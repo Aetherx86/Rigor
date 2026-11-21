@@ -376,3 +376,96 @@ fn indexed_vec_and_mutual_even_odd_and_subsingleton_and() {
     let and_rec = env.get(and_rec_n).unwrap();
     assert_eq!(and_rec.level_params().len(), 1, "Subsingleton And.rec must allow large elimination");
 }
+
+#[test]
+fn spine_machine_regression_overapplied_recursor_quot_and_lam_proof_irrelevance() {
+    let mut env = Environment::new();
+    add_nat(&mut env);
+    add_eq(&mut env);
+    env.add_quot().expect("add_quot must succeed");
+
+    let l1 = env.arena.lvl_nat(1);
+    let prop = env.arena.prop();
+    let nat = env.arena.const_path("Nat", []);
+    let zero = env.arena.const_path("Nat.zero", []);
+    let succ = env.arena.const_path("Nat.succ", []);
+    let rec1 = env.arena.const_path("Nat.rec", [l1]);
+    let n2n = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+    let b0 = env.arena.bvar(0);
+    let b1 = env.arena.bvar(1);
+
+    // 1. Over-applied higher-order `Nat.rec`: motive = (λ _, Nat → Nat), applied to trailing arg `7`!
+    //    `Nat.rec (λ _, Nat → Nat) (λ x, x) (λ _ ih x, Nat.succ (ih x)) 3 7 == 10`
+    //    Directly exercises `spine.splice` with non-empty `keep_tail` (`[7]`).
+    let mot = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, n2n);
+    let id_fn = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, b0);
+    let ih_x = env.arena.app(b1, b0);
+    let s_ih_x = env.arena.app(succ, ih_x);
+    let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, s_ih_x);
+    let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, n2n, st);
+    let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, st);
+    let n3 = env.arena.lit_nat(3);
+    let n7 = env.arena.lit_nat(7);
+    let n10 = env.arena.lit_nat(10);
+    let over_rec = env.arena.app_n(rec1, &[mot, id_fn, st, n3, n7]);
+
+    // 2. Over-applied `Quot.lift`: returns `Nat → Nat` and is immediately applied to trailing arg `7`.
+    //    `Quot.lift.{1,1} Nat (Eq.{1} Nat) (Nat → Nat) (λ x y, x) h (Quot.mk Nat (Eq Nat) 3) 7 == 3`
+    let eq1 = env.arena.const_path("Eq", [l1]);
+    let eq_nat = env.arena.app(eq1, nat);
+    let eq_n2n = env.arena.app(eq1, n2n);
+    let qmk = env.arena.const_path("Quot.mk", [l1]);
+    let qlift = env.arena.const_path("Quot.lift", [l1, l1]);
+    let eq_rec11 = env.arena.const_path("Eq.rec", [l1, l1]);
+    // f : Nat → Nat → Nat := λ x _ => x
+    let f_const = {
+        let inner = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, b1);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, inner)
+    };
+    // h : ∀ a b, Eq Nat a b → Eq (Nat → Nat) (f a) (f b)
+    //     := λ a b p => Eq.rec.{0,1} Nat a (λ y _, Eq (Nat → Nat) (f a) (f y)) (Eq.refl (Nat → Nat) (f a)) b p
+    let eq_rec01 = env.arena.const_path("Eq.rec", [Arena::LEVEL_ZERO, l1]);
+    let refl1 = env.arena.const_path("Eq.refl", [l1]);
+    let h_proof = {
+        // Under (a:#2) (b:#1) (p:#0):
+        // motive (y:#1) (_:#0): Eq (Nat→Nat) (f a) (f y)  [a is #4 under y, _]
+        let b2 = env.arena.bvar(2);
+        let b3 = env.arena.bvar(3);
+        let b4 = env.arena.bvar(4);
+        let fa_m = env.arena.app(f_const, b4);
+        let fy_m = env.arena.app(f_const, b1);
+        let m_body = env.arena.app_n(eq_n2n, &[fa_m, fy_m]);
+        let eq_a_y = env.arena.app_n(eq_nat, &[b3, b0]);
+        let m_in = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, eq_a_y, m_body);
+        let m_out = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, m_in);
+        let fa = env.arena.app(f_const, b2);
+        let rfa = env.arena.app_n(refl1, &[n2n, fa]);
+        let body = env.arena.app_n(eq_rec01, &[nat, b2, m_out, rfa, b1, b0]);
+        let eq_ab = env.arena.app_n(eq_nat, &[b1, b0]);
+        let lp = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, eq_ab, body);
+        let lb = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, lp);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, lb)
+    };
+    let _ = eq_rec11;
+    let qmk3 = env.arena.app_n(qmk, &[nat, eq_nat, n3]);
+    let over_quot = env.arena.app_n(qlift, &[nat, eq_nat, n2n, f_const, h_proof, qmk3, n7]);
+
+    // 3. Proof irrelevance between two structurally distinct `Lam` proofs of `P → P` (deferred `is_proof` regression).
+    let p_n = env.arena.name_from_path("P");
+    let q_n = env.arena.name_from_path("Q");
+    env.add_decl(Declaration::Axiom { name: p_n, level_params: Box::new([]), ty: prop }).unwrap();
+    let p_c = env.arena.const_(p_n, []);
+    env.add_decl(Declaration::Axiom { name: q_n, level_params: Box::new([]), ty: p_c }).unwrap();
+    let q_c = env.arena.const_(q_n, []);
+    let lam_proof_1 = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, p_c, b0);
+    let lam_proof_2 = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, p_c, q_c);
+
+    let frozen = env.freeze();
+    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
+    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    assert!(tc.is_def_eq(over_rec, n10).unwrap(), "over-applied Nat.rec must reduce to 10");
+    assert_eq!(tc.infer_type(over_quot).unwrap(), nat);
+    assert!(tc.is_def_eq(over_quot, n3).unwrap(), "over-applied Quot.lift must reduce to 3");
+    assert!(tc.is_def_eq(lam_proof_1, lam_proof_2).unwrap(), "distinct Lam proofs of P → P must be def-eq");
+    let _ = zero;
+}

@@ -154,53 +154,31 @@ pub struct Environment {
 }
 
 impl Environment {
-    pub fn new() -> Self {
-        Self {
-            arena: Arena::new(),
-            decls: FxHashMap::default(),
-        }
-    }
-
+    pub fn new() -> Self { Self { arena: Arena::new(), decls: FxHashMap::default() } }
     #[inline]
-    pub fn get(&self, name: NameId) -> Option<&Declaration> {
-        self.decls.get(&name)
-    }
-
+    pub fn get(&self, name: NameId) -> Option<&Declaration> { self.decls.get(&name) }
     #[inline]
-    pub fn len(&self) -> usize {
-        self.decls.len()
-    }
-
+    pub fn len(&self) -> usize { self.decls.len() }
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.decls.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.decls.is_empty() }
 
     /// Compute Lean 4-style definition height: `1 + max(height of referenced definitions)`.
     pub fn compute_height(&self, expr: ExprId) -> u32 {
         let mut visited = FxHashSet::default();
-        let max_ref = self.max_height_rec(expr, &mut visited);
-        max_ref.saturating_add(1)
+        self.max_height_rec(expr, &mut visited).saturating_add(1)
     }
 
     fn max_height_rec(&self, e: ExprId, visited: &mut FxHashSet<ExprId>) -> u32 {
-        if !visited.insert(e) {
-            return 0;
-        }
+        if !visited.insert(e) { return 0; }
         match self.arena.get_expr(e) {
             ExprData::Const(name, _) => match self.decls.get(name) {
-                Some(Declaration::Definition {
-                    hint: ReducibilityHint::Regular(h),
-                    ..
-                }) => *h,
+                Some(Declaration::Definition { hint: ReducibilityHint::Regular(h), .. }) => *h,
                 _ => 0,
             },
-            ExprData::App(f, a) => self
-                .max_height_rec(*f, visited)
-                .max(self.max_height_rec(*a, visited)),
-            ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => self
-                .max_height_rec(*ty, visited)
-                .max(self.max_height_rec(*body, visited)),
+            ExprData::App(f, a) => self.max_height_rec(*f, visited).max(self.max_height_rec(*a, visited)),
+            ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
+                self.max_height_rec(*ty, visited).max(self.max_height_rec(*body, visited))
+            }
             ExprData::Let { ty, val, body, .. } => self
                 .max_height_rec(*ty, visited)
                 .max(self.max_height_rec(*val, visited))
@@ -213,16 +191,8 @@ impl Environment {
     /// Type-check and insert a declaration into the global environment.
     pub fn add_decl(&mut self, mut decl: Declaration) -> Result<(), KernelError> {
         let name = decl.name();
-        if self.decls.contains_key(&name) {
-            return Err(KernelError::DuplicateDeclaration(name));
-        }
-        // Auto-compute height for Regular(0) definitions.
-        if let Declaration::Definition {
-            val,
-            hint: hint @ ReducibilityHint::Regular(0),
-            ..
-        } = &mut decl
-        {
+        if self.decls.contains_key(&name) { return Err(KernelError::DuplicateDeclaration(name)); }
+        if let Declaration::Definition { val, hint: hint @ ReducibilityHint::Regular(0), .. } = &mut decl {
             *hint = ReducibilityHint::Regular(self.compute_height(*val));
         }
         {

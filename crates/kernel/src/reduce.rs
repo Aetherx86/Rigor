@@ -1,6 +1,6 @@
-//! Fast spine-based WHNF reducer and definitional equality engine.
-//! Supports beta, zeta, iota, K-like, structure projections, height-ordered delta,
-//! proof irrelevance in `Prop`, and function + structure eta-conversion.
+//! Unified spine-machine WHNF reducer and definitional equality engine.
+//! Supports beta, zeta, iota, K-like, quotient, `Nat` literals, structure projections,
+//! height-ordered delta, proof irrelevance in `Prop`, and function + structure eta-conversion.
 
 use crate::arena::{BinderInfo, ExprData, ExprId, FVarId, LevelId, Literal, NameId};
 use crate::check::TypeChecker;
@@ -10,61 +10,228 @@ use crate::expr::{instantiate1, instantiate_level_params, instantiate_rev};
 use crate::level::{level_eq, level_is_zero};
 
 impl<'a> TypeChecker<'a> {
-    /// Reduce `e` to weak head normal form (beta + zeta + iota + projection + delta).
+    /// Cached universe-parameter instantiation (O(1) hit for the common 1-param case).
+    pub(crate) fn inst_levels_cached(&mut self, e: ExprId, params: &[NameId], lvls: &[LevelId]) -> ExprId {
+        if params.is_empty() || !self.arena.get_expr_meta(e).has_level_param() {
+            return e;
+        }
+        if lvls.len() == 1 {
+            let key = (e, lvls[0]);
+            if let Some(&res) = self.inst_lvl1_cache.get(&key) {
+                return res;
+            }
+            let res = instantiate_level_params(self.arena, e, params, lvls);
+            self.inst_lvl1_cache.insert(key, res);
+            return res;
+        }
+        instantiate_level_params(self.arena, e, params, lvls)
+    }
+
+    #[inline]
+    fn inst_levels_opt(&mut self, e: ExprId, params: &[NameId], l0: Option<LevelId>, lvls: Option<&[LevelId]>) -> ExprId {
+        match (l0, lvls) {
+            (Some(l), _) => self.inst_levels_cached(e, params, &[l]),
+            (None, Some(ls)) => self.inst_levels_cached(e, params, ls),
+            (None, None) => e,
+        }
+    }
+
+    /// Reduce `e` to weak head normal form (beta + zeta + iota + proj + quot + delta).
     pub fn whnf(&mut self, e: ExprId) -> ExprId {
         if let Some(&cached) = self.whnf_cache.get(&e) {
             return cached;
         }
-        let mut cur = e;
-        loop {
-            cur = self.whnf_core(cur);
-            if let Some(r) = self.reduce_iota_or_proj(cur).or_else(|| self.unfold_head_delta(cur)) {
-                cur = r;
-            } else {
-                break;
-            }
-        }
+        let cur = self.whnf_spine(e, true);
         self.whnf_cache.insert(e, cur);
         cur
     }
 
-    /// Spine-based WHNF without delta: beta, zeta, and local let-bound fvars.
-    pub(crate) fn whnf_core(&mut self, mut e: ExprId) -> ExprId {
-        let mut spine = Vec::new();
+    /// Reduce `e` to weak head normal form without delta unfolding.
+    #[inline]
+    pub(crate) fn whnf_no_delta(&mut self, e: ExprId) -> ExprId {
+        self.whnf_spine(e, false)
+    }
+
+    fn whnf_spine(&mut self, e: ExprId, allow_delta: bool) -> ExprId {
+        match self.arena.get_expr(e) {
+            ExprData::Sort(_) | ExprData::Pi { .. } | ExprData::Lam { .. } | ExprData::Lit(_) | ExprData::BVar(_) => {
+                return e;
+            }
+            ExprData::Const(_, _) if !allow_delta => return e,
+            _ => {}
+        }
+        self.whnf_spine_with(e, Vec::new(), allow_delta)
+    }
+
+    /// Unified spine abstract machine: keeps arguments on `spine` across beta, zeta,
+    /// local FVar, Proj, Quot.lift, Recursor iota/K, and delta steps without interning
+    /// intermediate `App` nodes into the arena.
+    fn whnf_spine_with(&mut self, mut cur: ExprId, mut spine: Vec<ExprId>, allow_delta: bool) -> ExprId {
         loop {
-            match self.arena.get_expr(e).clone() {
+            match self.arena.get_expr(cur) {
                 ExprData::App(f, a) => {
+                    let (f, a) = (*f, *a);
                     spine.push(a);
-                    e = f;
+                    cur = f;
                 }
-                ExprData::Lam { mut body, .. } if !spine.is_empty() => {
-                    let mut args = Vec::with_capacity(spine.len());
-                    args.push(spine.pop().unwrap());
-                    while !spine.is_empty() {
-                        if let ExprData::Lam { body: next, .. } = self.arena.get_expr(body) {
-                            body = *next;
-                            args.push(spine.pop().unwrap());
-                        } else {
-                            break;
+                ExprData::Lam { body, .. } if !spine.is_empty() => {
+                    let mut body = *body;
+                    let first = spine.pop().unwrap();
+                    if spine.is_empty() {
+                        cur = instantiate1(self.arena, body, first);
+                    } else {
+                        let mut args = Vec::with_capacity(spine.len() + 1);
+                        args.push(first);
+                        while !spine.is_empty() {
+                            if let ExprData::Lam { body: next, .. } = self.arena.get_expr(body) {
+                                body = *next;
+                                args.push(spine.pop().unwrap());
+                            } else {
+                                break;
+                            }
                         }
+                        cur = instantiate_rev(self.arena, body, &args);
                     }
-                    e = instantiate_rev(self.arena, body, &args);
                 }
-                ExprData::Let { val, body, .. } => e = instantiate1(self.arena, body, val),
-                ExprData::FVar(fv) => match self.local_value(fv) {
-                    Some(val) => e = val,
+                ExprData::Let { val, body, .. } => {
+                    let (val, body) = (*val, *body);
+                    cur = instantiate1(self.arena, body, val);
+                }
+                ExprData::FVar(fv) => match self.local_value(*fv) {
+                    Some(val) => cur = val,
                     None => break,
                 },
+                ExprData::Proj { struct_name, idx, expr } => {
+                    let (sn, idx, expr) = (*struct_name, *idx, *expr);
+                    if let Some(v) = self.reduce_proj_head(sn, idx, expr) {
+                        cur = v;
+                    } else {
+                        break;
+                    }
+                }
+                ExprData::Const(name, lvls) => {
+                    let name = *name;
+                    let Some(decl) = self.decls.get(&name) else { break };
+                    match decl {
+                        Declaration::Quot { kind: QuotKind::Lift, .. } if spine.len() >= 6 => {
+                            let len = spine.len();
+                            let major = self.whnf(spine[len - 6]);
+                            let (mhead, margs) = self.app_spine(major);
+                            if let ExprData::Const(mn, _) = self.arena.get_expr(mhead) {
+                                if matches!(self.decls.get(mn), Some(Declaration::Quot { kind: QuotKind::Ctor, .. }))
+                                    && margs.len() == 3
+                                {
+                                    let f = spine[len - 4];
+                                    spine.truncate(len - 6);
+                                    spine.push(margs[2]);
+                                    cur = f;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        Declaration::Recursor(rec) if lvls.len() == rec.level_params.len() => {
+                            let prefix_end = (rec.num_params + rec.num_motives + rec.num_minors) as usize;
+                            let major_idx = prefix_end + rec.num_indices as usize;
+                            let len = spine.len();
+                            if len <= major_idx {
+                                break;
+                            }
+                            let (l0, lvls_owned) = split_lvls(lvls);
+                            let mut major = self.whnf(spine[len - 1 - major_idx]);
+                            if let ExprData::Lit(Literal::Nat(k)) = *self.arena.get_expr(major) {
+                                major = self.expand_nat_lit(k);
+                            }
+                            if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
+                                let rule = &rec.rules[0];
+                                if let Some(Declaration::Constructor(c)) = self.decls.get(&rule.ctor_name) {
+                                    if let Ok(major_ty) = self.infer_type(major) {
+                                        let mut ctor_ty = if let Some(ref ls) = lvls_owned {
+                                            let ind_lvls = &ls[ls.len() - c.level_params.len()..];
+                                            self.inst_levels_cached(c.ty, &c.level_params, ind_lvls)
+                                        } else if c.level_params.is_empty() {
+                                            c.ty
+                                        } else {
+                                            self.inst_levels_cached(c.ty, &c.level_params, &[l0.unwrap()])
+                                        };
+                                        let mut ok = true;
+                                        for i in 0..rec.num_params as usize {
+                                            ctor_ty = self.whnf(ctor_ty);
+                                            if let ExprData::Pi { body, .. } = self.arena.get_expr(ctor_ty) {
+                                                ctor_ty = instantiate1(self.arena, *body, spine[len - 1 - i]);
+                                            } else {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        if ok && self.is_def_eq(major_ty, ctor_ty).unwrap_or(false) {
+                                            cur = self.inst_levels_opt(rule.rhs, &rec.level_params, l0, lvls_owned.as_deref());
+                                            spine.drain(len - 1 - major_idx..len - prefix_end);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            let (mhead, margs) = self.app_spine(major);
+                            if let ExprData::Const(cname, _) = self.arena.get_expr(mhead) {
+                                let cname = *cname;
+                                if let Some(rule) = rec.rules.iter().find(|r| r.ctor_name == cname) {
+                                    if margs.len() == (rec.num_params + rule.num_fields) as usize {
+                                        cur = self.inst_levels_opt(rule.rhs, &rec.level_params, l0, lvls_owned.as_deref());
+                                        let keep_tail = len - 1 - major_idx;
+                                        spine.splice(
+                                            keep_tail..len - prefix_end,
+                                            margs[rec.num_params as usize..].iter().rev().copied(),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        _ if allow_delta => {
+                            if let Some((val, _)) = decl.delta_value() {
+                                let params = decl.level_params();
+                                if lvls.len() == params.len() {
+                                    let (l0, lvls_owned) = split_lvls(lvls);
+                                    cur = self.inst_levels_opt(val, params, l0, lvls_owned.as_deref());
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
                 _ => break,
             }
         }
         while let Some(arg) = spine.pop() {
-            e = self.arena.app(e, arg);
+            cur = self.arena.app(cur, arg);
         }
-        e
+        cur
+    }
+
+    fn reduce_proj_head(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> Option<ExprId> {
+        let ind = match self.decls.get(&struct_name)? {
+            Declaration::Inductive(i) if i.ctors.len() == 1 && i.num_indices == 0 => i,
+            _ => return None,
+        };
+        let val = self.whnf(expr);
+        let (vhead, vargs) = self.app_spine(val);
+        if let ExprData::Const(cname, _) = self.arena.get_expr(vhead) {
+            let pos = ind.num_params as usize + idx as usize;
+            if *cname == ind.ctors[0] && pos < vargs.len() {
+                return Some(vargs[pos]);
+            }
+        }
+        None
     }
 
     pub(crate) fn app_spine(&self, mut e: ExprId) -> (ExprId, Vec<ExprId>) {
+        if !matches!(self.arena.get_expr(e), ExprData::App(_, _)) {
+            return (e, Vec::new());
+        }
         let mut args = Vec::new();
         while let ExprData::App(f, a) = self.arena.get_expr(e) {
             args.push(*a);
@@ -74,118 +241,39 @@ impl<'a> TypeChecker<'a> {
         (e, args)
     }
 
-    pub(crate) fn reduce_iota_or_proj(&mut self, e: ExprId) -> Option<ExprId> {
-        let (head, args) = self.app_spine(e);
-        match self.arena.get_expr(head).clone() {
-            ExprData::Proj { struct_name, idx, expr } => {
-                let ind = match self.decls.get(&struct_name)? {
-                    Declaration::Inductive(i) if i.ctors.len() == 1 && i.num_indices == 0 => i,
-                    _ => return None,
-                };
-                let val = self.whnf(expr);
-                let (vhead, vargs) = self.app_spine(val);
-                if let ExprData::Const(cname, _) = self.arena.get_expr(vhead) {
-                    let pos = ind.num_params as usize + idx as usize;
-                    if *cname == ind.ctors[0] && pos < vargs.len() {
-                        return Some(self.arena.app_n(vargs[pos], &args));
-                    }
-                }
-                None
-            }
-            ExprData::Const(name, lvls) => {
-                // Quotient reduction: `Quot.lift α r β f h (Quot.mk α' r' a)` -> `f a`.
-                if let Some(Declaration::Quot { kind: QuotKind::Lift, .. }) = self.decls.get(&name) {
-                    if args.len() >= 6 {
-                        let major = self.whnf(args[5]);
-                        let (mhead, margs) = self.app_spine(major);
-                        if let ExprData::Const(mn, _) = self.arena.get_expr(mhead) {
-                            if matches!(self.decls.get(mn), Some(Declaration::Quot { kind: QuotKind::Ctor, .. }))
-                                && margs.len() == 3
-                            {
-                                let fa = self.arena.app(args[3], margs[2]);
-                                return Some(self.arena.app_n(fa, &args[6..]));
-                            }
-                        }
-                    }
-                    return None;
-                }
-                let rec = match self.decls.get(&name)? {
-                    Declaration::Recursor(r) if lvls.len() == r.level_params.len() => r.clone(),
-                    _ => return None,
-                };
-                let major_idx = (rec.num_params + rec.num_motives + rec.num_minors + rec.num_indices) as usize;
-                if args.len() <= major_idx {
-                    return None;
-                }
-                let mut major = self.whnf(args[major_idx]);
-                // Expand Nat literals one step so `Nat.rec` computes on `#ELN` literals.
-                if let ExprData::Lit(Literal::Nat(k)) = *self.arena.get_expr(major) {
-                    major = self.expand_nat_lit(k);
-                }
-                let prefix_end = (rec.num_params + rec.num_motives + rec.num_minors) as usize;
-                if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
-                    let rule = &rec.rules[0];
-                    if let Some(Declaration::Constructor(c)) = self.decls.get(&rule.ctor_name) {
-                        let c = c.clone();
-                        let major_ty = self.infer_type(major).ok()?;
-                        let ind_lvls = &lvls[lvls.len() - c.level_params.len()..];
-                        let mut ctor_ty = instantiate_level_params(self.arena, c.ty, &c.level_params, ind_lvls);
-                        for &p in &args[..rec.num_params as usize] {
-                            ctor_ty = self.whnf(ctor_ty);
-                            let ExprData::Pi { body, .. } = self.arena.get_expr(ctor_ty) else { return None };
-                            ctor_ty = instantiate1(self.arena, *body, p);
-                        }
-                        if self.is_def_eq(major_ty, ctor_ty).ok()? {
-                            let rhs = instantiate_level_params(self.arena, rule.rhs, &rec.level_params, &lvls);
-                            let out = self.arena.app_n(rhs, &args[..prefix_end]);
-                            return Some(self.arena.app_n(out, &args[major_idx + 1..]));
-                        }
-                    }
-                }
-                let (mhead, margs) = self.app_spine(major);
-                if let ExprData::Const(cname, _) = self.arena.get_expr(mhead) {
-                    let rule = rec.rules.iter().find(|r| r.ctor_name == *cname)?;
-                    if margs.len() == (rec.num_params + rule.num_fields) as usize {
-                        let rhs = instantiate_level_params(self.arena, rule.rhs, &rec.level_params, &lvls);
-                        let out = self.arena.app_n(rhs, &args[..prefix_end]);
-                        let out = self.arena.app_n(out, &margs[rec.num_params as usize..]);
-                        return Some(self.arena.app_n(out, &args[major_idx + 1..]));
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
+    #[inline]
     fn expand_nat_lit(&mut self, k: u64) -> ExprId {
         if k == 0 {
-            self.arena.const_path("Nat.zero", [])
+            if let Some(z) = self.nat_zero { z } else {
+                let z = self.arena.const_path("Nat.zero", []);
+                self.nat_zero = Some(z);
+                z
+            }
         } else {
-            let succ = self.arena.const_path("Nat.succ", []);
+            let succ = if let Some(s) = self.nat_succ { s } else {
+                let s = self.arena.const_path("Nat.succ", []);
+                self.nat_succ = Some(s);
+                s
+            };
             let pred = self.arena.lit_nat(k - 1);
             self.arena.app(succ, pred)
         }
     }
 
-    fn delta_info(&self, head: ExprId) -> Option<(ExprId, u64, Box<[LevelId]>, Box<[NameId]>)> {
+    fn delta_info(&self, head: ExprId) -> Option<(ExprId, u64, &'a [NameId], Option<LevelId>, Option<Box<[LevelId]>>)> {
         let ExprData::Const(name, lvls) = self.arena.get_expr(head) else { return None };
         let decl = self.decls.get(name)?;
         let (val, prio) = decl.delta_value()?;
-        (lvls.len() == decl.level_params().len()).then(|| (val, prio, lvls.clone(), decl.level_params().into()))
+        let params = decl.level_params();
+        if lvls.len() != params.len() { return None; }
+        let (l0, lvls_owned) = split_lvls(lvls);
+        Some((val, prio, params, l0, lvls_owned))
     }
 
-    fn unfold_delta_app(&mut self, val: ExprId, params: &[NameId], lvls: &[LevelId], args: &[ExprId]) -> ExprId {
-        let inst = instantiate_level_params(self.arena, val, params, lvls);
-        let app = self.arena.app_n(inst, args);
-        self.whnf_core(app)
-    }
-
-    fn unfold_head_delta(&mut self, e: ExprId) -> Option<ExprId> {
-        let (head, args) = self.app_spine(e);
-        let (val, _, lvls, params) = self.delta_info(head)?;
-        let inst = instantiate_level_params(self.arena, val, &params, &lvls);
-        Some(self.arena.app_n(inst, &args))
+    fn unfold_delta_app(&mut self, val: ExprId, params: &[NameId], l0: Option<LevelId>, lvls: Option<&[LevelId]>, args: &[ExprId]) -> ExprId {
+        let inst = self.inst_levels_opt(val, params, l0, lvls);
+        let spine: Vec<ExprId> = args.iter().rev().copied().collect();
+        self.whnf_spine_with(inst, spine, false)
     }
 
     fn is_proof(&mut self, e: ExprId) -> Result<Option<ExprId>, KernelError> {
@@ -199,81 +287,63 @@ impl<'a> TypeChecker<'a> {
 
     /// Definitional equality `a ≡ b` with DAG memoization.
     pub fn is_def_eq(&mut self, a: ExprId, b: ExprId) -> Result<bool, KernelError> {
-        if a == b {
-            return Ok(true);
-        }
+        if a == b { return Ok(true); }
         let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
-        if self.def_eq_cache.contains(&key) {
-            return Ok(true);
-        }
+        if self.def_eq_cache.contains(&key) { return Ok(true); }
         let eq = self.is_def_eq_core(a, b)?;
-        if eq {
-            self.def_eq_cache.insert(key);
-        }
+        if eq { self.def_eq_cache.insert(key); }
         Ok(eq)
     }
 
     fn is_def_eq_core(&mut self, mut a: ExprId, mut b: ExprId) -> Result<bool, KernelError> {
-        a = self.whnf_core(a);
-        b = self.whnf_core(b);
-        if a == b {
-            return Ok(true);
-        }
-        if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
-            return self.is_def_eq(ta, tb);
-        }
+        a = self.whnf_no_delta(a);
+        b = self.whnf_no_delta(b);
+        let mut checked_proof = false;
 
         loop {
-            if a == b {
-                return Ok(true);
-            }
-            if let Some(ra) = self.reduce_iota_or_proj(a) {
-                a = self.whnf_core(ra);
-                continue;
-            }
-            if let Some(rb) = self.reduce_iota_or_proj(b) {
-                b = self.whnf_core(rb);
-                continue;
-            }
-
-            match (self.arena.get_expr(a).clone(), self.arena.get_expr(b).clone()) {
-                (ExprData::Sort(u), ExprData::Sort(v)) => return Ok(level_eq(self.arena, u, v)),
+            if a == b { return Ok(true); }
+            match (self.arena.get_expr(a), self.arena.get_expr(b)) {
+                (ExprData::Sort(u), ExprData::Sort(v)) => {
+                    let (u, v) = (*u, *v);
+                    return Ok(level_eq(self.arena, u, v));
+                }
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
-                (ExprData::Lit(Literal::Nat(k)), _) => {
-                    a = self.expand_nat_lit(k);
-                    continue;
-                }
-                (_, ExprData::Lit(Literal::Nat(k))) => {
-                    b = self.expand_nat_lit(k);
-                    continue;
-                }
-                (
-                    ExprData::Pi { name, binder_info, ty: t1, body: b1 },
-                    ExprData::Pi { ty: t2, body: b2, .. },
-                )
-                | (
-                    ExprData::Lam { name, binder_info, ty: t1, body: b1 },
-                    ExprData::Lam { ty: t2, body: b2, .. },
-                ) => {
-                    if !self.is_def_eq(t1, t2)? {
-                        return Ok(false);
-                    }
-                    let fv = self.push_local(name, binder_info, t1, None);
+                (ExprData::Lit(Literal::Nat(k)), _) => { let k = *k; a = self.expand_nat_lit(k); continue; }
+                (_, ExprData::Lit(Literal::Nat(k))) => { let k = *k; b = self.expand_nat_lit(k); continue; }
+                (ExprData::Pi { name, binder_info, ty: t1, body: b1 }, ExprData::Pi { ty: t2, body: b2, .. }) => {
+                    let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
+                    if !self.is_def_eq(t1, t2)? { return Ok(false); }
+                    let fv = self.push_local(name, bi, t1, None);
                     let fve = self.arena.fvar(fv);
                     let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
                     let res = self.is_def_eq(ib1, ib2);
                     self.pop_local();
                     return res;
                 }
-                (ExprData::Lam { name, binder_info, ty, body }, _) => {
-                    if self.try_fun_eta(name, binder_info, ty, body, b)? {
-                        return Ok(true);
+                (ExprData::Lam { name, binder_info, ty: t1, body: b1 }, ExprData::Lam { ty: t2, body: b2, .. }) => {
+                    let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
+                    if self.is_def_eq(t1, t2)? {
+                        let fv = self.push_local(name, bi, t1, None);
+                        let fve = self.arena.fvar(fv);
+                        let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
+                        let res = self.is_def_eq(ib1, ib2)?;
+                        self.pop_local();
+                        if res { return Ok(true); }
                     }
+                    if !checked_proof {
+                        if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
+                            return self.is_def_eq(ta, tb);
+                        }
+                    }
+                    return Ok(false);
+                }
+                (ExprData::Lam { name, binder_info, ty, body }, _) => {
+                    let (name, bi, ty, body) = (*name, *binder_info, *ty, *body);
+                    if self.try_fun_eta(name, bi, ty, body, b)? { return Ok(true); }
                 }
                 (_, ExprData::Lam { name, binder_info, ty, body }) => {
-                    if self.try_fun_eta(name, binder_info, ty, body, a)? {
-                        return Ok(true);
-                    }
+                    let (name, bi, ty, body) = (*name, *binder_info, *ty, *body);
+                    if self.try_fun_eta(name, bi, ty, body, a)? { return Ok(true); }
                 }
                 _ => {}
             }
@@ -283,30 +353,26 @@ impl<'a> TypeChecker<'a> {
             if args_a.len() == args_b.len() && self.heads_equal(ha, hb) {
                 let mut all_eq = true;
                 for (&xa, &xb) in args_a.iter().zip(&args_b) {
-                    if !self.is_def_eq(xa, xb)? {
-                        all_eq = false;
-                        break;
-                    }
+                    if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
                 }
-                if all_eq {
-                    return Ok(true);
+                if all_eq { return Ok(true); }
+            }
+
+            if !checked_proof {
+                checked_proof = true;
+                if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
+                    return self.is_def_eq(ta, tb);
                 }
             }
 
             match (self.delta_info(ha), self.delta_info(hb)) {
-                (Some((va, pa, la, ppa)), Some((vb, pb, lb, ppb))) => {
-                    if pa >= pb {
-                        a = self.unfold_delta_app(va, &ppa, &la, &args_a);
-                    }
-                    if pb >= pa {
-                        b = self.unfold_delta_app(vb, &ppb, &lb, &args_b);
-                    }
+                (Some((va, pa, ppa, l0a, la)), Some((vb, pb, ppb, l0b, lb))) => {
+                    if pa >= pb { a = self.unfold_delta_app(va, ppa, l0a, la.as_deref(), &args_a); }
+                    if pb >= pa { b = self.unfold_delta_app(vb, ppb, l0b, lb.as_deref(), &args_b); }
                 }
-                (Some((va, _, la, ppa)), None) => a = self.unfold_delta_app(va, &ppa, &la, &args_a),
-                (None, Some((vb, _, lb, ppb))) => b = self.unfold_delta_app(vb, &ppb, &lb, &args_b),
-                (None, None) => {
-                    return Ok(self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)?);
-                }
+                (Some((va, _, ppa, l0a, la)), None) => a = self.unfold_delta_app(va, ppa, l0a, la.as_deref(), &args_a),
+                (None, Some((vb, _, ppb, l0b, lb))) => b = self.unfold_delta_app(vb, ppb, l0b, lb.as_deref(), &args_b),
+                (None, None) => return Ok(self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)?),
             }
         }
     }
@@ -318,9 +384,7 @@ impl<'a> TypeChecker<'a> {
         let other_ty = self.infer_type(other)?;
         let other_ty_w = self.whnf(other_ty);
         let ExprData::Pi { ty: dom, .. } = *self.arena.get_expr(other_ty_w) else { return Ok(false) };
-        if !self.is_def_eq(ty, dom)? {
-            return Ok(false);
-        }
+        if !self.is_def_eq(ty, dom)? { return Ok(false); }
         let fv: FVarId = self.push_local(name, bi, ty, None);
         let fve = self.arena.fvar(fv);
         let (lhs, rhs) = (instantiate1(self.arena, body, fve), self.arena.app(other, fve));
@@ -332,8 +396,8 @@ impl<'a> TypeChecker<'a> {
     fn try_struct_eta(&mut self, ctor_side: ExprId, other: ExprId) -> Result<bool, KernelError> {
         let (head, args) = self.app_spine(ctor_side);
         let ExprData::Const(cname, _) = *self.arena.get_expr(head) else { return Ok(false) };
-        let Some(Declaration::Constructor(c)) = self.decls.get(&cname).cloned() else { return Ok(false) };
-        let Some(Declaration::Inductive(ind)) = self.decls.get(&c.ind_name).cloned() else { return Ok(false) };
+        let Some(Declaration::Constructor(c)) = self.decls.get(&cname) else { return Ok(false) };
+        let Some(Declaration::Inductive(ind)) = self.decls.get(&c.ind_name) else { return Ok(false) };
         if ind.is_prop || ind.is_rec || ind.ctors.len() != 1 || ind.num_indices != 0 || ind.all.len() != 1
             || args.len() != (c.num_params + c.num_fields) as usize
         {
@@ -347,26 +411,34 @@ impl<'a> TypeChecker<'a> {
         }
         for fi in 0..c.num_fields {
             let rhs = self.arena.proj(ind.name, fi, other);
-            if !self.is_def_eq(args[c.num_params as usize + fi as usize], rhs)? {
-                return Ok(false);
-            }
+            if !self.is_def_eq(args[c.num_params as usize + fi as usize], rhs)? { return Ok(false); }
         }
         Ok(true)
     }
 
     fn heads_equal(&mut self, ha: ExprId, hb: ExprId) -> bool {
-        if ha == hb {
-            return true;
-        }
-        match (self.arena.get_expr(ha).clone(), self.arena.get_expr(hb).clone()) {
+        if ha == hb { return true; }
+        match (self.arena.get_expr(ha), self.arena.get_expr(hb)) {
             (ExprData::Const(na, la), ExprData::Const(nb, lb)) if na == nb && la.len() == lb.len() => {
+                let (la, lb) = (la.clone(), lb.clone());
                 la.iter().zip(lb.iter()).all(|(&x, &y)| level_eq(self.arena, x, y))
             }
-            (
-                ExprData::Proj { struct_name: sa, idx: ia, expr: ea },
-                ExprData::Proj { struct_name: sb, idx: ib, expr: eb },
-            ) if sa == sb && ia == ib => self.is_def_eq(ea, eb).unwrap_or(false),
+            (ExprData::Proj { struct_name: sa, idx: ia, expr: ea }, ExprData::Proj { struct_name: sb, idx: ib, expr: eb })
+                if sa == sb && ia == ib =>
+            {
+                let (ea, eb) = (*ea, *eb);
+                self.is_def_eq(ea, eb).unwrap_or(false)
+            }
             _ => false,
         }
+    }
+}
+
+#[inline]
+fn split_lvls(lvls: &[LevelId]) -> (Option<LevelId>, Option<Box<[LevelId]>>) {
+    match lvls.len() {
+        0 => (None, None),
+        1 => (Some(lvls[0]), None),
+        _ => (None, Some(lvls.into())),
     }
 }

@@ -95,6 +95,8 @@ pub struct Arena {
     exprs: Vec<ExprData>,
     expr_meta: Vec<ExprMeta>,
     expr_map: FxHashMap<ExprData, ExprId>,
+    app_map: FxHashMap<(ExprId, ExprId), ExprId>,
+    bvar_cache: [u32; 32],
 }
 
 impl Default for Arena {
@@ -119,6 +121,8 @@ impl Arena {
             exprs: Vec::with_capacity(1024),
             expr_meta: Vec::with_capacity(1024),
             expr_map: FxHashMap::default(),
+            app_map: FxHashMap::default(),
+            bvar_cache: [u32::MAX; 32],
         };
         let n0 = a.intern_name_raw(NameData::Anonymous);
         let l0 = a.intern_level_raw(LevelData::Zero);
@@ -141,6 +145,8 @@ impl Arena {
             exprs: Vec::new(),
             expr_meta: Vec::new(),
             expr_map: FxHashMap::default(),
+            app_map: FxHashMap::default(),
+            bvar_cache: [u32::MAX; 32],
         }
     }
 
@@ -218,10 +224,24 @@ impl Arena {
     }
 
     // ---------------------------------------------------------------- Expressions
+    #[inline]
+    fn lookup_app(&self, key: (ExprId, ExprId)) -> Option<ExprId> {
+        self.app_map.get(&key).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_app(key)))
+    }
+    #[inline]
+    fn lookup_bvar(&self, idx: usize) -> Option<ExprId> {
+        let v = self.bvar_cache[idx];
+        if v != u32::MAX { Some(ExprId(v)) } else { self.parent.as_deref().and_then(|p| p.lookup_bvar(idx)) }
+    }
     fn lookup_expr(&self, data: &ExprData) -> Option<ExprId> {
         self.expr_map.get(data).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_expr(data)))
     }
     pub fn intern_expr(&mut self, data: ExprData) -> ExprId {
+        match data {
+            ExprData::App(f, a) => return self.app(f, a),
+            ExprData::BVar(idx) if (idx as usize) < 32 => return self.bvar(idx),
+            _ => {}
+        }
         if let Some(id) = self.lookup_expr(&data) { return id; }
         let meta = self.compute_expr_meta(&data);
         let id = ExprId(self.expr_len());
@@ -276,7 +296,18 @@ impl Arena {
     }
 
     #[inline]
-    pub fn bvar(&mut self, idx: u32) -> ExprId { self.intern_expr(ExprData::BVar(idx)) }
+    pub fn bvar(&mut self, idx: u32) -> ExprId {
+        if (idx as usize) < 32 {
+            if let Some(id) = self.lookup_bvar(idx as usize) { return id; }
+            let id = ExprId(self.expr_len());
+            self.exprs.push(ExprData::BVar(idx));
+            self.expr_meta.push(ExprMeta { loose_bvar_range: idx + 1, flags: 0 });
+            self.bvar_cache[idx as usize] = id.0;
+            id
+        } else {
+            self.intern_expr(ExprData::BVar(idx))
+        }
+    }
     #[inline]
     pub fn fvar(&mut self, id: FVarId) -> ExprId { self.intern_expr(ExprData::FVar(id)) }
     #[inline]
@@ -292,7 +323,16 @@ impl Arena {
         self.const_(n, levels)
     }
     #[inline]
-    pub fn app(&mut self, f: ExprId, a: ExprId) -> ExprId { self.intern_expr(ExprData::App(f, a)) }
+    pub fn app(&mut self, f: ExprId, a: ExprId) -> ExprId {
+        if let Some(id) = self.lookup_app((f, a)) { return id; }
+        let (mf, ma) = (self.get_expr_meta(f), self.get_expr_meta(a));
+        let meta = ExprMeta { loose_bvar_range: mf.loose_bvar_range.max(ma.loose_bvar_range), flags: mf.flags | ma.flags };
+        let id = ExprId(self.expr_len());
+        self.exprs.push(ExprData::App(f, a));
+        self.expr_meta.push(meta);
+        self.app_map.insert((f, a), id);
+        id
+    }
     pub fn app_n(&mut self, mut f: ExprId, args: &[ExprId]) -> ExprId {
         for &a in args { f = self.app(f, a); }
         f

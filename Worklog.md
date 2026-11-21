@@ -49,10 +49,26 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
   - Note: real Lean 4 `Init`/`Std` `.export` artifacts require `lean`/`elan` + `lean4export` installed locally (not present on this host yet).
   - Phase 3 release benchmark (`cargo run --release -p rigor-bench`):
     * Streaming `lean4export` parse + kernel verify (10,002 decls, 50,032 lines, 0.86 MiB): 12.85 ms (778k decls/s, 67.1 MiB/s).
-- **Phase 4: Head-to-Head Benchmarking & Optimization** (pending)
+- **Phase 4: Head-to-Head Benchmarking & Optimization** (done)
+  - Automated benchmark harness & stress suite (`crates/bench/src/main.rs`, `crates/bench/run_head_to_head.sh`):
+    * CLI modes: `--check <file.export>`, `--generate-export <path> <n>`, `--stress-only [iters]`, and default full suite.
+    * Computational stress tests: Church `mul 25*40 == 1000`, inductive `Nat.rec` `mul 30*40 == 1200`, higher-order `Nat.rec` Ackermann `ack(3, 5) == 253`, and pure-CIC primality reflection (`isPrime 51 = false`, `53 = true`, `97 = true` by `Eq.refl`).
+    * Head-to-head script capturing Wall Time, Decls/sec, and OS-level Peak RSS (`/usr/bin/time -l` on macOS, `-v` on Linux), auto-detecting `lean4checker` on `PATH` when installed.
+  - Profile-guided kernel optimizations (`/usr/bin/sample` before/after):
+    * Dedicated `app_map` (`(ExprId, ExprId) -> ExprId`) and `[u32; 32]` `bvar_cache` in `Arena`.
+    * Unified spine abstract machine (`whnf_spine_with`) avoiding intermediate `App` re-interning across beta/zeta/proj/quot/iota/delta.
+    * Zero-clone `&'a` decl borrows, cached 1-param level instantiation (`inst_lvl1_cache`), cached `Nat.zero`/`Nat.succ`, deferred `is_proof`, and lazy `FxHashMap` allocation in `expr.rs` `map_children`.
+  - Regression test added in `crates/kernel/tests/inductives.rs` covering over-applied `Nat.rec`, over-applied `Quot.lift`, and `Lam` proof irrelevance (`19/19` tests green, `0` warnings).
+  - TCB size audit: `crates/kernel/src/*.rs` = **2,484 SLOC** (`#![forbid(unsafe_code)]`, zero external deps).
+  - Key before/after speedups documented in `BENCHMARKS.md`:
+    * `Nat.rec` `mul 30*40 == 1200`: `3.764 ms -> 0.427 ms` (`8.81x`)
+    * Ackermann `ack(3, 5) == 253`: `2.051 ms -> 0.285 ms` (`7.20x`)
+    * Primality reflection (`51/53/97`): `38.395 ms -> 10.036 ms` (`3.83x`, `-35.4%` arena nodes)
+    * `mathlib_subset_100k.export` (100k decls, 587k lines, 11.29 MiB): `222.98 ms / 61.02 MB RSS -> 113.26 ms (883k decls/s, 1.97x) / 46.56 MB RSS (-23.7% RSS)`.
 
 ## Progress log
 - 2026-11-22 01:30 KST: initialized `~/Rigor` workspace and started Phase 1 implementation.
 - 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `Aetherx86/Rigor` (commit `b41a1c2`).
 - 2026-11-22 01:52 KST: completed Phase 2 (inductives, strict positivity, Subsingleton large-elim & `Proj` guard, iota/K-like/structure-eta reduction, soundness torture suite: 14/14 tests green, 0 warnings, `Nat.rec` benchmark 1.544 ms, commit `f879983`).
-- 2026-11-22 02:04 KST: completed Phase 3 (streaming `lean4export` parser for all 22 directives + v3 `#IND`/`#CTOR`/`#REC` + `#INDM`, kernel `#QUOT` + `#ELN` reduction, 18/18 tests green, 0 warnings, 778k decls/s streaming parse+verify, TCB < 2,500 SLOC).
+- 2026-11-22 02:04 KST: completed Phase 3 (streaming `lean4export` parser for all 22 directives + v3 `#IND`/`#CTOR`/`#REC` + `#INDM`, kernel `#QUOT` + `#ELN` reduction, 18/18 tests green, 0 warnings, 778k decls/s streaming parse+verify, TCB < 2,500 SLOC, commit `2e473b1`).
+- 2026-11-22 02:19 KST: completed Phase 4 (head-to-head benchmark harness + Peak RSS script, Ackermann & primality reflection stress tests, `/usr/bin/sample` profile-guided spine-machine & arena optimizations up to 8.81x faster / -23.7% RSS, 19/19 tests green, TCB 2,484 SLOC, `BENCHMARKS.md`).

@@ -17,9 +17,12 @@ A mathematically sound, high-performance dependent type theory proof kernel (Cal
 - `crates/parser`: Streaming zero-copy-token `lean4export` format parser supporting all 22 directives (`#NS`, `#NI`, `#US`, `#UM`, `#UIM`, `#UP`, `#EV`, `#ES`, `#EC`, `#EA`, `#EL`, `#EP`, `#EZ`, `#EJ`, `#ELN`, `#ELS`, `#AX`, `#DEF`, `#THM`, `#OPAQ`, `#QUOT`, `#IND`), plus mutual `#INDM` and v3 `#IND`/`#CTOR`/`#REC`.
 - `crates/bench`: Micro-benchmarks and head-to-head `lean4checker` harness.
 
-## Build and Test
+## Build, Test, and Benchmark
 
 ```sh
 cargo test --workspace
 cargo run --release -p rigor-bench
+./crates/bench/run_head_to_head.sh /tmp/rigor_bench
 ```
+
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed throughput, Peak RSS, computational stress test, and profiling results.

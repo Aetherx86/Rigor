@@ -27,6 +27,9 @@ pub struct TypeChecker<'a> {
     pub(crate) whnf_cache: FxHashMap<ExprId, ExprId>,
     pub(crate) infer_cache: FxHashMap<ExprId, ExprId>,
     pub(crate) def_eq_cache: FxHashSet<(ExprId, ExprId)>,
+    pub(crate) inst_lvl1_cache: FxHashMap<(ExprId, LevelId), ExprId>,
+    pub(crate) nat_zero: Option<ExprId>,
+    pub(crate) nat_succ: Option<ExprId>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -39,6 +42,9 @@ impl<'a> TypeChecker<'a> {
             whnf_cache: FxHashMap::default(),
             infer_cache: FxHashMap::default(),
             def_eq_cache: FxHashSet::default(),
+            inst_lvl1_cache: FxHashMap::default(),
+            nat_zero: None,
+            nat_succ: None,
         }
     }
 
@@ -48,52 +54,24 @@ impl<'a> TypeChecker<'a> {
         id
     }
 
-    pub(crate) fn push_local(
-        &mut self,
-        name: NameId,
-        binder_info: BinderInfo,
-        ty: ExprId,
-        val: Option<ExprId>,
-    ) -> FVarId {
+    pub(crate) fn push_local(&mut self, name: NameId, binder_info: BinderInfo, ty: ExprId, val: Option<ExprId>) -> FVarId {
         let id = self.fresh_fvar();
-        self.locals.push(LocalDecl {
-            id,
-            name,
-            binder_info,
-            ty,
-            val,
-        });
+        self.locals.push(LocalDecl { id, name, binder_info, ty, val });
         id
     }
 
     pub(crate) fn push_existing_local(&mut self, id: FVarId, name: NameId, binder_info: BinderInfo, ty: ExprId) {
-        self.locals.push(LocalDecl {
-            id,
-            name,
-            binder_info,
-            ty,
-            val: None,
-        });
+        self.locals.push(LocalDecl { id, name, binder_info, ty, val: None });
     }
 
-    pub(crate) fn pop_local(&mut self) {
-        self.locals.pop();
-    }
+    pub(crate) fn pop_local(&mut self) { self.locals.pop(); }
 
     pub(crate) fn local_type(&self, id: FVarId) -> Option<ExprId> {
-        self.locals
-            .iter()
-            .rev()
-            .find(|l| l.id == id)
-            .map(|l| l.ty)
+        self.locals.iter().rev().find(|l| l.id == id).map(|l| l.ty)
     }
 
     pub(crate) fn local_value(&self, id: FVarId) -> Option<ExprId> {
-        self.locals
-            .iter()
-            .rev()
-            .find(|l| l.id == id)
-            .and_then(|l| l.val)
+        self.locals.iter().rev().find(|l| l.id == id).and_then(|l| l.val)
     }
 
     /// Infer the type of `e` in the current local context (DAG-memoized).
@@ -117,14 +95,16 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn infer_type_core(&mut self, e: ExprId) -> Result<ExprId, KernelError> {
-        match self.arena.get_expr(e).clone() {
-            ExprData::BVar(idx) => Err(KernelError::UnboundBVar(idx)),
-            ExprData::FVar(fv) => self.local_type(fv).ok_or(KernelError::UnknownFVar(fv)),
+        match self.arena.get_expr(e) {
+            ExprData::BVar(idx) => Err(KernelError::UnboundBVar(*idx)),
+            ExprData::FVar(fv) => self.local_type(*fv).ok_or(KernelError::UnknownFVar(*fv)),
             ExprData::Sort(u) => {
+                let u = *u;
                 let next = self.arena.lvl_succ(u);
                 Ok(self.arena.sort(next))
             }
             ExprData::Const(name, lvls) => {
+                let name = *name;
                 let decl = self
                     .decls
                     .get(&name)
@@ -137,9 +117,19 @@ impl<'a> TypeChecker<'a> {
                         got: lvls.len(),
                     });
                 }
-                Ok(instantiate_level_params(self.arena, decl.ty(), params, &lvls))
+                let ty = decl.ty();
+                if params.is_empty() || !self.arena.get_expr_meta(ty).has_level_param() {
+                    return Ok(ty);
+                }
+                if lvls.len() == 1 {
+                    let l0 = lvls[0];
+                    return Ok(self.inst_levels_cached(ty, params, &[l0]));
+                }
+                let lvls = lvls.clone();
+                Ok(instantiate_level_params(self.arena, ty, params, &lvls))
             }
             ExprData::App(f, a) => {
+                let (f, a) = (*f, *a);
                 let f_ty = self.infer_type(f)?;
                 let f_ty_whnf = self.whnf(f_ty);
                 let (dom, body) = match self.arena.get_expr(f_ty_whnf) {
@@ -155,12 +145,8 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ok(instantiate1(self.arena, body, a))
             }
-            ExprData::Pi {
-                name,
-                binder_info,
-                ty,
-                body,
-            } => {
+            ExprData::Pi { name, binder_info, ty, body } => {
+                let (name, binder_info, ty, body) = (*name, *binder_info, *ty, *body);
                 let u = self.infer_sort(ty)?;
                 let fv = self.push_local(name, binder_info, ty, None);
                 let fv_expr = self.arena.fvar(fv);
@@ -171,12 +157,8 @@ impl<'a> TypeChecker<'a> {
                 let res_lvl = self.arena.lvl_imax(u, v);
                 Ok(self.arena.sort(res_lvl))
             }
-            ExprData::Lam {
-                name,
-                binder_info,
-                ty,
-                body,
-            } => {
+            ExprData::Lam { name, binder_info, ty, body } => {
+                let (name, binder_info, ty, body) = (*name, *binder_info, *ty, *body);
                 let _u = self.infer_sort(ty)?;
                 let fv = self.push_local(name, binder_info, ty, None);
                 let fv_expr = self.arena.fvar(fv);
@@ -187,12 +169,8 @@ impl<'a> TypeChecker<'a> {
                 let abs_body_ty = abstract_fvars(self.arena, body_ty, &[fv]);
                 Ok(self.arena.pi(name, binder_info, ty, abs_body_ty))
             }
-            ExprData::Let {
-                name,
-                ty,
-                val,
-                body,
-            } => {
+            ExprData::Let { name, ty, val, body } => {
+                let (name, ty, val, body) = (*name, *ty, *val, *body);
                 let _u = self.infer_sort(ty)?;
                 let val_ty = self.infer_type(val)?;
                 if !self.is_def_eq(val_ty, ty)? {
@@ -207,7 +185,6 @@ impl<'a> TypeChecker<'a> {
                 let body_ty = self.infer_type(body_inst);
                 self.pop_local();
                 let body_ty = body_ty?;
-                // Substitute `fv -> val` so the returned type does not leak the local FVar.
                 let abs = abstract_fvars(self.arena, body_ty, &[fv]);
                 Ok(instantiate1(self.arena, abs, val))
             }
@@ -227,59 +204,36 @@ impl<'a> TypeChecker<'a> {
                     Err(KernelError::UnknownConstant(str_name))
                 }
             }
-            ExprData::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => self.infer_proj(struct_name, idx, expr),
+            ExprData::Proj { struct_name, idx, expr } => {
+                let (s, i, x) = (*struct_name, *idx, *expr);
+                self.infer_proj(s, i, x)
+            }
         }
     }
 
     /// Infer the type of a structure projection `Proj(S, idx, e)` while enforcing the
     /// Prop-elimination / Subsingleton soundness guard (never smuggle Type witnesses out of Prop).
     fn infer_proj(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> Result<ExprId, KernelError> {
+        let err = |reason| KernelError::InvalidProjection { struct_name, idx, reason };
         let ind = match self.decls.get(&struct_name) {
-            Some(Declaration::Inductive(i)) => i.clone(),
-            _ => {
-                return Err(KernelError::InvalidProjection {
-                    struct_name,
-                    idx,
-                    reason: "not an inductive type",
-                });
-            }
+            Some(Declaration::Inductive(i)) => i,
+            _ => return Err(err("not an inductive type")),
         };
         if ind.ctors.len() != 1 || ind.num_indices != 0 || ind.all.len() != 1 {
-            return Err(KernelError::InvalidProjection {
-                struct_name,
-                idx,
-                reason: "projection requires a non-mutual, 0-index, 1-constructor structure",
-            });
+            return Err(err("projection requires a non-mutual, 0-index, 1-constructor structure"));
         }
-        let ctor = match self.decls.get(&ind.ctors[0]) {
-            Some(Declaration::Constructor(c)) => c.clone(),
-            _ => unreachable!("structure constructor missing"),
+        let Some(Declaration::Constructor(ctor)) = self.decls.get(&ind.ctors[0]) else {
+            unreachable!("structure constructor missing");
         };
         if idx >= ctor.num_fields {
-            return Err(KernelError::InvalidProjection {
-                struct_name,
-                idx,
-                reason: "field index out of bounds",
-            });
+            return Err(err("field index out of bounds"));
         }
         let expr_ty = self.infer_type(expr)?;
         let expr_ty_whnf = self.whnf(expr_ty);
         let (head, args) = self.app_spine(expr_ty_whnf);
         let lvls = match self.arena.get_expr(head) {
-            ExprData::Const(n, ls) if *n == struct_name && args.len() == ind.num_params as usize => {
-                ls.clone()
-            }
-            _ => {
-                return Err(KernelError::InvalidProjection {
-                    struct_name,
-                    idx,
-                    reason: "expression type does not match structure",
-                });
-            }
+            ExprData::Const(n, ls) if *n == struct_name && args.len() == ind.num_params as usize => ls.clone(),
+            _ => return Err(err("expression type does not match structure")),
         };
 
         let mut cur = instantiate_level_params(self.arena, ctor.ty, &ctor.level_params, &lvls);
@@ -292,19 +246,14 @@ impl<'a> TypeChecker<'a> {
         }
         for field_i in 0..=idx {
             cur = self.whnf(cur);
-            match self.arena.get_expr(cur).clone() {
+            match self.arena.get_expr(cur) {
                 ExprData::Pi { ty, body, .. } => {
+                    let (ty, body) = (*ty, *body);
                     if field_i == idx {
-                        // Soundness guard: if structure is in Prop, projecting a non-Prop field
-                        // is ONLY allowed if the structure supports large elimination (Subsingleton).
                         if ind.is_prop && !ind.can_elim_large {
                             let field_sort = self.infer_sort(ty)?;
                             if !level_is_zero(self.arena, field_sort) {
-                                return Err(KernelError::InvalidProjection {
-                                    struct_name,
-                                    idx,
-                                    reason: "cannot project non-Prop field out of a non-Subsingleton Prop inductive",
-                                });
+                                return Err(err("cannot project non-Prop field out of a non-Subsingleton Prop inductive"));
                             }
                         }
                         return Ok(ty);
@@ -322,7 +271,6 @@ impl<'a> TypeChecker<'a> {
     pub fn check_decl(&mut self, decl: &Declaration) -> Result<(), KernelError> {
         let params = decl.level_params();
         check_unique_params(params)?;
-
         let ty = decl.ty();
         expr_check_level_params(self.arena, ty, params)?;
         let ty_sort = self.infer_sort(ty)?;
@@ -337,28 +285,19 @@ impl<'a> TypeChecker<'a> {
                 expr_check_level_params(self.arena, *val, params)?;
                 let val_ty = self.infer_type(*val)?;
                 if !self.is_def_eq(val_ty, ty)? {
-                    return Err(KernelError::TypeMismatch {
-                        expected: ty,
-                        got: val_ty,
-                    });
+                    return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
                 }
                 Ok(())
             }
             Declaration::Theorem { name, val, .. } => {
                 if !level_is_zero(self.arena, ty_sort) {
-                    let sort_expr = self.arena.sort(ty_sort);
-                    return Err(KernelError::TheoremNotInProp {
-                        name: *name,
-                        sort: sort_expr,
-                    });
+                    let sort = self.arena.sort(ty_sort);
+                    return Err(KernelError::TheoremNotInProp { name: *name, sort });
                 }
                 expr_check_level_params(self.arena, *val, params)?;
                 let val_ty = self.infer_type(*val)?;
                 if !self.is_def_eq(val_ty, ty)? {
-                    return Err(KernelError::TypeMismatch {
-                        expected: ty,
-                        got: val_ty,
-                    });
+                    return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
                 }
                 Ok(())
             }
