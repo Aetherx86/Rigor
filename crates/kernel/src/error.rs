@@ -27,6 +27,20 @@ pub enum KernelError {
         name: NameId,
         sort: ExprId,
     },
+    InvalidInductive(String),
+    NonPositiveInductive {
+        ind: NameId,
+        ctor: NameId,
+    },
+    UniverseTooSmall {
+        ind: NameId,
+        ctor: NameId,
+    },
+    InvalidProjection {
+        struct_name: NameId,
+        idx: u32,
+        reason: &'static str,
+    },
     Unsupported(&'static str),
 }
 
@@ -55,6 +69,18 @@ impl fmt::Display for KernelError {
             KernelError::TheoremNotInProp { name, sort } => {
                 write!(f, "theorem {name:?} must live in Prop (Sort 0), got {sort:?}")
             }
+            KernelError::InvalidInductive(msg) => write!(f, "invalid inductive declaration: {msg}"),
+            KernelError::NonPositiveInductive { ind, ctor } => {
+                write!(f, "non-strictly-positive occurrence of {ind:?} in constructor {ctor:?}")
+            }
+            KernelError::UniverseTooSmall { ind, ctor } => {
+                write!(f, "constructor {ctor:?} has a field in a universe larger than {ind:?}")
+            }
+            KernelError::InvalidProjection {
+                struct_name,
+                idx,
+                reason,
+            } => write!(f, "invalid projection {struct_name:?}.{idx}: {reason}"),
             KernelError::Unsupported(msg) => write!(f, "unsupported kernel feature: {msg}"),
         }
     }

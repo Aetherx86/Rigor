@@ -448,6 +448,11 @@ impl Arena {
         self.intern_expr(ExprData::Const(name, levels.into()))
     }
 
+    pub fn const_path(&mut self, path: &str, levels: impl Into<Box<[LevelId]>>) -> ExprId {
+        let n = self.name_from_path(path);
+        self.const_(n, levels)
+    }
+
     #[inline]
     pub fn app(&mut self, f: ExprId, a: ExprId) -> ExprId {
         self.intern_expr(ExprData::App(f, a))
@@ -480,14 +485,13 @@ impl Arena {
         })
     }
 
-    /// Non-dependent arrow `dom -> cod` (shifts loose bvars in `cod` by 1? Caller passes body in scope).
     #[inline]
     pub fn let_(&mut self, name: NameId, ty: ExprId, val: ExprId, body: ExprId) -> ExprId {
-        self.intern_expr(ExprData::Let {
-            name,
-            ty,
-            val,
-            body,
-        })
+        self.intern_expr(ExprData::Let { name, ty, val, body })
+    }
+
+    #[inline]
+    pub fn proj(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> ExprId {
+        self.intern_expr(ExprData::Proj { struct_name, idx, expr })
     }
 }

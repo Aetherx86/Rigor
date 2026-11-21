@@ -42,6 +42,12 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    pub(crate) fn fresh_fvar(&mut self) -> FVarId {
+        let id = FVarId(self.next_fvar);
+        self.next_fvar = self.next_fvar.checked_add(1).expect("FVarId overflow");
+        id
+    }
+
     pub(crate) fn push_local(
         &mut self,
         name: NameId,
@@ -49,8 +55,7 @@ impl<'a> TypeChecker<'a> {
         ty: ExprId,
         val: Option<ExprId>,
     ) -> FVarId {
-        let id = FVarId(self.next_fvar);
-        self.next_fvar = self.next_fvar.checked_add(1).expect("FVarId overflow");
+        let id = self.fresh_fvar();
         self.locals.push(LocalDecl {
             id,
             name,
@@ -59,6 +64,16 @@ impl<'a> TypeChecker<'a> {
             val,
         });
         id
+    }
+
+    pub(crate) fn push_existing_local(&mut self, id: FVarId, name: NameId, binder_info: BinderInfo, ty: ExprId) {
+        self.locals.push(LocalDecl {
+            id,
+            name,
+            binder_info,
+            ty,
+            val: None,
+        });
     }
 
     pub(crate) fn pop_local(&mut self) {
@@ -196,13 +211,111 @@ impl<'a> TypeChecker<'a> {
                 let abs = abstract_fvars(self.arena, body_ty, &[fv]);
                 Ok(instantiate1(self.arena, abs, val))
             }
-            ExprData::Lit(_) => Err(KernelError::Unsupported(
-                "Nat/String literals require Phase 2 inductive Nat/String types",
-            )),
-            ExprData::Proj { .. } => Err(KernelError::Unsupported(
-                "structure projections require Phase 2 inductive types",
-            )),
+            ExprData::Lit(crate::arena::Literal::Nat(_)) => {
+                let nat_name = self.arena.name_from_path("Nat");
+                if self.decls.contains_key(&nat_name) {
+                    Ok(self.arena.const_(nat_name, []))
+                } else {
+                    Err(KernelError::UnknownConstant(nat_name))
+                }
+            }
+            ExprData::Lit(crate::arena::Literal::Str(_)) => {
+                let str_name = self.arena.name_from_path("String");
+                if self.decls.contains_key(&str_name) {
+                    Ok(self.arena.const_(str_name, []))
+                } else {
+                    Err(KernelError::UnknownConstant(str_name))
+                }
+            }
+            ExprData::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => self.infer_proj(struct_name, idx, expr),
         }
+    }
+
+    /// Infer the type of a structure projection `Proj(S, idx, e)` while enforcing the
+    /// Prop-elimination / Subsingleton soundness guard (never smuggle Type witnesses out of Prop).
+    fn infer_proj(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> Result<ExprId, KernelError> {
+        let ind = match self.decls.get(&struct_name) {
+            Some(Declaration::Inductive(i)) => i.clone(),
+            _ => {
+                return Err(KernelError::InvalidProjection {
+                    struct_name,
+                    idx,
+                    reason: "not an inductive type",
+                });
+            }
+        };
+        if ind.ctors.len() != 1 || ind.num_indices != 0 || ind.all.len() != 1 {
+            return Err(KernelError::InvalidProjection {
+                struct_name,
+                idx,
+                reason: "projection requires a non-mutual, 0-index, 1-constructor structure",
+            });
+        }
+        let ctor = match self.decls.get(&ind.ctors[0]) {
+            Some(Declaration::Constructor(c)) => c.clone(),
+            _ => unreachable!("structure constructor missing"),
+        };
+        if idx >= ctor.num_fields {
+            return Err(KernelError::InvalidProjection {
+                struct_name,
+                idx,
+                reason: "field index out of bounds",
+            });
+        }
+        let expr_ty = self.infer_type(expr)?;
+        let expr_ty_whnf = self.whnf(expr_ty);
+        let (head, args) = self.app_spine(expr_ty_whnf);
+        let lvls = match self.arena.get_expr(head) {
+            ExprData::Const(n, ls) if *n == struct_name && args.len() == ind.num_params as usize => {
+                ls.clone()
+            }
+            _ => {
+                return Err(KernelError::InvalidProjection {
+                    struct_name,
+                    idx,
+                    reason: "expression type does not match structure",
+                });
+            }
+        };
+
+        let mut cur = instantiate_level_params(self.arena, ctor.ty, &ctor.level_params, &lvls);
+        for &p_arg in &args {
+            cur = self.whnf(cur);
+            match self.arena.get_expr(cur) {
+                ExprData::Pi { body, .. } => cur = instantiate1(self.arena, *body, p_arg),
+                _ => unreachable!("constructor parameter telescope mismatch"),
+            }
+        }
+        for field_i in 0..=idx {
+            cur = self.whnf(cur);
+            match self.arena.get_expr(cur).clone() {
+                ExprData::Pi { ty, body, .. } => {
+                    if field_i == idx {
+                        // Soundness guard: if structure is in Prop, projecting a non-Prop field
+                        // is ONLY allowed if the structure supports large elimination (Subsingleton).
+                        if ind.is_prop && !ind.can_elim_large {
+                            let field_sort = self.infer_sort(ty)?;
+                            if !level_is_zero(self.arena, field_sort) {
+                                return Err(KernelError::InvalidProjection {
+                                    struct_name,
+                                    idx,
+                                    reason: "cannot project non-Prop field out of a non-Subsingleton Prop inductive",
+                                });
+                            }
+                        }
+                        return Ok(ty);
+                    }
+                    let prev_proj = self.arena.proj(struct_name, field_i, expr);
+                    cur = instantiate1(self.arena, body, prev_proj);
+                }
+                _ => unreachable!("constructor field telescope mismatch"),
+            }
+        }
+        unreachable!()
     }
 
     /// Check that `decl` is completely well-formed and well-typed in the current environment.
@@ -215,7 +328,10 @@ impl<'a> TypeChecker<'a> {
         let ty_sort = self.infer_sort(ty)?;
 
         match decl {
-            Declaration::Axiom { .. } => Ok(()),
+            Declaration::Axiom { .. }
+            | Declaration::Inductive(_)
+            | Declaration::Constructor(_)
+            | Declaration::Recursor(_) => Ok(()),
             Declaration::Definition { val, .. } | Declaration::Opaque { val, .. } => {
                 expr_check_level_params(self.arena, *val, params)?;
                 let val_ty = self.infer_type(*val)?;

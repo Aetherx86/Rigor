@@ -3,14 +3,17 @@
 
 use std::time::Instant;
 
-use rigor_kernel::{Arena, BinderInfo, Declaration, Environment, ReducibilityHint};
+use rigor_kernel::{
+    Arena, BinderInfo, Declaration, Environment, InductiveSpec, InductiveTypeSpec, ReducibilityHint,
+};
 
 fn main() {
-    println!("Rigor Phase 1 Micro-Benchmarks");
-    println!("==============================");
+    println!("Rigor Phase 1 & 2 Micro-Benchmarks");
+    println!("==================================");
 
     bench_arena_hash_consing();
     bench_church_reduction();
+    bench_nat_iota_reduction();
     bench_parallel_theorems();
 }
 
@@ -199,6 +202,129 @@ fn bench_church_reduction() {
     let elapsed = t0.elapsed();
     println!(
         "[2] Church numeral reduction (mul 20 25 == 500 by refl): {:.3} ms (arena nodes: {})",
+        elapsed.as_secs_f64() * 1000.0,
+        env.arena.expr_len()
+    );
+}
+
+fn bench_nat_iota_reduction() {
+    let mut env = Environment::new();
+    let l1 = env.arena.lvl_nat(1);
+    let type0 = env.arena.sort(l1);
+    let prop = env.arena.prop();
+    let nat_n = env.arena.name_from_path("Nat");
+    let z_n = env.arena.name_from_path("Nat.zero");
+    let s_n = env.arena.name_from_path("Nat.succ");
+    let nat = env.arena.const_(nat_n, []);
+    let s_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+    env.add_inductive(InductiveSpec {
+        level_params: Box::new([]),
+        num_params: 0,
+        types: vec![InductiveTypeSpec { name: nat_n, ty: type0, ctors: vec![(z_n, nat), (s_n, s_ty)] }],
+    })
+    .unwrap();
+
+    let u = env.arena.name_from_path("u");
+    let lu = env.arena.lvl_param(u);
+    let su = env.arena.sort(lu);
+    let eq_n = env.arena.name_from_path("Eq");
+    let refl_n = env.arena.name_from_path("Eq.refl");
+    let b0 = env.arena.bvar(0);
+    let b1 = env.arena.bvar(1);
+    let b3 = env.arena.bvar(3);
+    let eq_ty = {
+        let tb = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, b1, prop);
+        let ta = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, b0, tb);
+        env.arena.pi(Arena::ANONYMOUS, BinderInfo::Implicit, su, ta)
+    };
+    let eq_u = env.arena.const_(eq_n, [lu]);
+    let refl_ty = {
+        let ret = env.arena.app_n(eq_u, &[b1, b0, b0]);
+        let ta = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, b0, ret);
+        env.arena.pi(Arena::ANONYMOUS, BinderInfo::Implicit, su, ta)
+    };
+    env.add_inductive(InductiveSpec {
+        level_params: Box::new([u]),
+        num_params: 2,
+        types: vec![InductiveTypeSpec { name: eq_n, ty: eq_ty, ctors: vec![(refl_n, refl_ty)] }],
+    })
+    .unwrap();
+
+    let zero = env.arena.const_(z_n, []);
+    let succ = env.arena.const_(s_n, []);
+    let rec1 = env.arena.const_path("Nat.rec", [l1]);
+    let bin_ty = {
+        let i = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+        env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, i)
+    };
+    let motive = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+
+    let add_n = env.arena.name_from_path("Nat.add");
+    let add_val = {
+        let sb0 = env.arena.app(succ, b0);
+        let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, sb0);
+        let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, st);
+        let rc = env.arena.app_n(rec1, &[motive, b1, st, b0]);
+        let lb = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, rc);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, lb)
+    };
+    env.add_decl(Declaration::Definition {
+        name: add_n,
+        level_params: Box::new([]),
+        ty: bin_ty,
+        val: add_val,
+        hint: ReducibilityHint::Regular(0),
+    })
+    .unwrap();
+    let add_c = env.arena.const_(add_n, []);
+
+    let mul_n = env.arena.name_from_path("Nat.mul");
+    let mul_val = {
+        let a_ih = env.arena.app_n(add_c, &[b0, b3]);
+        let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, a_ih);
+        let st = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, st);
+        let rc = env.arena.app_n(rec1, &[motive, zero, st, b0]);
+        let lb = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, rc);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, lb)
+    };
+    env.add_decl(Declaration::Definition {
+        name: mul_n,
+        level_params: Box::new([]),
+        ty: bin_ty,
+        val: mul_val,
+        hint: ReducibilityHint::Regular(0),
+    })
+    .unwrap();
+    let mul_c = env.arena.const_(mul_n, []);
+
+    let mk_nat = |arena: &mut Arena, k: u32| {
+        let mut x = zero;
+        for _ in 0..k {
+            x = arena.app(succ, x);
+        }
+        x
+    };
+    let n20 = mk_nat(&mut env.arena, 20);
+    let n25 = mk_nat(&mut env.arena, 25);
+    let n500 = mk_nat(&mut env.arena, 500);
+    let lhs = env.arena.app_n(mul_c, &[n20, n25]);
+    let eq1 = env.arena.const_(eq_n, [l1]);
+    let refl1 = env.arena.const_(refl_n, [l1]);
+    let thm_ty = env.arena.app_n(eq1, &[nat, lhs, n500]);
+    let thm_val = env.arena.app_n(refl1, &[nat, n500]);
+    let thm_n = env.arena.name_from_path("nat_rec_20x25");
+
+    let t0 = Instant::now();
+    env.add_decl(Declaration::Theorem {
+        name: thm_n,
+        level_params: Box::new([]),
+        ty: thm_ty,
+        val: thm_val,
+    })
+    .expect("Nat.mul 20 25 == 500 via Nat.rec must verify");
+    let elapsed = t0.elapsed();
+    println!(
+        "[2b] Inductive Nat.rec iota reduction (mul 20 25 == 500 by refl): {:.3} ms (arena nodes: {})",
         elapsed.as_secs_f64() * 1000.0,
         env.arena.expr_len()
     );

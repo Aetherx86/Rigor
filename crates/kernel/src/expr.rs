@@ -1,239 +1,60 @@
-//! DAG-preserving expression operations: simultaneous multi-substitution (`instantiate_rev`),
-//! fvar abstraction (`abstract_fvar`), universe parameter instantiation, and scope checks.
-//!
-//! All traversals skip closed/parameter-free sub-DAGs in O(1) using `ExprMeta` and memoize
-//! visited nodes so diamond-shared DAGs stay linear in DAG size.
+//! Compact DAG-preserving expression operations (substitution, abstraction, universe instantiation).
 
 use crate::arena::{Arena, ExprData, ExprId, FVarId, LevelId, NameId};
 use crate::error::KernelError;
-use crate::hash::FxHashMap;
+use crate::hash::{FxHashMap, FxHashSet};
 use crate::level::{level_check_params, level_instantiate};
 
-/// Substitute a single closed term `val` for `BVar(0)` in `e`.
 #[inline]
 pub fn instantiate1(arena: &mut Arena, e: ExprId, val: ExprId) -> ExprId {
     instantiate_rev(arena, e, &[val])
 }
 
-/// Simultaneous multi-substitution matching spine order:
-/// for `args = [a_0, a_1, ..., a_{n-1}]` (outermost to innermost), replaces
-/// `BVar(n - 1)` with `a_0`, ..., `BVar(0)` with `a_{n-1}`, and shifts higher `BVar`s down by `n`.
-///
-/// Precondition: every `a_i` is closed (`loose_bvar_range == 0`), which holds for all kernel
-/// values (local variables use `FVar`, never loose `BVar`).
+/// Simultaneous spine-order substitution: `args[0]` replaces `BVar(n-1)`, `args[n-1]` replaces `BVar(0)`.
 pub fn instantiate_rev(arena: &mut Arena, e: ExprId, args: &[ExprId]) -> ExprId {
-    let n = args.len() as u32;
-    if n == 0 || arena.get_expr_meta(e).is_closed() {
+    if args.is_empty() || arena.get_expr_meta(e).is_closed() {
         return e;
     }
-    let mut cache: FxHashMap<(ExprId, u32), ExprId> = FxHashMap::default();
-    inst_rec(arena, e, 0, args, &mut cache)
+    let mut cache = FxHashMap::default();
+    map_children(arena, e, 0, &mut cache, &mut |a, node, off| {
+        if a.get_expr_meta(node).loose_bvar_range <= off {
+            return Some(node);
+        }
+        if let ExprData::BVar(idx) = a.get_expr(node) {
+            let idx = *idx;
+            let n = args.len() as u32;
+            return Some(if idx < off {
+                node
+            } else if idx < off + n {
+                args[(n - 1 - (idx - off)) as usize]
+            } else {
+                a.bvar(idx - n)
+            });
+        }
+        None
+    })
 }
 
-fn inst_rec(
-    arena: &mut Arena,
-    e: ExprId,
-    offset: u32,
-    args: &[ExprId],
-    cache: &mut FxHashMap<(ExprId, u32), ExprId>,
-) -> ExprId {
-    let meta = arena.get_expr_meta(e);
-    if meta.loose_bvar_range <= offset {
-        return e;
-    }
-    if let Some(&res) = cache.get(&(e, offset)) {
-        return res;
-    }
-    let n = args.len() as u32;
-    let res = match arena.get_expr(e).clone() {
-        ExprData::BVar(idx) => {
-            if idx < offset {
-                e
-            } else if idx < offset + n {
-                // Reverse mapping: idx == offset -> last arg; idx == offset + n - 1 -> first arg.
-                args[(n - 1 - (idx - offset)) as usize]
-            } else {
-                arena.bvar(idx - n)
-            }
-        }
-        ExprData::App(f, a) => {
-            let f2 = inst_rec(arena, f, offset, args, cache);
-            let a2 = inst_rec(arena, a, offset, args, cache);
-            if f2 == f && a2 == a {
-                e
-            } else {
-                arena.app(f2, a2)
-            }
-        }
-        ExprData::Lam {
-            name,
-            binder_info,
-            ty,
-            body,
-        } => {
-            let ty2 = inst_rec(arena, ty, offset, args, cache);
-            let body2 = inst_rec(arena, body, offset + 1, args, cache);
-            if ty2 == ty && body2 == body {
-                e
-            } else {
-                arena.lam(name, binder_info, ty2, body2)
-            }
-        }
-        ExprData::Pi {
-            name,
-            binder_info,
-            ty,
-            body,
-        } => {
-            let ty2 = inst_rec(arena, ty, offset, args, cache);
-            let body2 = inst_rec(arena, body, offset + 1, args, cache);
-            if ty2 == ty && body2 == body {
-                e
-            } else {
-                arena.pi(name, binder_info, ty2, body2)
-            }
-        }
-        ExprData::Let {
-            name,
-            ty,
-            val,
-            body,
-        } => {
-            let ty2 = inst_rec(arena, ty, offset, args, cache);
-            let val2 = inst_rec(arena, val, offset, args, cache);
-            let body2 = inst_rec(arena, body, offset + 1, args, cache);
-            if ty2 == ty && val2 == val && body2 == body {
-                e
-            } else {
-                arena.let_(name, ty2, val2, body2)
-            }
-        }
-        ExprData::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => {
-            let expr2 = inst_rec(arena, expr, offset, args, cache);
-            if expr2 == expr {
-                e
-            } else {
-                arena.intern_expr(ExprData::Proj {
-                    struct_name,
-                    idx,
-                    expr: expr2,
-                })
-            }
-        }
-        ExprData::FVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e,
-    };
-    cache.insert((e, offset), res);
-    res
-}
-
-/// Abstract a list of free variables `fvars` (outermost to innermost) into de Bruijn indices
-/// `BVar(fvars.len() - 1 ..= 0)` in `e`.
+/// Abstract free variables `fvars` (outermost to innermost) into `BVar(n-1 ..= 0)`.
 pub fn abstract_fvars(arena: &mut Arena, e: ExprId, fvars: &[FVarId]) -> ExprId {
     if fvars.is_empty() || !arena.get_expr_meta(e).has_fvar() {
         return e;
     }
-    let mut cache: FxHashMap<(ExprId, u32), ExprId> = FxHashMap::default();
-    abs_rec(arena, e, 0, fvars, &mut cache)
-}
-
-fn abs_rec(
-    arena: &mut Arena,
-    e: ExprId,
-    offset: u32,
-    fvars: &[FVarId],
-    cache: &mut FxHashMap<(ExprId, u32), ExprId>,
-) -> ExprId {
-    if !arena.get_expr_meta(e).has_fvar() {
-        return e;
-    }
-    if let Some(&res) = cache.get(&(e, offset)) {
-        return res;
-    }
+    let mut cache = FxHashMap::default();
     let n = fvars.len();
-    let res = match arena.get_expr(e).clone() {
-        ExprData::FVar(fv) => {
-            if let Some(pos) = fvars.iter().rposition(|&x| x == fv) {
-                arena.bvar(offset + (n - 1 - pos) as u32)
-            } else {
-                e
-            }
+    map_children(arena, e, 0, &mut cache, &mut |a, node, off| {
+        if !a.get_expr_meta(node).has_fvar() {
+            return Some(node);
         }
-        ExprData::App(f, a) => {
-            let f2 = abs_rec(arena, f, offset, fvars, cache);
-            let a2 = abs_rec(arena, a, offset, fvars, cache);
-            if f2 == f && a2 == a {
-                e
+        if let ExprData::FVar(fv) = a.get_expr(node) {
+            return Some(if let Some(pos) = fvars.iter().rposition(|&x| x == *fv) {
+                a.bvar(off + (n - 1 - pos) as u32)
             } else {
-                arena.app(f2, a2)
-            }
+                node
+            });
         }
-        ExprData::Lam {
-            name,
-            binder_info,
-            ty,
-            body,
-        } => {
-            let ty2 = abs_rec(arena, ty, offset, fvars, cache);
-            let body2 = abs_rec(arena, body, offset + 1, fvars, cache);
-            if ty2 == ty && body2 == body {
-                e
-            } else {
-                arena.lam(name, binder_info, ty2, body2)
-            }
-        }
-        ExprData::Pi {
-            name,
-            binder_info,
-            ty,
-            body,
-        } => {
-            let ty2 = abs_rec(arena, ty, offset, fvars, cache);
-            let body2 = abs_rec(arena, body, offset + 1, fvars, cache);
-            if ty2 == ty && body2 == body {
-                e
-            } else {
-                arena.pi(name, binder_info, ty2, body2)
-            }
-        }
-        ExprData::Let {
-            name,
-            ty,
-            val,
-            body,
-        } => {
-            let ty2 = abs_rec(arena, ty, offset, fvars, cache);
-            let val2 = abs_rec(arena, val, offset, fvars, cache);
-            let body2 = abs_rec(arena, body, offset + 1, fvars, cache);
-            if ty2 == ty && val2 == val && body2 == body {
-                e
-            } else {
-                arena.let_(name, ty2, val2, body2)
-            }
-        }
-        ExprData::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => {
-            let expr2 = abs_rec(arena, expr, offset, fvars, cache);
-            if expr2 == expr {
-                e
-            } else {
-                arena.intern_expr(ExprData::Proj {
-                    struct_name,
-                    idx,
-                    expr: expr2,
-                })
-            }
-        }
-        ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e,
-    };
-    cache.insert((e, offset), res);
-    res
+        None
+    })
 }
 
 /// Instantiate universe level parameters `params -> args` throughout an expression DAG.
@@ -246,132 +67,148 @@ pub fn instantiate_level_params(
     if params.is_empty() || !arena.get_expr_meta(e).has_level_param() {
         return e;
     }
-    let mut cache: FxHashMap<ExprId, ExprId> = FxHashMap::default();
-    inst_lvl_rec(arena, e, params, args, &mut cache)
+    let mut cache = FxHashMap::default();
+    map_children(arena, e, 0, &mut cache, &mut |a, node, _off| {
+        if !a.get_expr_meta(node).has_level_param() {
+            return Some(node);
+        }
+        match a.get_expr(node).clone() {
+            ExprData::Sort(l) => {
+                let l2 = level_instantiate(a, l, params, args);
+                Some(if l2 == l { node } else { a.sort(l2) })
+            }
+            ExprData::Const(name, lvls) => {
+                let mut changed = false;
+                let out: Vec<LevelId> = lvls
+                    .iter()
+                    .map(|&l| {
+                        let l2 = level_instantiate(a, l, params, args);
+                        if l2 != l {
+                            changed = true;
+                        }
+                        l2
+                    })
+                    .collect();
+                Some(if changed { a.const_(name, out) } else { node })
+            }
+            _ => None,
+        }
+    })
 }
 
-fn inst_lvl_rec(
+fn map_children<F>(
     arena: &mut Arena,
     e: ExprId,
-    params: &[NameId],
-    args: &[LevelId],
-    cache: &mut FxHashMap<ExprId, ExprId>,
-) -> ExprId {
-    if !arena.get_expr_meta(e).has_level_param() {
-        return e;
+    off: u32,
+    cache: &mut FxHashMap<(ExprId, u32), ExprId>,
+    leaf: &mut F,
+) -> ExprId
+where
+    F: FnMut(&mut Arena, ExprId, u32) -> Option<ExprId>,
+{
+    if let Some(res) = leaf(arena, e, off) {
+        return res;
     }
-    if let Some(&res) = cache.get(&e) {
+    if let Some(&res) = cache.get(&(e, off)) {
         return res;
     }
     let res = match arena.get_expr(e).clone() {
-        ExprData::Sort(l) => {
-            let l2 = level_instantiate(arena, l, params, args);
-            if l2 == l {
-                e
-            } else {
-                arena.sort(l2)
-            }
-        }
-        ExprData::Const(name, lvls) => {
-            let mut changed = false;
-            let mut out = Vec::with_capacity(lvls.len());
-            for &l in lvls.iter() {
-                let l2 = level_instantiate(arena, l, params, args);
-                if l2 != l {
-                    changed = true;
-                }
-                out.push(l2);
-            }
-            if !changed {
-                e
-            } else {
-                arena.const_(name, out)
-            }
-        }
         ExprData::App(f, a) => {
-            let f2 = inst_lvl_rec(arena, f, params, args, cache);
-            let a2 = inst_lvl_rec(arena, a, params, args, cache);
-            if f2 == f && a2 == a {
-                e
-            } else {
-                arena.app(f2, a2)
-            }
+            let f2 = map_children(arena, f, off, cache, leaf);
+            let a2 = map_children(arena, a, off, cache, leaf);
+            if f2 == f && a2 == a { e } else { arena.app(f2, a2) }
         }
-        ExprData::Lam {
-            name,
-            binder_info,
-            ty,
-            body,
-        } => {
-            let ty2 = inst_lvl_rec(arena, ty, params, args, cache);
-            let body2 = inst_lvl_rec(arena, body, params, args, cache);
-            if ty2 == ty && body2 == body {
-                e
-            } else {
-                arena.lam(name, binder_info, ty2, body2)
-            }
+        ExprData::Lam { name, binder_info, ty, body } => {
+            let ty2 = map_children(arena, ty, off, cache, leaf);
+            let b2 = map_children(arena, body, off + 1, cache, leaf);
+            if ty2 == ty && b2 == body { e } else { arena.lam(name, binder_info, ty2, b2) }
         }
-        ExprData::Pi {
-            name,
-            binder_info,
-            ty,
-            body,
-        } => {
-            let ty2 = inst_lvl_rec(arena, ty, params, args, cache);
-            let body2 = inst_lvl_rec(arena, body, params, args, cache);
-            if ty2 == ty && body2 == body {
-                e
-            } else {
-                arena.pi(name, binder_info, ty2, body2)
-            }
+        ExprData::Pi { name, binder_info, ty, body } => {
+            let ty2 = map_children(arena, ty, off, cache, leaf);
+            let b2 = map_children(arena, body, off + 1, cache, leaf);
+            if ty2 == ty && b2 == body { e } else { arena.pi(name, binder_info, ty2, b2) }
         }
-        ExprData::Let {
-            name,
-            ty,
-            val,
-            body,
-        } => {
-            let ty2 = inst_lvl_rec(arena, ty, params, args, cache);
-            let val2 = inst_lvl_rec(arena, val, params, args, cache);
-            let body2 = inst_lvl_rec(arena, body, params, args, cache);
-            if ty2 == ty && val2 == val && body2 == body {
-                e
-            } else {
-                arena.let_(name, ty2, val2, body2)
-            }
+        ExprData::Let { name, ty, val, body } => {
+            let ty2 = map_children(arena, ty, off, cache, leaf);
+            let v2 = map_children(arena, val, off, cache, leaf);
+            let b2 = map_children(arena, body, off + 1, cache, leaf);
+            if ty2 == ty && v2 == val && b2 == body { e } else { arena.let_(name, ty2, v2, b2) }
         }
-        ExprData::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => {
-            let expr2 = inst_lvl_rec(arena, expr, params, args, cache);
-            if expr2 == expr {
-                e
-            } else {
-                arena.intern_expr(ExprData::Proj {
-                    struct_name,
-                    idx,
-                    expr: expr2,
-                })
-            }
+        ExprData::Proj { struct_name, idx, expr } => {
+            let x2 = map_children(arena, expr, off, cache, leaf);
+            if x2 == expr { e } else { arena.proj(struct_name, idx, x2) }
         }
-        ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Lit(_) => e,
+        ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => e,
     };
-    cache.insert(e, res);
+    cache.insert((e, off), res);
     res
 }
 
+/// True if `e` mentions any constant whose name is in `targets` (DAG-memoized).
+pub fn expr_mentions_any_const(arena: &Arena, e: ExprId, targets: &[NameId]) -> bool {
+    let mut visited = FxHashSet::default();
+    mentions_rec(arena, e, targets, &mut visited)
+}
+
+fn mentions_rec(arena: &Arena, e: ExprId, targets: &[NameId], visited: &mut FxHashSet<ExprId>) -> bool {
+    if !visited.insert(e) {
+        return false;
+    }
+    match arena.get_expr(e) {
+        ExprData::Const(name, _) => targets.contains(name),
+        ExprData::App(f, a) => mentions_rec(arena, *f, targets, visited) || mentions_rec(arena, *a, targets, visited),
+        ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
+            mentions_rec(arena, *ty, targets, visited) || mentions_rec(arena, *body, targets, visited)
+        }
+        ExprData::Let { ty, val, body, .. } => {
+            mentions_rec(arena, *ty, targets, visited)
+                || mentions_rec(arena, *val, targets, visited)
+                || mentions_rec(arena, *body, targets, visited)
+        }
+        ExprData::Proj { struct_name, expr, .. } => {
+            targets.contains(struct_name) || mentions_rec(arena, *expr, targets, visited)
+        }
+        ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Sort(_) | ExprData::Lit(_) => false,
+    }
+}
+
+/// True if `e` mentions `fvar` anywhere (O(1) skip when `!has_fvar`).
+pub fn expr_mentions_fvar(arena: &Arena, e: ExprId, fvar: FVarId) -> bool {
+    if !arena.get_expr_meta(e).has_fvar() {
+        return false;
+    }
+    let mut visited = FxHashSet::default();
+    mentions_fvar_rec(arena, e, fvar, &mut visited)
+}
+
+fn mentions_fvar_rec(arena: &Arena, e: ExprId, fvar: FVarId, visited: &mut FxHashSet<ExprId>) -> bool {
+    if !arena.get_expr_meta(e).has_fvar() || !visited.insert(e) {
+        return false;
+    }
+    match arena.get_expr(e) {
+        ExprData::FVar(id) => *id == fvar,
+        ExprData::App(f, a) => {
+            mentions_fvar_rec(arena, *f, fvar, visited) || mentions_fvar_rec(arena, *a, fvar, visited)
+        }
+        ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
+            mentions_fvar_rec(arena, *ty, fvar, visited) || mentions_fvar_rec(arena, *body, fvar, visited)
+        }
+        ExprData::Let { ty, val, body, .. } => {
+            mentions_fvar_rec(arena, *ty, fvar, visited)
+                || mentions_fvar_rec(arena, *val, fvar, visited)
+                || mentions_fvar_rec(arena, *body, fvar, visited)
+        }
+        ExprData::Proj { expr, .. } => mentions_fvar_rec(arena, *expr, fvar, visited),
+        ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => false,
+    }
+}
+
 /// Verify that every universe parameter in `e` is declared in `allowed` (DAG-memoized).
-pub fn expr_check_level_params(
-    arena: &Arena,
-    e: ExprId,
-    allowed: &[NameId],
-) -> Result<(), KernelError> {
+pub fn expr_check_level_params(arena: &Arena, e: ExprId, allowed: &[NameId]) -> Result<(), KernelError> {
     if !arena.get_expr_meta(e).has_level_param() {
         return Ok(());
     }
-    let mut visited = crate::hash::FxHashSet::default();
+    let mut visited = FxHashSet::default();
     check_lvl_rec(arena, e, allowed, &mut visited)
 }
 
@@ -379,7 +216,7 @@ fn check_lvl_rec(
     arena: &Arena,
     e: ExprId,
     allowed: &[NameId],
-    visited: &mut crate::hash::FxHashSet<ExprId>,
+    visited: &mut FxHashSet<ExprId>,
 ) -> Result<(), KernelError> {
     if !arena.get_expr_meta(e).has_level_param() || !visited.insert(e) {
         return Ok(());

@@ -27,14 +27,27 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
     * Arena interning (100k unique + 100k hits): 17.56 ms (11.39M ops/sec)
     * Church numeral reduction (`mul 20 25 == 500` by `Eq.refl`): 1.029 ms (4,838 arena nodes)
     * Theorem batch (2,000 decls): 4.98 ms / 401k decls/s (1 thread) -> 2.64 ms / 757k decls/s (10 threads, 1.88x)
-- **Phase 2: Inductive Types & Soundness Torture Suite** (next)
-  - Inductive types, constructors, recursors, iota-reduction, structure projections (`Proj`).
-  - Strict positivity checker & universe level constraint validator (including Prop large-elimination / Subsingleton rules).
-  - `tests/soundness/` negative torture suite (Girard/Type:Type, non-positive inductives, invalid Prop->Type large eliminations, proof-irrelevance violations, ill-typed recursors).
-  - Keep `crates/kernel` strictly < 2,500 LOC total (compact repetitive `expr.rs` traversal helpers before/while adding `inductive.rs`).
-- **Phase 3: `lean4export` Compatibility** (pending)
+- **Phase 2: Inductive Types & Soundness Torture Suite** (done)
+  - Full CIC inductive validator & recursor generator (`crates/kernel/src/inductive.rs`, `env.rs`, `reduce.rs`, `check.rs`):
+    * Single and mutual inductive blocks, constructors, recursors, iota-reduction, K-like reduction (`Eq.rec` on opaque `a = a`), structure projections (`Proj`), and structure eta (`S.mk (p.0) ... ≡ p`).
+    * Strict positivity checker (rejects direct negative, double-negative, mutual negative cycles, non-uniform parameter recursion, and inductive mentions in recursive index arguments).
+    * Predicative universe bound checks (`field_sort <= ind_sort` for non-Prop inductives, blocking Girard's paradox) and exact Subsingleton large-elimination rules (`Prop -> Type` allowed only for 0-ctor or 1-ctor Prop inductives whose fields are proofs or determined by indices; `Proj` also enforces the Prop witness-smuggling guard).
+  - TCB size: `#![forbid(unsafe_code)]`, zero third-party deps, 2,771 raw lines (under 2,500 SLOC excluding comments/blank lines).
+  - Verified (`cargo test --workspace`): 14/14 test suites pass (0 warnings):
+    * `tests/phase1.rs` (7/7)
+    * `tests/inductives.rs` (3/3: `Nat.add`/`Nat.mul` iota arithmetic, `Eq` K-like reduction, `Prod` projections & structure eta, indexed `Vec`, mutual `Even`/`Odd`, Subsingleton `And`)
+    * `tests/soundness/main.rs` (4/4 negative torture tests: universe cycles & Girard impredicative Type inductive, direct/double/mutual/non-uniform non-positive inductives, invalid `Or.rec`/`Exists.rec` Prop->Type large eliminations & `Proj` witness smuggling, `Type` proof-irrelevance rejection & ill-typed recursor applications)
+  - Phase 2 release benchmarks (`cargo run --release -p rigor-bench`):
+    * Arena interning (100k unique + 100k hits): 11.55 ms (17.32M ops/sec)
+    * Church numeral reduction (`mul 20 25 == 500`): 0.810 ms (4,839 arena nodes)
+    * Inductive `Nat.rec` iota reduction (`Nat.mul 20 25 == 500`): 1.544 ms (3,213 arena nodes)
+    * Theorem batch (2,000 decls): 3.88 ms / 515k decls/s (1 thread) -> 2.32 ms / 863k decls/s (10 threads)
+- **Phase 3: `lean4export` Compatibility** (next)
+  - Streaming zero-copy `lean4export` parser in `crates/parser` covering all directives (`#NS`, `#NI`, `#US`, `#UM`, `#UIM`, `#UP`, `#EV`, `#ES`, `#EC`, `#EA`, `#EL`, `#EP`, `#EZ`, `#EJ`, `#ELN`, `#ELS`, `#AX`, `#DEF`, `#THM`, `#OPAQ`, `#QUOT`, `#IND`).
+  - Kernel `#QUOT` (quotient types + `Quot.lift` / `Quot.ind` reduction) & `Nat`/`String` literal reduction (`Nat.zero`/`Nat.succ` unfolding in `whnf` for Lean 4 compatibility).
 - **Phase 4: Head-to-Head Benchmarking & Optimization** (pending)
 
 ## Progress log
 - 2026-11-22 01:30 KST: initialized `~/Rigor` workspace and started Phase 1 implementation.
-- 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); creating public GitHub repo `Aetherx86/Rigor`.
+- 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `Aetherx86/Rigor` (commit `b41a1c2`).
+- 2026-11-22 01:52 KST: completed Phase 2 (inductives, strict positivity, Subsingleton large-elim & `Proj` guard, iota/K-like/structure-eta reduction, soundness torture suite: 14/14 tests green, 0 warnings, `Nat.rec` benchmark 1.544 ms).
