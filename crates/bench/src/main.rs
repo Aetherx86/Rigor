@@ -863,7 +863,7 @@ fn bench_primality_reflection(print: bool) -> f64 {
     let is_prime_c = add_def(&mut s.env, "Nat.isPrime", n2b, is_prime_val);
 
     let t0 = Instant::now();
-    for (num, expected_prime) in [(51u64, false), (53, true), (97, true)] {
+    for (num, expected_prime) in [(51u128, false), (53, true), (97, true)] {
         let lit = s.env.arena.lit_nat(num);
         let exp = if expected_prime { s.b_true } else { s.b_false };
         let lhs = s.env.arena.app(is_prime_c, lit);

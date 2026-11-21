@@ -13,7 +13,7 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
 ## Toolchain status
 - `cargo` / `rustc`: Homebrew keg-only rustup (`/opt/homebrew/opt/rustup/bin`).
 - `gh`: installed (`/opt/homebrew/bin/gh`).
-- `lean` / `lake`: not currently installed (needed in Phase 3/4 for real `lean4export` artifacts and `lean4checker` head-to-head benchmarks).
+- `elan` / `lean` / `lake` / `leanchecker`: installed via Homebrew `elan-init` (`leanprover/lean4:v4.36.0-rc1`); `leanprover/lean4export` built at `/tmp/lean4-tools/lean4export`.
 
 ## Phase plan & status
 - **Phase 1: Core Calculus & Arena Engine** (done)
@@ -59,16 +59,15 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
     * Unified spine abstract machine (`whnf_spine_with`) avoiding intermediate `App` re-interning across beta/zeta/proj/quot/iota/delta.
     * Zero-clone `&'a` decl borrows, cached 1-param level instantiation (`inst_lvl1_cache`), cached `Nat.zero`/`Nat.succ`, deferred `is_proof`, and lazy `FxHashMap` allocation in `expr.rs` `map_children`.
   - Regression test added in `crates/kernel/tests/inductives.rs` covering over-applied `Nat.rec`, over-applied `Quot.lift`, and `Lam` proof irrelevance (`19/19` tests green, `0` warnings).
-  - TCB size audit: `crates/kernel/src/*.rs` = **2,484 SLOC** (`#![forbid(unsafe_code)]`, zero external deps).
-  - Key before/after speedups documented in `BENCHMARKS.md`:
-    * `Nat.rec` `mul 30*40 == 1200`: `3.764 ms -> 0.427 ms` (`8.81x`)
-    * Ackermann `ack(3, 5) == 253`: `2.051 ms -> 0.285 ms` (`7.20x`)
-    * Primality reflection (`51/53/97`): `38.395 ms -> 10.036 ms` (`3.83x`, `-35.4%` arena nodes)
-    * `mathlib_subset_100k.export` (100k decls, 587k lines, 11.29 MiB): `222.98 ms / 61.02 MB RSS -> 113.26 ms (883k decls/s, 1.97x) / 46.56 MB RSS (-23.7% RSS)`.
+  - Real Lean 4 v4.36.0-rc1 `Init` verification & head-to-head vs `leanchecker --fresh`:
+    * Added zero-dependency streaming NDJSON (`lean4export` v3.1.0) parser (`crates/parser/src/ndjson.rs`), sound nested inductive elimination (`crates/kernel/src/inductive.rs`), WHNF structure eta (`to_ctor_when_structure`), `u128` `Nat` literal `reduce_nat`, and per-declaration scratch arena reclamation (`Arena::truncate_to`).
+    * Verified 100% of real `Init.Prelude` (2,121 decls: 92.86 ms / 19.55 MB RSS vs `leanchecker` 660 ms / 61.58 MB — 7.11x faster, 3.15x less RAM), `Init.Core` (3,913 decls: 101.03 ms / 24.48 MB vs 500 ms / 67.34 MB — 4.95x faster, 2.75x less RAM), `Init.Data.Nat.Basic` (4,718 decls: 132.29 ms / 26.61 MB vs 550 ms / 70.27 MB — 4.16x faster, 2.64x less RAM), and `Init.Data.List.Basic` (5,314 decls: 168.83 ms / 32.50 MB vs 620 ms / 72.33 MB — 3.67x faster, 2.23x less RAM).
+  - TCB size audit: `crates/kernel/src/*.rs` strictly < 2,500 SLOC (`#![forbid(unsafe_code)]`, zero external deps).
 
 ## Progress log
 - 2026-11-22 01:30 KST: initialized `~/Rigor` workspace and started Phase 1 implementation.
 - 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `Aetherx86/Rigor` (commit `b41a1c2`).
 - 2026-11-22 01:52 KST: completed Phase 2 (inductives, strict positivity, Subsingleton large-elim & `Proj` guard, iota/K-like/structure-eta reduction, soundness torture suite: 14/14 tests green, 0 warnings, `Nat.rec` benchmark 1.544 ms, commit `f879983`).
 - 2026-11-22 02:04 KST: completed Phase 3 (streaming `lean4export` parser for all 22 directives + v3 `#IND`/`#CTOR`/`#REC` + `#INDM`, kernel `#QUOT` + `#ELN` reduction, 18/18 tests green, 0 warnings, 778k decls/s streaming parse+verify, TCB < 2,500 SLOC, commit `2e473b1`).
-- 2026-11-22 02:19 KST: completed Phase 4 (head-to-head benchmark harness + Peak RSS script, Ackermann & primality reflection stress tests, `/usr/bin/sample` profile-guided spine-machine & arena optimizations up to 8.81x faster / -23.7% RSS, 19/19 tests green, TCB 2,484 SLOC, `BENCHMARKS.md`).
+- 2026-11-22 02:19 KST: completed Phase 4 (head-to-head benchmark harness + Peak RSS script, Ackermann & primality reflection stress tests, `/usr/bin/sample` profile-guided spine-machine & arena optimizations up to 8.81x faster / -23.7% RSS, 19/19 tests green, TCB 2,484 SLOC, `BENCHMARKS.md`, commit `cb2ddff`).
+- 2026-11-22 04:07 KST: verified real Lean 4 v4.36.0 `Init.Prelude`, `Init.Core`, `Init.Data.Nat.Basic`, `Init.Data.List.Basic` via NDJSON `lean4export`, nested inductives, `to_ctor_when_structure`, `u128` `reduce_nat`, and `Arena::truncate_to` — beating `leanchecker --fresh` by 3.67x-7.11x wall time and 2.23x-3.15x lower Peak RSS while keeping TCB < 2,500 SLOC.

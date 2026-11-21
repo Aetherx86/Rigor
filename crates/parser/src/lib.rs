@@ -13,6 +13,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+mod ndjson;
+
 pub use rigor_kernel as kernel;
 
 use rigor_kernel::{
@@ -141,11 +143,12 @@ impl PendingV3Ind {
 
 /// Streaming parser state mapping `lean4export` integer IDs directly into Rigor's hash-consed arena.
 pub struct StreamParser {
-    names: Vec<Option<NameId>>,
-    levels: Vec<Option<LevelId>>,
-    exprs: Vec<Option<ExprId>>,
-    stats: ParseStats,
+    pub(crate) names: Vec<Option<NameId>>,
+    pub(crate) levels: Vec<Option<LevelId>>,
+    pub(crate) exprs: Vec<Option<ExprId>>,
+    pub(crate) stats: ParseStats,
     v3_mode: bool,
+    ndjson_mode: bool,
     pending_ind: Option<PendingV3Ind>,
 }
 
@@ -167,6 +170,7 @@ impl StreamParser {
             exprs: Vec::with_capacity(4096),
             stats: ParseStats::default(),
             v3_mode: false,
+            ndjson_mode: false,
             pending_ind: None,
         }
     }
@@ -198,14 +202,20 @@ impl StreamParser {
 
             if !saw_content {
                 saw_content = true;
-                if is_version_header(trimmed) {
+                if trimmed.starts_with('{') {
+                    self.ndjson_mode = true;
+                } else if is_version_header(trimmed) {
                     self.v3_mode = trimmed.starts_with("3.");
                     self.stats.version = Some(trimmed.to_owned());
                     continue;
                 }
             }
 
-            self.parse_line(line_no, trimmed, env)?;
+            if self.ndjson_mode {
+                self.parse_ndjson_line(line_no, trimmed, env)?;
+            } else {
+                self.parse_line(line_no, trimmed, env)?;
+            }
         }
 
         if let Some(pending) = self.pending_ind.take() {
@@ -367,7 +377,7 @@ impl StreamParser {
             }
             "#ELN" => {
                 let mut it = after_tag.split_ascii_whitespace();
-                let n = parse_u64(line, next_tok(line, &mut it, "#ELN nat")?, "#ELN nat")?;
+                let n = parse_u128(line, next_tok(line, &mut it, "#ELN nat")?, "#ELN nat")?;
                 expect_end(line, &mut it, "#ELN")?;
                 let eid = env.arena.lit_nat(n);
                 set_slot(&mut self.exprs, id, eid);
@@ -638,7 +648,7 @@ impl StreamParser {
     }
 
     #[inline]
-    fn get_name(&self, line: usize, id: usize) -> Result<NameId, ParseError> {
+    pub(crate) fn get_name(&self, line: usize, id: usize) -> Result<NameId, ParseError> {
         self.names
             .get(id)
             .and_then(|o| *o)
@@ -646,7 +656,7 @@ impl StreamParser {
     }
 
     #[inline]
-    fn get_level(&self, line: usize, id: usize) -> Result<LevelId, ParseError> {
+    pub(crate) fn get_level(&self, line: usize, id: usize) -> Result<LevelId, ParseError> {
         self.levels
             .get(id)
             .and_then(|o| *o)
@@ -654,7 +664,7 @@ impl StreamParser {
     }
 
     #[inline]
-    fn get_expr(&self, line: usize, id: usize) -> Result<ExprId, ParseError> {
+    pub(crate) fn get_expr(&self, line: usize, id: usize) -> Result<ExprId, ParseError> {
         self.exprs
             .get(id)
             .and_then(|o| *o)
@@ -730,14 +740,14 @@ pub fn parse_file(
 }
 
 #[inline]
-fn set_slot<T: Copy>(table: &mut Vec<Option<T>>, id: usize, val: T) {
+pub(crate) fn set_slot<T: Copy>(table: &mut Vec<Option<T>>, id: usize, val: T) {
     if id >= table.len() {
         table.resize(id + 1, None);
     }
     table[id] = Some(val);
 }
 
-fn syntax(line: usize, msg: &str) -> ParseError {
+pub(crate) fn syntax(line: usize, msg: &str) -> ParseError {
     ParseError::Syntax {
         line,
         message: msg.to_owned(),
@@ -827,6 +837,11 @@ fn parse_u32(line: usize, tok: &str, what: &str) -> Result<u32, ParseError> {
 fn parse_u64(line: usize, tok: &str, what: &str) -> Result<u64, ParseError> {
     tok.parse::<u64>()
         .map_err(|_| syntax(line, &format!("invalid u64 '{tok}' for {what}")))
+}
+
+fn parse_u128(line: usize, tok: &str, what: &str) -> Result<u128, ParseError> {
+    tok.parse::<u128>()
+        .map_err(|_| syntax(line, &format!("invalid u128 '{tok}' for {what}")))
 }
 
 fn parse_binder_info(line: usize, tok: &str) -> Result<BinderInfo, ParseError> {

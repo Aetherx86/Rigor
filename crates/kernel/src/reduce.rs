@@ -111,6 +111,16 @@ impl<'a> TypeChecker<'a> {
                 }
                 ExprData::Const(name, lvls) => {
                     let name = *name;
+                    let lvl_len = lvls.len();
+                    let (l0, lvls_owned) = split_lvls(lvls);
+                    if lvl_len == 0 {
+                        if let Some((res, consumed)) = self.try_reduce_nat(name, &spine, allow_delta) {
+                            let new_len = spine.len() - consumed;
+                            spine.truncate(new_len);
+                            cur = res;
+                            continue;
+                        }
+                    }
                     let Some(decl) = self.decls.get(&name) else { break };
                     match decl {
                         Declaration::Quot { kind: QuotKind::Lift, .. } if spine.len() >= 6 => {
@@ -130,14 +140,13 @@ impl<'a> TypeChecker<'a> {
                             }
                             break;
                         }
-                        Declaration::Recursor(rec) if lvls.len() == rec.level_params.len() => {
+                        Declaration::Recursor(rec) if lvl_len == rec.level_params.len() => {
                             let prefix_end = (rec.num_params + rec.num_motives + rec.num_minors) as usize;
                             let major_idx = prefix_end + rec.num_indices as usize;
                             let len = spine.len();
                             if len <= major_idx {
                                 break;
                             }
-                            let (l0, lvls_owned) = split_lvls(lvls);
                             let mut major = self.whnf(spine[len - 1 - major_idx]);
                             if let ExprData::Lit(Literal::Nat(k)) = *self.arena.get_expr(major) {
                                 major = self.expand_nat_lit(k);
@@ -172,16 +181,44 @@ impl<'a> TypeChecker<'a> {
                                     }
                                 }
                             }
-                            let (mhead, margs) = self.app_spine(major);
+                            let (mut mhead, mut margs) = self.app_spine(major);
+                            // Structure eta in WHNF (Lean 4 `to_ctor_when_structure`):
+                            // expand opaque `x : S` to `S.mk p... (x.0) ...` for non-Prop structures.
+                            if rec.rules.len() == 1 && rec.all.len() == 1 && rec.num_indices == 0
+                                && !matches!(self.arena.get_expr(mhead), ExprData::Const(cn, _) if *cn == rec.rules[0].ctor_name || *cn == name)
+                            {
+                                if let Some(Declaration::Inductive(ind)) = self.decls.get(&rec.all[0]) {
+                                    if !ind.is_prop && !ind.is_rec && ind.ctors.len() == 1 && ind.num_indices == 0 && ind.all.len() == 1 {
+                                        if let Ok(mty) = self.infer_type(major) {
+                                            let mty_w = self.whnf(mty);
+                                            let (th, ta) = self.app_spine(mty_w);
+                                            if let ExprData::Const(tn, tls) = self.arena.get_expr(th) {
+                                                if *tn == ind.name && ta.len() == ind.num_params as usize {
+                                                    let tls = tls.clone();
+                                                    mhead = self.arena.const_(ind.ctors[0], tls);
+                                                    margs = ta;
+                                                    for fi in 0..rec.rules[0].num_fields {
+                                                        margs.push(self.arena.proj(ind.name, fi, major));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let ExprData::Const(cname, _) = self.arena.get_expr(mhead) {
                                 let cname = *cname;
                                 if let Some(rule) = rec.rules.iter().find(|r| r.ctor_name == cname) {
-                                    if margs.len() == (rec.num_params + rule.num_fields) as usize {
+                                    let ctor_np = match self.decls.get(&cname) {
+                                        Some(Declaration::Constructor(c)) => c.num_params,
+                                        _ => rec.num_params,
+                                    };
+                                    if margs.len() == (ctor_np + rule.num_fields) as usize {
                                         cur = self.inst_levels_opt(rule.rhs, &rec.level_params, l0, lvls_owned.as_deref());
                                         let keep_tail = len - 1 - major_idx;
                                         spine.splice(
                                             keep_tail..len - prefix_end,
-                                            margs[rec.num_params as usize..].iter().rev().copied(),
+                                            margs[ctor_np as usize..].iter().rev().copied(),
                                         );
                                         continue;
                                     }
@@ -192,8 +229,7 @@ impl<'a> TypeChecker<'a> {
                         _ if allow_delta => {
                             if let Some((val, _)) = decl.delta_value() {
                                 let params = decl.level_params();
-                                if lvls.len() == params.len() {
-                                    let (l0, lvls_owned) = split_lvls(lvls);
+                                if lvl_len == params.len() {
                                     cur = self.inst_levels_opt(val, params, l0, lvls_owned.as_deref());
                                     continue;
                                 }
@@ -242,7 +278,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     #[inline]
-    fn expand_nat_lit(&mut self, k: u64) -> ExprId {
+    fn expand_nat_lit(&mut self, k: u128) -> ExprId {
         if k == 0 {
             if let Some(z) = self.nat_zero { z } else {
                 let z = self.arena.const_path("Nat.zero", []);
@@ -257,6 +293,61 @@ impl<'a> TypeChecker<'a> {
             };
             let pred = self.arena.lit_nat(k - 1);
             self.arena.app(succ, pred)
+        }
+    }
+
+    /// Lean 4 kernel `reduce_nat`: O(1) machine evaluation of closed `Nat` literal primitives.
+    fn try_reduce_nat(&mut self, name: NameId, spine: &[ExprId], allow_succ: bool) -> Option<(ExprId, usize)> {
+        let len = spine.len();
+        if len == 0 { return None; }
+        let crate::arena::NameData::Str(parent, seg) = self.arena.get_name(name) else { return None };
+        let crate::arena::NameData::Str(gp, pseg) = self.arena.get_name(*parent) else { return None };
+        if *gp != crate::arena::Arena::ANONYMOUS || pseg.as_ref() != "Nat" { return None; }
+        let op: &str = match seg.as_ref() {
+            "succ" if allow_succ => "succ", "add" => "add", "sub" => "sub", "mul" => "mul",
+            "pow" => "pow", "div" => "div", "mod" => "mod", "beq" => "beq",
+            "ble" => "ble", "gcd" => "gcd",
+            _ => return None,
+        };
+        let as_nat = |tc: &mut Self, e: ExprId| -> Option<u128> {
+            let w = tc.whnf(e);
+            match tc.arena.get_expr(w) {
+                ExprData::Lit(Literal::Nat(n)) => Some(*n),
+                ExprData::Const(cn, _) => match tc.arena.get_name(*cn) {
+                    crate::arena::NameData::Str(p, s) if s.as_ref() == "zero" => match tc.arena.get_name(*p) {
+                        crate::arena::NameData::Str(g, ps) if *g == crate::arena::Arena::ANONYMOUS && ps.as_ref() == "Nat" => Some(0),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        if op == "succ" {
+            let a = as_nat(self, spine[len - 1])?;
+            return a.checked_add(1).map(|r| (self.arena.lit_nat(r), 1));
+        }
+        if len < 2 { return None; }
+        let a = as_nat(self, spine[len - 1])?;
+        let b = as_nat(self, spine[len - 2])?;
+        match op {
+            "add" => a.checked_add(b).map(|r| (self.arena.lit_nat(r), 2)),
+            "sub" => Some((self.arena.lit_nat(a.saturating_sub(b)), 2)),
+            "mul" => a.checked_mul(b).map(|r| (self.arena.lit_nat(r), 2)),
+            "pow" => u32::try_from(b).ok().and_then(|e| a.checked_pow(e)).map(|r| (self.arena.lit_nat(r), 2)),
+            "div" => Some((self.arena.lit_nat(if b == 0 { 0 } else { a / b }), 2)),
+            "mod" => Some((self.arena.lit_nat(if b == 0 { a } else { a % b }), 2)),
+            "gcd" => {
+                let (mut x, mut y) = (a, b);
+                while y != 0 { let t = x % y; x = y; y = t; }
+                Some((self.arena.lit_nat(x), 2))
+            }
+            "beq" | "ble" => {
+                let res = if op == "beq" { a == b } else { a <= b };
+                let p = if res { "Bool.true" } else { "Bool.false" };
+                Some((self.arena.const_path(p, []), 2))
+            }
+            _ => None,
         }
     }
 

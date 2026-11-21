@@ -18,49 +18,25 @@ pub enum ReducibilityHint {
 
 #[derive(Debug, Clone)]
 pub struct InductiveInfo {
-    pub name: NameId,
-    pub level_params: Box<[NameId]>,
-    pub ty: ExprId,
-    pub num_params: u32,
-    pub num_indices: u32,
-    pub all: Box<[NameId]>,
-    pub ctors: Box<[NameId]>,
-    pub is_rec: bool,
-    pub is_reflexive: bool,
-    pub is_prop: bool,
-    pub can_elim_large: bool,
+    pub name: NameId, pub level_params: Box<[NameId]>, pub ty: ExprId,
+    pub num_params: u32, pub num_indices: u32, pub all: Box<[NameId]>, pub ctors: Box<[NameId]>,
+    pub is_rec: bool, pub is_reflexive: bool, pub is_prop: bool, pub can_elim_large: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConstructorInfo {
-    pub name: NameId,
-    pub ind_name: NameId,
-    pub level_params: Box<[NameId]>,
-    pub ty: ExprId,
-    pub ctor_idx: u32,
-    pub num_params: u32,
-    pub num_fields: u32,
+    pub name: NameId, pub ind_name: NameId, pub level_params: Box<[NameId]>,
+    pub ty: ExprId, pub ctor_idx: u32, pub num_params: u32, pub num_fields: u32,
 }
 
 #[derive(Debug, Clone)]
-pub struct RecursorRule {
-    pub ctor_name: NameId,
-    pub num_fields: u32,
-    pub rhs: ExprId,
-}
+pub struct RecursorRule { pub ctor_name: NameId, pub num_fields: u32, pub rhs: ExprId }
 
 #[derive(Debug, Clone)]
 pub struct RecursorInfo {
-    pub name: NameId,
-    pub level_params: Box<[NameId]>,
-    pub ty: ExprId,
-    pub all: Box<[NameId]>,
-    pub num_params: u32,
-    pub num_indices: u32,
-    pub num_motives: u32,
-    pub num_minors: u32,
-    pub rules: Box<[RecursorRule]>,
-    pub k: bool,
+    pub name: NameId, pub level_params: Box<[NameId]>, pub ty: ExprId, pub all: Box<[NameId]>,
+    pub num_params: u32, pub num_indices: u32, pub num_motives: u32, pub num_minors: u32,
+    pub rules: Box<[RecursorRule]>, pub k: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,35 +52,26 @@ pub enum Declaration {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum QuotKind {
-    Type,
-    Ctor,
-    Lift,
-    Ind,
-}
+pub enum QuotKind { Type, Ctor, Lift, Ind }
 
 impl Declaration {
     #[inline]
     pub fn name(&self) -> NameId {
         match self {
-            Declaration::Axiom { name, .. }
-            | Declaration::Definition { name, .. }
-            | Declaration::Theorem { name, .. }
-            | Declaration::Opaque { name, .. } => *name,
+            Declaration::Axiom { name, .. } | Declaration::Definition { name, .. }
+            | Declaration::Theorem { name, .. } | Declaration::Opaque { name, .. }
+            | Declaration::Quot { name, .. } => *name,
             Declaration::Inductive(i) => i.name,
             Declaration::Constructor(c) => c.name,
             Declaration::Recursor(r) => r.name,
-            Declaration::Quot { name, .. } => *name,
         }
     }
 
     #[inline]
     pub fn level_params(&self) -> &[NameId] {
         match self {
-            Declaration::Axiom { level_params, .. }
-            | Declaration::Definition { level_params, .. }
-            | Declaration::Theorem { level_params, .. }
-            | Declaration::Opaque { level_params, .. }
+            Declaration::Axiom { level_params, .. } | Declaration::Definition { level_params, .. }
+            | Declaration::Theorem { level_params, .. } | Declaration::Opaque { level_params, .. }
             | Declaration::Quot { level_params, .. } => level_params,
             Declaration::Inductive(i) => &i.level_params,
             Declaration::Constructor(c) => &c.level_params,
@@ -115,10 +82,8 @@ impl Declaration {
     #[inline]
     pub fn ty(&self) -> ExprId {
         match self {
-            Declaration::Axiom { ty, .. }
-            | Declaration::Definition { ty, .. }
-            | Declaration::Theorem { ty, .. }
-            | Declaration::Opaque { ty, .. }
+            Declaration::Axiom { ty, .. } | Declaration::Definition { ty, .. }
+            | Declaration::Theorem { ty, .. } | Declaration::Opaque { ty, .. }
             | Declaration::Quot { ty, .. } => *ty,
             Declaration::Inductive(i) => i.ty,
             Declaration::Constructor(c) => c.ty,
@@ -126,7 +91,6 @@ impl Declaration {
         }
     }
 
-    /// Returns `(value, unfold_priority)` if this declaration is delta-reducible.
     #[inline]
     pub fn delta_value(&self) -> Option<(ExprId, u64)> {
         match self {
@@ -136,12 +100,7 @@ impl Declaration {
                 ReducibilityHint::Regular(h) => Some((*val, (*h as u64) + 1)),
             },
             Declaration::Theorem { val, .. } => Some((*val, 0)),
-            Declaration::Axiom { .. }
-            | Declaration::Opaque { .. }
-            | Declaration::Inductive(_)
-            | Declaration::Constructor(_)
-            | Declaration::Recursor(_)
-            | Declaration::Quot { .. } => None,
+            _ => None,
         }
     }
 }
@@ -195,10 +154,13 @@ impl Environment {
         if let Declaration::Definition { val, hint: hint @ ReducibilityHint::Regular(0), .. } = &mut decl {
             *hint = ReducibilityHint::Regular(self.compute_height(*val));
         }
-        {
+        let (nl, ll, el) = (self.arena.name_len(), self.arena.level_len(), self.arena.expr_len());
+        let res = {
             let mut tc = TypeChecker::new(&self.decls, &mut self.arena);
-            tc.check_decl(&decl)?;
-        }
+            tc.check_decl(&decl)
+        };
+        self.arena.truncate_to(nl, ll, el);
+        res?;
         self.decls.insert(name, decl);
         Ok(())
     }

@@ -44,7 +44,7 @@ pub enum BinderInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Literal {
-    Nat(u64),
+    Nat(u128),
     Str(Box<str>),
 }
 
@@ -354,7 +354,23 @@ impl Arena {
         self.intern_expr(ExprData::Proj { struct_name, idx, expr })
     }
     #[inline]
-    pub fn lit_nat(&mut self, n: u64) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Nat(n))) }
+    pub fn lit_nat(&mut self, n: u128) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Nat(n))) }
     #[inline]
     pub fn lit_str(&mut self, s: &str) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Str(s.into()))) }
+
+    /// Reclaim temporary expressions/levels/names interned during single-declaration type-checking.
+    pub fn truncate_to(&mut self, n_len: u32, l_len: u32, e_len: u32) {
+        debug_assert!(self.parent.is_none());
+        for d in self.names.drain(n_len as usize..) { self.name_map.remove(&d); }
+        for d in self.levels.drain(l_len as usize..) { self.level_map.remove(&d); }
+        self.level_meta.truncate(l_len as usize);
+        for d in self.exprs.drain(e_len as usize..) {
+            match d {
+                ExprData::App(f, a) => { self.app_map.remove(&(f, a)); }
+                ExprData::BVar(i) if (i as usize) < 32 => { self.bvar_cache[i as usize] = u32::MAX; }
+                other => { self.expr_map.remove(&other); }
+            }
+        }
+        self.expr_meta.truncate(e_len as usize);
+    }
 }
