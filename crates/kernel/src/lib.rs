@@ -10,6 +10,7 @@ pub mod expr;
 pub mod hash;
 pub mod inductive;
 pub mod level;
+pub mod nat;
 pub mod reduce;
 
 pub use arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelData, LevelId, Literal, NameId};
@@ -21,4 +22,5 @@ pub use env::{
 pub use error::KernelError;
 pub use expr::{abstract_fvars, instantiate1, instantiate_level_params, instantiate_rev};
 pub use inductive::{InductiveSpec, InductiveTypeSpec};
+pub use nat::Nat;
 pub use level::{level_eq, level_instantiate, level_is_nonzero, level_is_zero, level_leq};

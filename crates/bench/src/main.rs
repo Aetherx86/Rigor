@@ -22,7 +22,15 @@ fn main() {
         match args[1].as_str() {
             "--check" => {
                 let path = args.get(2).expect("usage: rigor-bench --check <file.export>");
-                run_check_file(path);
+                // Real libraries produce deeply nested terms; like Lean's own checker, run on a large
+                // stack (virtual reservation only; untouched pages are never committed).
+                let owned = path.to_owned();
+                std::thread::Builder::new()
+                    .stack_size(4 << 30)
+                    .spawn(move || run_check_file(&owned))
+                    .expect("spawn checker thread")
+                    .join()
+                    .unwrap_or_else(|_| std::process::exit(101));
                 return;
             }
             "--generate-export" => {

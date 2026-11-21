@@ -148,8 +148,9 @@ impl<'a> TypeChecker<'a> {
                                 break;
                             }
                             let mut major = self.whnf_lit_ctor(spine[len - 1 - major_idx]);
-                            if let ExprData::Lit(Literal::Nat(k)) = *self.arena.get_expr(major) {
-                                major = self.expand_nat_lit(k);
+                            if let ExprData::Lit(Literal::Nat(k)) = self.arena.get_expr(major) {
+                                let k = k.clone();
+                                major = self.expand_nat_lit(&k);
                             }
                             if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
                                 let rule = &rec.rules[0];
@@ -278,8 +279,8 @@ impl<'a> TypeChecker<'a> {
     }
 
     #[inline]
-    fn expand_nat_lit(&mut self, k: u128) -> ExprId {
-        if k == 0 {
+    fn expand_nat_lit(&mut self, k: &crate::nat::Nat) -> ExprId {
+        if k.is_zero() {
             if let Some(z) = self.nat_zero { z } else {
                 let z = self.arena.const_path("Nat.zero", []);
                 self.nat_zero = Some(z);
@@ -291,7 +292,7 @@ impl<'a> TypeChecker<'a> {
                 self.nat_succ = Some(s);
                 s
             };
-            let pred = self.arena.lit_nat(k - 1);
+            let pred = self.arena.lit_nat_big(k.sub(&crate::nat::Nat::from_u128(1)));
             self.arena.app(succ, pred)
         }
     }
@@ -328,24 +329,27 @@ impl<'a> TypeChecker<'a> {
 
     /// Lean 4 kernel `reduce_nat`: O(1) machine evaluation of closed `Nat` literal primitives.
     fn try_reduce_nat(&mut self, name: NameId, spine: &[ExprId], allow_succ: bool) -> Option<(ExprId, usize)> {
+        use crate::nat::{Nat, MAX_BITS};
         let len = spine.len();
         if len == 0 { return None; }
         let crate::arena::NameData::Str(parent, seg) = self.arena.get_name(name) else { return None };
         let crate::arena::NameData::Str(gp, pseg) = self.arena.get_name(*parent) else { return None };
         if *gp != crate::arena::Arena::ANONYMOUS || pseg.as_ref() != "Nat" { return None; }
-        let op: &str = match seg.as_ref() {
-            "succ" if allow_succ => "succ", "add" => "add", "sub" => "sub", "mul" => "mul",
-            "pow" => "pow", "div" => "div", "mod" => "mod", "beq" => "beq",
-            "ble" => "ble", "gcd" => "gcd",
+        // The binary operations Lean's kernel evaluates on literals (GMP there, `Nat` here).
+        let op: &'static str = match seg.as_ref() {
+            "succ" if allow_succ => "succ", "log2" => "log2",
+            "add" => "add", "sub" => "sub", "mul" => "mul", "pow" => "pow", "div" => "div", "mod" => "mod",
+            "gcd" => "gcd", "beq" => "beq", "ble" => "ble", "land" => "land", "lor" => "lor", "xor" => "xor",
+            "shiftLeft" => "shiftLeft", "shiftRight" => "shiftRight",
             _ => return None,
         };
-        let as_nat = |tc: &mut Self, e: ExprId| -> Option<u128> {
+        let as_nat = |tc: &mut Self, e: ExprId| -> Option<Nat> {
             let w = tc.whnf(e);
             match tc.arena.get_expr(w) {
-                ExprData::Lit(Literal::Nat(n)) => Some(*n),
+                ExprData::Lit(Literal::Nat(n)) => Some(n.clone()),
                 ExprData::Const(cn, _) => match tc.arena.get_name(*cn) {
                     crate::arena::NameData::Str(p, s) if s.as_ref() == "zero" => match tc.arena.get_name(*p) {
-                        crate::arena::NameData::Str(g, ps) if *g == crate::arena::Arena::ANONYMOUS && ps.as_ref() == "Nat" => Some(0),
+                        crate::arena::NameData::Str(g, ps) if *g == crate::arena::Arena::ANONYMOUS && ps.as_ref() == "Nat" => Some(Nat::zero()),
                         _ => None,
                     },
                     _ => None,
@@ -353,32 +357,38 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             }
         };
-        if op == "succ" {
+        if op == "succ" || op == "log2" {
             let a = as_nat(self, spine[len - 1])?;
-            return a.checked_add(1).map(|r| (self.arena.lit_nat(r), 1));
+            let r = if op == "succ" { a.add(&Nat::from_u128(1)) } else { a.log2() };
+            return Some((self.arena.lit_nat_big(r), 1));
         }
         if len < 2 { return None; }
         let a = as_nat(self, spine[len - 1])?;
         let b = as_nat(self, spine[len - 2])?;
-        match op {
-            "add" => a.checked_add(b).map(|r| (self.arena.lit_nat(r), 2)),
-            "sub" => Some((self.arena.lit_nat(a.saturating_sub(b)), 2)),
-            "mul" => a.checked_mul(b).map(|r| (self.arena.lit_nat(r), 2)),
-            "pow" => u32::try_from(b).ok().and_then(|e| a.checked_pow(e)).map(|r| (self.arena.lit_nat(r), 2)),
-            "div" => Some((self.arena.lit_nat(if b == 0 { 0 } else { a / b }), 2)),
-            "mod" => Some((self.arena.lit_nat(if b == 0 { a } else { a % b }), 2)),
-            "gcd" => {
-                let (mut x, mut y) = (a, b);
-                while y != 0 { let t = x % y; x = y; y = t; }
-                Some((self.arena.lit_nat(x), 2))
+        let r = match op {
+            "add" => a.add(&b),
+            "sub" => a.sub(&b),
+            "mul" => a.mul(&b),
+            "pow" => a.pow(&b)?,
+            "div" => a.div(&b),
+            "mod" => a.rem(&b),
+            "gcd" => a.gcd(&b),
+            "land" => a.land(&b),
+            "lor" => a.lor(&b),
+            "xor" => a.xor(&b),
+            "shiftLeft" => {
+                let k = b.to_u64().filter(|k| a.bits().saturating_add(*k) <= MAX_BITS)?;
+                a.shl(k)
             }
+            "shiftRight" => a.shr(b.to_u64().unwrap_or(u64::MAX)),
             "beq" | "ble" => {
                 let res = if op == "beq" { a == b } else { a <= b };
                 let p = if res { "Bool.true" } else { "Bool.false" };
-                Some((self.arena.const_path(p, []), 2))
+                return Some((self.arena.const_path(p, []), 2));
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some((self.arena.lit_nat_big(r), 2))
     }
 
     fn delta_info(&self, head: ExprId) -> Option<(ExprId, u64, &'a [NameId], Option<LevelId>, Option<Box<[LevelId]>>)> {
@@ -411,8 +421,9 @@ impl<'a> TypeChecker<'a> {
         if a == b { return Ok(true); }
         let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
         if self.def_eq_cache.contains(&key) { return Ok(true); }
+        if self.def_neq_cache.contains(&key) { return Ok(false); }
         let eq = self.is_def_eq_core(a, b)?;
-        if eq { self.def_eq_cache.insert(key); }
+        if eq { self.def_eq_cache.insert(key); } else { self.def_neq_cache.insert(key); }
         Ok(eq)
     }
 
@@ -429,8 +440,8 @@ impl<'a> TypeChecker<'a> {
                     return Ok(level_eq(self.arena, u, v));
                 }
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
-                (ExprData::Lit(Literal::Nat(k)), _) => { let k = *k; a = self.expand_nat_lit(k); continue; }
-                (_, ExprData::Lit(Literal::Nat(k))) => { let k = *k; b = self.expand_nat_lit(k); continue; }
+                (ExprData::Lit(Literal::Nat(k)), _) => { let k = k.clone(); a = self.expand_nat_lit(&k); continue; }
+                (_, ExprData::Lit(Literal::Nat(k))) => { let k = k.clone(); b = self.expand_nat_lit(&k); continue; }
                 (ExprData::Lit(Literal::Str(sv)), _) => { let sv = sv.clone(); let ex = self.expand_str_lit(&sv); a = self.whnf_no_delta(ex); continue; }
                 (_, ExprData::Lit(Literal::Str(sv))) => { let sv = sv.clone(); let ex = self.expand_str_lit(&sv); b = self.whnf_no_delta(ex); continue; }
                 (ExprData::Pi { name, binder_info, ty: t1, body: b1 }, ExprData::Pi { ty: t2, body: b2, .. }) => {

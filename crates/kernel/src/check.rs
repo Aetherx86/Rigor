@@ -27,6 +27,9 @@ pub struct TypeChecker<'a> {
     pub(crate) whnf_cache: FxHashMap<ExprId, ExprId>,
     pub(crate) infer_cache: FxHashMap<ExprId, ExprId>,
     pub(crate) def_eq_cache: FxHashSet<(ExprId, ExprId)>,
+    /// Pairs already shown not definitionally equal (Lean's failure cache); without it, nested
+    /// structure eta and delta unfolding re-explore the same failing comparisons exponentially.
+    pub(crate) def_neq_cache: FxHashSet<(ExprId, ExprId)>,
     pub(crate) inst_lvl1_cache: FxHashMap<(ExprId, LevelId), ExprId>,
     pub(crate) nat_zero: Option<ExprId>,
     pub(crate) nat_succ: Option<ExprId>,
@@ -42,6 +45,7 @@ impl<'a> TypeChecker<'a> {
             whnf_cache: FxHashMap::default(),
             infer_cache: FxHashMap::default(),
             def_eq_cache: FxHashSet::default(),
+            def_neq_cache: FxHashSet::default(),
             inst_lvl1_cache: FxHashMap::default(),
             nat_zero: None,
             nat_succ: None,

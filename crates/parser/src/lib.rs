@@ -212,7 +212,25 @@ impl StreamParser {
             }
 
             if self.ndjson_mode {
-                self.parse_ndjson_line(line_no, trimmed, env)?;
+                // RIGOR_TRACE=<ms>: report declarations slower than <ms> and a heartbeat every
+                // 100k lines on stderr, so slow or crashing declarations are found immediately.
+                if let Some(limit) = trace_limit_ms() {
+                    let is_decl = !trimmed.starts_with("{\"i");
+                    if is_decl {
+                        eprintln!("RIGOR_DECL line={line_no} {}", &trimmed[..trimmed.len().min(160)]);
+                    }
+                    let t = std::time::Instant::now();
+                    self.parse_ndjson_line(line_no, trimmed, env)?;
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                    if is_decl && ms >= limit {
+                        eprintln!("RIGOR_SLOW line={line_no} ms={ms:.1}");
+                    }
+                    if line_no % 100_000 == 0 {
+                        eprintln!("RIGOR_PROGRESS line={line_no}");
+                    }
+                } else {
+                    self.parse_ndjson_line(line_no, trimmed, env)?;
+                }
             } else {
                 self.parse_line(line_no, trimmed, env)?;
             }
@@ -377,9 +395,10 @@ impl StreamParser {
             }
             "#ELN" => {
                 let mut it = after_tag.split_ascii_whitespace();
-                let n = parse_u128(line, next_tok(line, &mut it, "#ELN nat")?, "#ELN nat")?;
+                let tok = next_tok(line, &mut it, "#ELN nat")?;
+                let n = rigor_kernel::Nat::from_dec(tok).ok_or_else(|| syntax(line, &format!("invalid natural number '{tok}' for #ELN nat")))?;
                 expect_end(line, &mut it, "#ELN")?;
-                let eid = env.arena.lit_nat(n);
+                let eid = env.arena.lit_nat_big(n);
                 set_slot(&mut self.exprs, id, eid);
                 self.stats.exprs += 1;
             }
@@ -839,10 +858,6 @@ fn parse_u64(line: usize, tok: &str, what: &str) -> Result<u64, ParseError> {
         .map_err(|_| syntax(line, &format!("invalid u64 '{tok}' for {what}")))
 }
 
-fn parse_u128(line: usize, tok: &str, what: &str) -> Result<u128, ParseError> {
-    tok.parse::<u128>()
-        .map_err(|_| syntax(line, &format!("invalid u128 '{tok}' for {what}")))
-}
 
 fn parse_binder_info(line: usize, tok: &str) -> Result<BinderInfo, ParseError> {
     match tok {
@@ -874,4 +889,9 @@ fn parse_hint(
             }
         }
     }
+}
+
+fn trace_limit_ms() -> Option<f64> {
+    static LIMIT: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("RIGOR_TRACE").ok().and_then(|v| v.parse().ok()))
 }

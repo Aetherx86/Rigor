@@ -44,7 +44,7 @@ pub enum BinderInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Literal {
-    Nat(u128),
+    Nat(crate::nat::Nat),
     Str(Box<str>),
 }
 
@@ -354,7 +354,8 @@ impl Arena {
         self.intern_expr(ExprData::Proj { struct_name, idx, expr })
     }
     #[inline]
-    pub fn lit_nat(&mut self, n: u128) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Nat(n))) }
+    pub fn lit_nat(&mut self, n: u128) -> ExprId { self.lit_nat_big(crate::nat::Nat::from_u128(n)) }
+    pub fn lit_nat_big(&mut self, n: crate::nat::Nat) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Nat(n))) }
     #[inline]
     pub fn lit_str(&mut self, s: &str) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Str(s.into()))) }
 
