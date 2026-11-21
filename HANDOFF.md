@@ -48,7 +48,18 @@ C. [owner: coordinator] Verification of A and B, Worklog.md, BENCHMARKS.md, comm
 D. [next, unassigned] Per-thread scratch memory: profile which TypeChecker caches dominate for the
    heaviest declarations and bound them.
 
+## Recovery (rate limits, quota, stalls)
+- The coordinator (Claude session in herdr pane w2:p1) re-checks every hour (:23) and also resumes after its
+  own usage limit resets. Workers: gem in w2:p3 (Task A), agy-mut in w2:p2 (Task B), both `agy` (Antigravity
+  CLI, Gemini) started with --dangerously-skip-permissions.
+- If a worker hits a rate limit, quota, context limit or stalls: stop it (ctrl+c, exit), start a fresh one in
+  the same pane: `herdr agent start <name> --kind agy --pane <pane> -- --dangerously-skip-permissions`,
+  accept the folder-trust prompt for ~/Rigor, then prompt: "Read ~/rigor/HANDOFF.md and continue your task
+  (<task letter>) from the Log." Workers must therefore append to the Log after every meaningful step.
+- A worker that resumes must first inspect `git status` / `git diff` to see partial work before continuing.
+
 ## Log
 - 2026-11-22 06:30 KST: parallel deferred checking landed (check_deferred, parse_file_parallel), id-only
   hash-consing table (expr_table) replaced expr_map/app_map. Uncommitted at this point; coordinator will
   commit after verification. Task A assigned to gem, task B running in agy-mut.
+- 2026-11-22 06:20 KST: Task B round 1 done (agy-mut): tools/mutation/mutate.py, 250 mutants of Init.Prelude, 249 rejected, 1 accepted = Lean.Name.str -> Lean.Name.mkStr (abbrev of the constructor, definitionally equal; correct). Reviewed by coordinator, committed. Task B round 2: larger modules and more mutants.
