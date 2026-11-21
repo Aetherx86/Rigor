@@ -1,0 +1,6 @@
+/target
+.DS_Store
+*.profraw
+*.svg
+flamegraph.svg
+perf.data*

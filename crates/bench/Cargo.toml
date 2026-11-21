@@ -1,0 +1,9 @@
+[package]
+name = "rigor-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark harness for Rigor"
+license = "MIT"
+
+[dependencies]
+rigor-kernel = { path = "../kernel" }
