@@ -42,12 +42,17 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
     * Church numeral reduction (`mul 20 25 == 500`): 0.810 ms (4,839 arena nodes)
     * Inductive `Nat.rec` iota reduction (`Nat.mul 20 25 == 500`): 1.544 ms (3,213 arena nodes)
     * Theorem batch (2,000 decls): 3.88 ms / 515k decls/s (1 thread) -> 2.32 ms / 863k decls/s (10 threads)
-- **Phase 3: `lean4export` Compatibility** (next)
-  - Streaming zero-copy `lean4export` parser in `crates/parser` covering all directives (`#NS`, `#NI`, `#US`, `#UM`, `#UIM`, `#UP`, `#EV`, `#ES`, `#EC`, `#EA`, `#EL`, `#EP`, `#EZ`, `#EJ`, `#ELN`, `#ELS`, `#AX`, `#DEF`, `#THM`, `#OPAQ`, `#QUOT`, `#IND`).
-  - Kernel `#QUOT` (quotient types + `Quot.lift` / `Quot.ind` reduction) & `Nat`/`String` literal reduction (`Nat.zero`/`Nat.succ` unfolding in `whnf` for Lean 4 compatibility).
+- **Phase 3: `lean4export` Compatibility** (done)
+  - Streaming zero-copy-token `lean4export` parser in `crates/parser` (`#![forbid(unsafe_code)]`, zero external deps) covering all 22 directives (`#NS`, `#NI`, `#US`, `#UM`, `#UIM`, `#UP`, `#EV`, `#ES`, `#EC`, `#EA`, `#EL` with `#BD`/`#BI`/`#BS`/`#BC`, `#EP`, `#EZ`, `#EJ`, `#ELN`, `#ELS`, `#AX`, `#DEF` with `O`/`A`/`R`, `#THM`, `#OPAQ`, `#QUOT`, `#IND`), plus mutual `#INDM` and `lean4export` v3 `#IND`/`#CTOR`/`#REC` (always kernel-validated rather than trusting exported recursor rules).
+  - Kernel `#QUOT` (`Quot`, `Quot.mk`, `Quot.lift`, `Quot.ind` — self-checked by `TypeChecker::check_decl` with atomic rollback on invalid `Eq` — plus `Quot.lift`/`Quot.mk` reduction) and `Nat` literal (`#ELN`) step-expansion in `reduce_iota_or_proj` and `is_def_eq`.
+  - Verified (`cargo test --workspace`): 18/18 test suites pass (0 warnings), including `crates/parser/tests/lean4export.rs` (4/4: full `Init`/`Std`-style prelude exercising all 22 directives + `Quot.lift` computation + `Nat.add 2 3 = 5` via `#ELN` + `#EJ` `Prod` projection + `#ELS` UTF-8 strings; v3 `#IND`/`#CTOR`/`#REC`; mutual `#INDM`; and 6 negative soundness/syntax rejections with zero false positives).
+  - Note: real Lean 4 `Init`/`Std` `.export` artifacts require `lean`/`elan` + `lean4export` installed locally (not present on this host yet).
+  - Phase 3 release benchmark (`cargo run --release -p rigor-bench`):
+    * Streaming `lean4export` parse + kernel verify (10,002 decls, 50,032 lines, 0.86 MiB): 12.85 ms (778k decls/s, 67.1 MiB/s).
 - **Phase 4: Head-to-Head Benchmarking & Optimization** (pending)
 
 ## Progress log
 - 2026-11-22 01:30 KST: initialized `~/Rigor` workspace and started Phase 1 implementation.
 - 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `Aetherx86/Rigor` (commit `b41a1c2`).
-- 2026-11-22 01:52 KST: completed Phase 2 (inductives, strict positivity, Subsingleton large-elim & `Proj` guard, iota/K-like/structure-eta reduction, soundness torture suite: 14/14 tests green, 0 warnings, `Nat.rec` benchmark 1.544 ms).
+- 2026-11-22 01:52 KST: completed Phase 2 (inductives, strict positivity, Subsingleton large-elim & `Proj` guard, iota/K-like/structure-eta reduction, soundness torture suite: 14/14 tests green, 0 warnings, `Nat.rec` benchmark 1.544 ms, commit `f879983`).
+- 2026-11-22 02:04 KST: completed Phase 3 (streaming `lean4export` parser for all 22 directives + v3 `#IND`/`#CTOR`/`#REC` + `#INDM`, kernel `#QUOT` + `#ELN` reduction, 18/18 tests green, 0 warnings, 778k decls/s streaming parse+verify, TCB < 2,500 SLOC).

@@ -2,9 +2,9 @@
 //! Supports beta, zeta, iota, K-like, structure projections, height-ordered delta,
 //! proof irrelevance in `Prop`, and function + structure eta-conversion.
 
-use crate::arena::{BinderInfo, ExprData, ExprId, FVarId, LevelId, NameId};
+use crate::arena::{BinderInfo, ExprData, ExprId, FVarId, LevelId, Literal, NameId};
 use crate::check::TypeChecker;
-use crate::env::Declaration;
+use crate::env::{Declaration, QuotKind};
 use crate::error::KernelError;
 use crate::expr::{instantiate1, instantiate_level_params, instantiate_rev};
 use crate::level::{level_eq, level_is_zero};
@@ -93,6 +93,22 @@ impl<'a> TypeChecker<'a> {
                 None
             }
             ExprData::Const(name, lvls) => {
+                // Quotient reduction: `Quot.lift α r β f h (Quot.mk α' r' a)` -> `f a`.
+                if let Some(Declaration::Quot { kind: QuotKind::Lift, .. }) = self.decls.get(&name) {
+                    if args.len() >= 6 {
+                        let major = self.whnf(args[5]);
+                        let (mhead, margs) = self.app_spine(major);
+                        if let ExprData::Const(mn, _) = self.arena.get_expr(mhead) {
+                            if matches!(self.decls.get(mn), Some(Declaration::Quot { kind: QuotKind::Ctor, .. }))
+                                && margs.len() == 3
+                            {
+                                let fa = self.arena.app(args[3], margs[2]);
+                                return Some(self.arena.app_n(fa, &args[6..]));
+                            }
+                        }
+                    }
+                    return None;
+                }
                 let rec = match self.decls.get(&name)? {
                     Declaration::Recursor(r) if lvls.len() == r.level_params.len() => r.clone(),
                     _ => return None,
@@ -101,7 +117,11 @@ impl<'a> TypeChecker<'a> {
                 if args.len() <= major_idx {
                     return None;
                 }
-                let major = self.whnf(args[major_idx]);
+                let mut major = self.whnf(args[major_idx]);
+                // Expand Nat literals one step so `Nat.rec` computes on `#ELN` literals.
+                if let ExprData::Lit(Literal::Nat(k)) = *self.arena.get_expr(major) {
+                    major = self.expand_nat_lit(k);
+                }
                 let prefix_end = (rec.num_params + rec.num_motives + rec.num_minors) as usize;
                 if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
                     let rule = &rec.rules[0];
@@ -135,6 +155,16 @@ impl<'a> TypeChecker<'a> {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn expand_nat_lit(&mut self, k: u64) -> ExprId {
+        if k == 0 {
+            self.arena.const_path("Nat.zero", [])
+        } else {
+            let succ = self.arena.const_path("Nat.succ", []);
+            let pred = self.arena.lit_nat(k - 1);
+            self.arena.app(succ, pred)
         }
     }
 
@@ -209,6 +239,14 @@ impl<'a> TypeChecker<'a> {
             match (self.arena.get_expr(a).clone(), self.arena.get_expr(b).clone()) {
                 (ExprData::Sort(u), ExprData::Sort(v)) => return Ok(level_eq(self.arena, u, v)),
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
+                (ExprData::Lit(Literal::Nat(k)), _) => {
+                    a = self.expand_nat_lit(k);
+                    continue;
+                }
+                (_, ExprData::Lit(Literal::Nat(k))) => {
+                    b = self.expand_nat_lit(k);
+                    continue;
+                }
                 (
                     ExprData::Pi { name, binder_info, ty: t1, body: b1 },
                     ExprData::Pi { ty: t2, body: b2, .. },

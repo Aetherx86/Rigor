@@ -331,7 +331,8 @@ impl<'a> TypeChecker<'a> {
             Declaration::Axiom { .. }
             | Declaration::Inductive(_)
             | Declaration::Constructor(_)
-            | Declaration::Recursor(_) => Ok(()),
+            | Declaration::Recursor(_)
+            | Declaration::Quot { .. } => Ok(()),
             Declaration::Definition { val, .. } | Declaration::Opaque { val, .. } => {
                 expr_check_level_params(self.arena, *val, params)?;
                 let val_ty = self.infer_type(*val)?;

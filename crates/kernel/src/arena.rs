@@ -1,10 +1,4 @@
 //! Two-tier flat hash-consed DAG arenas for `Name`, `Level`, and `Expr`.
-//!
-//! - Every node is indexed by a 32-bit ID (`NameId`, `LevelId`, `ExprId`), giving O(1) structural
-//!   equality and compact memory footprint.
-//! - Global declarations live in an immutable `Arc<Arena>`. Worker threads checking independent
-//!   declarations create a lightweight child scratch arena via `Arena::child(Arc::clone(&base))`
-//!   with zero locking and O(1) teardown.
 
 use std::sync::Arc;
 
@@ -12,13 +6,10 @@ use crate::hash::FxHashMap;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NameId(pub u32);
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LevelId(pub u32);
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExprId(pub u32);
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FVarId(pub u32);
 
@@ -64,30 +55,11 @@ pub enum ExprData {
     Sort(LevelId),
     Const(NameId, Box<[LevelId]>),
     App(ExprId, ExprId),
-    Lam {
-        name: NameId,
-        binder_info: BinderInfo,
-        ty: ExprId,
-        body: ExprId,
-    },
-    Pi {
-        name: NameId,
-        binder_info: BinderInfo,
-        ty: ExprId,
-        body: ExprId,
-    },
-    Let {
-        name: NameId,
-        ty: ExprId,
-        val: ExprId,
-        body: ExprId,
-    },
+    Lam { name: NameId, binder_info: BinderInfo, ty: ExprId, body: ExprId },
+    Pi { name: NameId, binder_info: BinderInfo, ty: ExprId, body: ExprId },
+    Let { name: NameId, ty: ExprId, val: ExprId, body: ExprId },
     Lit(Literal),
-    Proj {
-        struct_name: NameId,
-        idx: u32,
-        expr: ExprId,
-    },
+    Proj { struct_name: NameId, idx: u32, expr: ExprId },
 }
 
 pub const FLAG_HAS_FVAR: u8 = 1 << 0;
@@ -95,26 +67,17 @@ pub const FLAG_HAS_LEVEL_PARAM: u8 = 1 << 1;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ExprMeta {
-    /// 0 if no loose bound variables; otherwise `1 + max_loose_bvar_index`.
     pub loose_bvar_range: u32,
     pub flags: u8,
 }
 
 impl ExprMeta {
     #[inline]
-    pub fn has_fvar(self) -> bool {
-        (self.flags & FLAG_HAS_FVAR) != 0
-    }
-
+    pub fn has_fvar(self) -> bool { (self.flags & FLAG_HAS_FVAR) != 0 }
     #[inline]
-    pub fn has_level_param(self) -> bool {
-        (self.flags & FLAG_HAS_LEVEL_PARAM) != 0
-    }
-
+    pub fn has_level_param(self) -> bool { (self.flags & FLAG_HAS_LEVEL_PARAM) != 0 }
     #[inline]
-    pub fn is_closed(self) -> bool {
-        self.loose_bvar_range == 0
-    }
+    pub fn is_closed(self) -> bool { self.loose_bvar_range == 0 }
 }
 
 /// Hash-consed flat DAG store supporting an optional immutable shared parent arena.
@@ -124,27 +87,21 @@ pub struct Arena {
     name_base: u32,
     level_base: u32,
     expr_base: u32,
-
     names: Vec<NameData>,
     name_map: FxHashMap<NameData, NameId>,
-
     levels: Vec<LevelData>,
     level_meta: Vec<LevelMeta>,
     level_map: FxHashMap<LevelData, LevelId>,
-
     exprs: Vec<ExprData>,
     expr_meta: Vec<ExprMeta>,
     expr_map: FxHashMap<ExprData, ExprId>,
 }
 
 impl Default for Arena {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl Arena {
-    /// Well-known root IDs always pre-interned at index 0.
     pub const ANONYMOUS: NameId = NameId(0);
     pub const LEVEL_ZERO: LevelId = LevelId(0);
 
@@ -164,17 +121,13 @@ impl Arena {
             expr_map: FxHashMap::default(),
         };
         let n0 = a.intern_name_raw(NameData::Anonymous);
-        debug_assert_eq!(n0, Self::ANONYMOUS);
         let l0 = a.intern_level_raw(LevelData::Zero);
-        debug_assert_eq!(l0, Self::LEVEL_ZERO);
+        debug_assert_eq!((n0, l0), (Self::ANONYMOUS, Self::LEVEL_ZERO));
         a
     }
 
-    /// Create a thread-local scratch arena backed by an immutable shared parent arena.
     pub fn child(parent: Arc<Arena>) -> Self {
-        let name_base = parent.name_len();
-        let level_base = parent.level_len();
-        let expr_base = parent.expr_len();
+        let (name_base, level_base, expr_base) = (parent.name_len(), parent.level_len(), parent.expr_len());
         Self {
             parent: Some(parent),
             name_base,
@@ -192,101 +145,53 @@ impl Arena {
     }
 
     #[inline]
-    pub fn name_len(&self) -> u32 {
-        self.name_base + self.names.len() as u32
-    }
-
+    pub fn name_len(&self) -> u32 { self.name_base + self.names.len() as u32 }
     #[inline]
-    pub fn level_len(&self) -> u32 {
-        self.level_base + self.levels.len() as u32
-    }
-
+    pub fn level_len(&self) -> u32 { self.level_base + self.levels.len() as u32 }
     #[inline]
-    pub fn expr_len(&self) -> u32 {
-        self.expr_base + self.exprs.len() as u32
-    }
+    pub fn expr_len(&self) -> u32 { self.expr_base + self.exprs.len() as u32 }
 
     // ---------------------------------------------------------------- Names
-
     fn lookup_name(&self, data: &NameData) -> Option<NameId> {
-        if let Some(&id) = self.name_map.get(data) {
-            return Some(id);
-        }
-        self.parent.as_deref().and_then(|p| p.lookup_name(data))
+        self.name_map.get(data).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_name(data)))
     }
-
     fn intern_name_raw(&mut self, data: NameData) -> NameId {
-        if let Some(id) = self.lookup_name(&data) {
-            return id;
-        }
+        if let Some(id) = self.lookup_name(&data) { return id; }
         let id = NameId(self.name_len());
         self.names.push(data.clone());
         self.name_map.insert(data, id);
         id
     }
-
-    pub fn name_str(&mut self, parent: NameId, seg: &str) -> NameId {
-        self.intern_name_raw(NameData::Str(parent, seg.into()))
-    }
-
-    pub fn name_num(&mut self, parent: NameId, num: u64) -> NameId {
-        self.intern_name_raw(NameData::Num(parent, num))
-    }
-
-    /// Intern a dotted name such as `"Nat.add"` starting from `ANONYMOUS`.
+    pub fn name_str(&mut self, parent: NameId, seg: &str) -> NameId { self.intern_name_raw(NameData::Str(parent, seg.into())) }
+    pub fn name_num(&mut self, parent: NameId, num: u64) -> NameId { self.intern_name_raw(NameData::Num(parent, num)) }
     pub fn name_from_path(&mut self, path: &str) -> NameId {
         let mut cur = Self::ANONYMOUS;
-        if path.is_empty() {
-            return cur;
-        }
-        for seg in path.split('.') {
-            cur = self.name_str(cur, seg);
+        if !path.is_empty() {
+            for seg in path.split('.') { cur = self.name_str(cur, seg); }
         }
         cur
     }
-
     #[inline]
     pub fn get_name(&self, id: NameId) -> &NameData {
-        if id.0 < self.name_base {
-            self.parent.as_deref().unwrap().get_name(id)
-        } else {
-            &self.names[(id.0 - self.name_base) as usize]
-        }
+        if id.0 < self.name_base { self.parent.as_deref().unwrap().get_name(id) }
+        else { &self.names[(id.0 - self.name_base) as usize] }
     }
-
     pub fn format_name(&self, id: NameId) -> String {
         match self.get_name(id) {
             NameData::Anonymous => "[anonymous]".into(),
-            NameData::Str(p, s) => {
-                if *p == Self::ANONYMOUS {
-                    s.to_string()
-                } else {
-                    format!("{}.{s}", self.format_name(*p))
-                }
-            }
-            NameData::Num(p, n) => {
-                if *p == Self::ANONYMOUS {
-                    n.to_string()
-                } else {
-                    format!("{}.{n}", self.format_name(*p))
-                }
-            }
+            NameData::Str(p, s) if *p == Self::ANONYMOUS => s.to_string(),
+            NameData::Str(p, s) => format!("{}.{s}", self.format_name(*p)),
+            NameData::Num(p, n) if *p == Self::ANONYMOUS => n.to_string(),
+            NameData::Num(p, n) => format!("{}.{n}", self.format_name(*p)),
         }
     }
 
     // ---------------------------------------------------------------- Levels
-
     fn lookup_level(&self, data: &LevelData) -> Option<LevelId> {
-        if let Some(&id) = self.level_map.get(data) {
-            return Some(id);
-        }
-        self.parent.as_deref().and_then(|p| p.lookup_level(data))
+        self.level_map.get(data).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_level(data)))
     }
-
     pub(crate) fn intern_level_raw(&mut self, data: LevelData) -> LevelId {
-        if let Some(id) = self.lookup_level(&data) {
-            return id;
-        }
+        if let Some(id) = self.lookup_level(&data) { return id; }
         let has_param = match &data {
             LevelData::Zero => false,
             LevelData::Param(_) => true,
@@ -301,38 +206,23 @@ impl Arena {
         self.level_map.insert(data, id);
         id
     }
-
     #[inline]
     pub fn get_level(&self, id: LevelId) -> &LevelData {
-        if id.0 < self.level_base {
-            self.parent.as_deref().unwrap().get_level(id)
-        } else {
-            &self.levels[(id.0 - self.level_base) as usize]
-        }
+        if id.0 < self.level_base { self.parent.as_deref().unwrap().get_level(id) }
+        else { &self.levels[(id.0 - self.level_base) as usize] }
     }
-
     #[inline]
     pub fn get_level_meta(&self, id: LevelId) -> LevelMeta {
-        if id.0 < self.level_base {
-            self.parent.as_deref().unwrap().get_level_meta(id)
-        } else {
-            self.level_meta[(id.0 - self.level_base) as usize]
-        }
+        if id.0 < self.level_base { self.parent.as_deref().unwrap().get_level_meta(id) }
+        else { self.level_meta[(id.0 - self.level_base) as usize] }
     }
 
     // ---------------------------------------------------------------- Expressions
-
     fn lookup_expr(&self, data: &ExprData) -> Option<ExprId> {
-        if let Some(&id) = self.expr_map.get(data) {
-            return Some(id);
-        }
-        self.parent.as_deref().and_then(|p| p.lookup_expr(data))
+        self.expr_map.get(data).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_expr(data)))
     }
-
     pub fn intern_expr(&mut self, data: ExprData) -> ExprId {
-        if let Some(id) = self.lookup_expr(&data) {
-            return id;
-        }
+        if let Some(id) = self.lookup_expr(&data) { return id; }
         let meta = self.compute_expr_meta(&data);
         let id = ExprId(self.expr_len());
         self.exprs.push(data.clone());
@@ -340,158 +230,91 @@ impl Arena {
         self.expr_map.insert(data, id);
         id
     }
-
     fn compute_expr_meta(&self, data: &ExprData) -> ExprMeta {
         match data {
-            ExprData::BVar(idx) => ExprMeta {
-                loose_bvar_range: idx.saturating_add(1),
-                flags: 0,
-            },
-            ExprData::FVar(_) => ExprMeta {
-                loose_bvar_range: 0,
-                flags: FLAG_HAS_FVAR,
-            },
+            ExprData::BVar(idx) => ExprMeta { loose_bvar_range: idx.saturating_add(1), flags: 0 },
+            ExprData::FVar(_) => ExprMeta { loose_bvar_range: 0, flags: FLAG_HAS_FVAR },
             ExprData::Sort(l) => ExprMeta {
                 loose_bvar_range: 0,
-                flags: if self.get_level_meta(*l).has_param {
-                    FLAG_HAS_LEVEL_PARAM
-                } else {
-                    0
-                },
+                flags: if self.get_level_meta(*l).has_param { FLAG_HAS_LEVEL_PARAM } else { 0 },
             },
-            ExprData::Const(_, lvls) => {
-                let hp = lvls.iter().any(|&l| self.get_level_meta(l).has_param);
-                ExprMeta {
-                    loose_bvar_range: 0,
-                    flags: if hp { FLAG_HAS_LEVEL_PARAM } else { 0 },
-                }
-            }
+            ExprData::Const(_, lvls) => ExprMeta {
+                loose_bvar_range: 0,
+                flags: if lvls.iter().any(|&l| self.get_level_meta(l).has_param) { FLAG_HAS_LEVEL_PARAM } else { 0 },
+            },
             ExprData::App(f, a) => {
-                let mf = self.get_expr_meta(*f);
-                let ma = self.get_expr_meta(*a);
-                ExprMeta {
-                    loose_bvar_range: mf.loose_bvar_range.max(ma.loose_bvar_range),
-                    flags: mf.flags | ma.flags,
-                }
+                let (mf, ma) = (self.get_expr_meta(*f), self.get_expr_meta(*a));
+                ExprMeta { loose_bvar_range: mf.loose_bvar_range.max(ma.loose_bvar_range), flags: mf.flags | ma.flags }
             }
             ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
-                let mt = self.get_expr_meta(*ty);
-                let mb = self.get_expr_meta(*body);
+                let (mt, mb) = (self.get_expr_meta(*ty), self.get_expr_meta(*body));
                 ExprMeta {
-                    loose_bvar_range: mt
-                        .loose_bvar_range
-                        .max(mb.loose_bvar_range.saturating_sub(1)),
+                    loose_bvar_range: mt.loose_bvar_range.max(mb.loose_bvar_range.saturating_sub(1)),
                     flags: mt.flags | mb.flags,
                 }
             }
             ExprData::Let { ty, val, body, .. } => {
-                let mt = self.get_expr_meta(*ty);
-                let mv = self.get_expr_meta(*val);
-                let mb = self.get_expr_meta(*body);
+                let (mt, mv, mb) = (self.get_expr_meta(*ty), self.get_expr_meta(*val), self.get_expr_meta(*body));
                 ExprMeta {
-                    loose_bvar_range: mt
-                        .loose_bvar_range
-                        .max(mv.loose_bvar_range)
-                        .max(mb.loose_bvar_range.saturating_sub(1)),
+                    loose_bvar_range: mt.loose_bvar_range.max(mv.loose_bvar_range).max(mb.loose_bvar_range.saturating_sub(1)),
                     flags: mt.flags | mv.flags | mb.flags,
                 }
             }
-            ExprData::Lit(_) => ExprMeta {
-                loose_bvar_range: 0,
-                flags: 0,
-            },
+            ExprData::Lit(_) => ExprMeta { loose_bvar_range: 0, flags: 0 },
             ExprData::Proj { expr, .. } => self.get_expr_meta(*expr),
         }
     }
-
     #[inline]
     pub fn get_expr(&self, id: ExprId) -> &ExprData {
-        if id.0 < self.expr_base {
-            self.parent.as_deref().unwrap().get_expr(id)
-        } else {
-            &self.exprs[(id.0 - self.expr_base) as usize]
-        }
+        if id.0 < self.expr_base { self.parent.as_deref().unwrap().get_expr(id) }
+        else { &self.exprs[(id.0 - self.expr_base) as usize] }
     }
-
     #[inline]
     pub fn get_expr_meta(&self, id: ExprId) -> ExprMeta {
-        if id.0 < self.expr_base {
-            self.parent.as_deref().unwrap().get_expr_meta(id)
-        } else {
-            self.expr_meta[(id.0 - self.expr_base) as usize]
-        }
-    }
-
-    // Convenience expression constructors
-    #[inline]
-    pub fn bvar(&mut self, idx: u32) -> ExprId {
-        self.intern_expr(ExprData::BVar(idx))
+        if id.0 < self.expr_base { self.parent.as_deref().unwrap().get_expr_meta(id) }
+        else { self.expr_meta[(id.0 - self.expr_base) as usize] }
     }
 
     #[inline]
-    pub fn fvar(&mut self, id: FVarId) -> ExprId {
-        self.intern_expr(ExprData::FVar(id))
-    }
-
+    pub fn bvar(&mut self, idx: u32) -> ExprId { self.intern_expr(ExprData::BVar(idx)) }
     #[inline]
-    pub fn sort(&mut self, level: LevelId) -> ExprId {
-        self.intern_expr(ExprData::Sort(level))
-    }
-
+    pub fn fvar(&mut self, id: FVarId) -> ExprId { self.intern_expr(ExprData::FVar(id)) }
     #[inline]
-    pub fn prop(&mut self) -> ExprId {
-        self.sort(Self::LEVEL_ZERO)
-    }
-
+    pub fn sort(&mut self, level: LevelId) -> ExprId { self.intern_expr(ExprData::Sort(level)) }
+    #[inline]
+    pub fn prop(&mut self) -> ExprId { self.sort(Self::LEVEL_ZERO) }
     #[inline]
     pub fn const_(&mut self, name: NameId, levels: impl Into<Box<[LevelId]>>) -> ExprId {
         self.intern_expr(ExprData::Const(name, levels.into()))
     }
-
     pub fn const_path(&mut self, path: &str, levels: impl Into<Box<[LevelId]>>) -> ExprId {
         let n = self.name_from_path(path);
         self.const_(n, levels)
     }
-
     #[inline]
-    pub fn app(&mut self, f: ExprId, a: ExprId) -> ExprId {
-        self.intern_expr(ExprData::App(f, a))
-    }
-
+    pub fn app(&mut self, f: ExprId, a: ExprId) -> ExprId { self.intern_expr(ExprData::App(f, a)) }
     pub fn app_n(&mut self, mut f: ExprId, args: &[ExprId]) -> ExprId {
-        for &a in args {
-            f = self.app(f, a);
-        }
+        for &a in args { f = self.app(f, a); }
         f
     }
-
     #[inline]
     pub fn lam(&mut self, name: NameId, binder_info: BinderInfo, ty: ExprId, body: ExprId) -> ExprId {
-        self.intern_expr(ExprData::Lam {
-            name,
-            binder_info,
-            ty,
-            body,
-        })
+        self.intern_expr(ExprData::Lam { name, binder_info, ty, body })
     }
-
     #[inline]
     pub fn pi(&mut self, name: NameId, binder_info: BinderInfo, ty: ExprId, body: ExprId) -> ExprId {
-        self.intern_expr(ExprData::Pi {
-            name,
-            binder_info,
-            ty,
-            body,
-        })
+        self.intern_expr(ExprData::Pi { name, binder_info, ty, body })
     }
-
     #[inline]
     pub fn let_(&mut self, name: NameId, ty: ExprId, val: ExprId, body: ExprId) -> ExprId {
         self.intern_expr(ExprData::Let { name, ty, val, body })
     }
-
     #[inline]
     pub fn proj(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> ExprId {
         self.intern_expr(ExprData::Proj { struct_name, idx, expr })
     }
+    #[inline]
+    pub fn lit_nat(&mut self, n: u64) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Nat(n))) }
+    #[inline]
+    pub fn lit_str(&mut self, s: &str) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Str(s.into()))) }
 }

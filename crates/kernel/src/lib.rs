@@ -15,7 +15,7 @@ pub mod reduce;
 pub use arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelData, LevelId, Literal, NameId};
 pub use check::TypeChecker;
 pub use env::{
-    ConstructorInfo, Declaration, Environment, FrozenEnv, InductiveInfo, RecursorInfo,
+    ConstructorInfo, Declaration, Environment, FrozenEnv, InductiveInfo, QuotKind, RecursorInfo,
     RecursorRule, ReducibilityHint,
 };
 pub use error::KernelError;

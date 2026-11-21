@@ -7,6 +7,7 @@ name = "rigor-bench"
 version = "0.1.0"
 dependencies = [
  "rigor-kernel",
+ "rigor-parser",
 ]
 
 [[package]]

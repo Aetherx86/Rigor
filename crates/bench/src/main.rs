@@ -8,13 +8,14 @@ use rigor_kernel::{
 };
 
 fn main() {
-    println!("Rigor Phase 1 & 2 Micro-Benchmarks");
-    println!("==================================");
+    println!("Rigor Phase 1-3 Micro-Benchmarks");
+    println!("================================");
 
     bench_arena_hash_consing();
     bench_church_reduction();
     bench_nat_iota_reduction();
     bench_parallel_theorems();
+    bench_lean4export_stream();
 }
 
 fn bench_arena_hash_consing() {
@@ -381,5 +382,89 @@ fn bench_parallel_theorems() {
         dp.as_secs_f64() * 1000.0,
         count as f64 / dp.as_secs_f64(),
         d1.as_secs_f64() / dp.as_secs_f64()
+    );
+}
+
+fn bench_lean4export_stream() {
+    use std::fmt::Write as _;
+
+    // Generate a 5,000-declaration lean4export stream exercising #NS, #NI, #US, #ES, #EV,
+    // #EC, #EA, #EL, #EP, #EZ, #ELN, #IND, #DEF, #THM.
+    let n_decls = 5_000usize;
+    let mut stream = String::with_capacity(n_decls * 96);
+    stream.push_str(
+        "0.1.4\n\
+         1 #NS 0 Nat\n\
+         2 #NS 1 zero\n\
+         3 #NS 1 succ\n\
+         4 #NS 0 Eq\n\
+         5 #NS 4 refl\n\
+         6 #NS 0 u\n\
+         7 #NS 0 Bench\n\
+         1 #US 0\n\
+         2 #UP 6\n\
+         0 #ES 0\n\
+         1 #ES 1\n\
+         2 #ES 2\n\
+         3 #EV 0\n\
+         4 #EV 1\n\
+         5 #EC 1\n\
+         6 #EP #BD 0 5 5\n\
+         #IND 0 1 1 2 2 5 3 6\n\
+         7 #EP #BD 0 4 0\n\
+         8 #EP #BD 0 3 7\n\
+         9 #EP #BI 0 2 8\n\
+         10 #EC 4 2\n\
+         11 #EA 10 4\n\
+         12 #EA 11 3\n\
+         13 #EA 12 3\n\
+         14 #EP #BD 0 3 13\n\
+         15 #EP #BI 0 2 14\n\
+         #IND 2 4 9 1 5 15 6\n\
+         16 #EC 4 1\n\
+         17 #EC 5 1\n\
+         18 #EA 16 5\n\
+         19 #EA 17 5\n",
+    );
+
+    let mut next_name = 8usize;
+    let mut next_expr = 20usize;
+    for i in 0..n_decls {
+        let nm_def = next_name;
+        let nm_thm = next_name + 1;
+        next_name += 2;
+        let lit = next_expr;
+        let let_e = next_expr + 1;
+        let def_c = next_expr + 2;
+        let eq1 = next_expr + 3;
+        let eq2 = next_expr + 4;
+        let rf = next_expr + 5;
+        next_expr += 6;
+        let _ = writeln!(stream, "{nm_def} #NI 7 {}", i * 2);
+        let _ = writeln!(stream, "{nm_thm} #NI 7 {}", i * 2 + 1);
+        let _ = writeln!(stream, "{lit} #ELN {}", i % 32);
+        let _ = writeln!(stream, "{let_e} #EZ 0 5 {lit} 3");
+        let _ = writeln!(stream, "#DEF {nm_def} 5 {let_e} R 1");
+        let _ = writeln!(stream, "{def_c} #EC {nm_def}");
+        let _ = writeln!(stream, "{eq1} #EA 18 {def_c}");
+        let _ = writeln!(stream, "{eq2} #EA {eq1} {lit}");
+        let _ = writeln!(stream, "{rf} #EA 19 {lit}");
+        let _ = writeln!(stream, "#THM {nm_thm} {eq2} {rf}");
+    }
+
+    let bytes = stream.len();
+    let t0 = Instant::now();
+    let (env, stats) = rigor_parser::parse_str(&stream).expect("lean4export bench stream must verify");
+    let elapsed = t0.elapsed();
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "[4] Streaming lean4export parse+check ({} decls, {} lines, {:.2} MiB): {:.2} ms ({:.0} decls/s, {:.1} MiB/s, env={} decls)",
+        stats.total_decls(),
+        stats.lines,
+        mb,
+        elapsed.as_secs_f64() * 1000.0,
+        stats.total_decls() as f64 / elapsed.as_secs_f64(),
+        mb / elapsed.as_secs_f64(),
+        env.len()
     );
 }

@@ -7,3 +7,4 @@ license = "MIT"
 
 [dependencies]
 rigor-kernel = { path = "../kernel" }
+rigor-parser = { path = "../parser" }

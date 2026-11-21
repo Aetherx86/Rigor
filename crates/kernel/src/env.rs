@@ -65,33 +65,22 @@ pub struct RecursorInfo {
 
 #[derive(Debug, Clone)]
 pub enum Declaration {
-    Axiom {
-        name: NameId,
-        level_params: Box<[NameId]>,
-        ty: ExprId,
-    },
-    Definition {
-        name: NameId,
-        level_params: Box<[NameId]>,
-        ty: ExprId,
-        val: ExprId,
-        hint: ReducibilityHint,
-    },
-    Theorem {
-        name: NameId,
-        level_params: Box<[NameId]>,
-        ty: ExprId,
-        val: ExprId,
-    },
-    Opaque {
-        name: NameId,
-        level_params: Box<[NameId]>,
-        ty: ExprId,
-        val: ExprId,
-    },
+    Axiom { name: NameId, level_params: Box<[NameId]>, ty: ExprId },
+    Definition { name: NameId, level_params: Box<[NameId]>, ty: ExprId, val: ExprId, hint: ReducibilityHint },
+    Theorem { name: NameId, level_params: Box<[NameId]>, ty: ExprId, val: ExprId },
+    Opaque { name: NameId, level_params: Box<[NameId]>, ty: ExprId, val: ExprId },
     Inductive(InductiveInfo),
     Constructor(ConstructorInfo),
     Recursor(RecursorInfo),
+    Quot { name: NameId, level_params: Box<[NameId]>, ty: ExprId, kind: QuotKind },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum QuotKind {
+    Type,
+    Ctor,
+    Lift,
+    Ind,
 }
 
 impl Declaration {
@@ -105,6 +94,7 @@ impl Declaration {
             Declaration::Inductive(i) => i.name,
             Declaration::Constructor(c) => c.name,
             Declaration::Recursor(r) => r.name,
+            Declaration::Quot { name, .. } => *name,
         }
     }
 
@@ -114,7 +104,8 @@ impl Declaration {
             Declaration::Axiom { level_params, .. }
             | Declaration::Definition { level_params, .. }
             | Declaration::Theorem { level_params, .. }
-            | Declaration::Opaque { level_params, .. } => level_params,
+            | Declaration::Opaque { level_params, .. }
+            | Declaration::Quot { level_params, .. } => level_params,
             Declaration::Inductive(i) => &i.level_params,
             Declaration::Constructor(c) => &c.level_params,
             Declaration::Recursor(r) => &r.level_params,
@@ -127,7 +118,8 @@ impl Declaration {
             Declaration::Axiom { ty, .. }
             | Declaration::Definition { ty, .. }
             | Declaration::Theorem { ty, .. }
-            | Declaration::Opaque { ty, .. } => *ty,
+            | Declaration::Opaque { ty, .. }
+            | Declaration::Quot { ty, .. } => *ty,
             Declaration::Inductive(i) => i.ty,
             Declaration::Constructor(c) => c.ty,
             Declaration::Recursor(r) => r.ty,
@@ -148,7 +140,8 @@ impl Declaration {
             | Declaration::Opaque { .. }
             | Declaration::Inductive(_)
             | Declaration::Constructor(_)
-            | Declaration::Recursor(_) => None,
+            | Declaration::Recursor(_)
+            | Declaration::Quot { .. } => None,
         }
     }
 }
@@ -246,6 +239,110 @@ impl Environment {
         let generated = check_inductive_block(&self.decls, &mut self.arena, &spec)?;
         for d in generated {
             self.decls.insert(d.name(), d);
+        }
+        Ok(())
+    }
+
+    /// Register Lean 4's four quotient primitives (`Quot`, `Quot.mk`, `Quot.lift`, `Quot.ind`).
+    /// Requires `Eq` to already be declared in the environment.
+    pub fn add_quot(&mut self) -> Result<(), KernelError> {
+        use crate::arena::BinderInfo::{Default as BD, Implicit as BI};
+        let eq_n = self.arena.name_from_path("Eq");
+        if !self.decls.contains_key(&eq_n) {
+            return Err(KernelError::UnknownConstant(eq_n));
+        }
+        let q_n = self.arena.name_from_path("Quot");
+        let qmk_n = self.arena.name_from_path("Quot.mk");
+        let qlift_n = self.arena.name_from_path("Quot.lift");
+        let qind_n = self.arena.name_from_path("Quot.ind");
+        if self.decls.contains_key(&q_n) {
+            return Ok(());
+        }
+        let u = self.arena.name_from_path("u");
+        let v = self.arena.name_from_path("v");
+        let (lu, lv) = (self.arena.lvl_param(u), self.arena.lvl_param(v));
+        let (su, sv, prop) = (self.arena.sort(lu), self.arena.sort(lv), self.arena.prop());
+        let (b0, b1, b2, b3, b4) = (
+            self.arena.bvar(0), self.arena.bvar(1), self.arena.bvar(2), self.arena.bvar(3), self.arena.bvar(4),
+        );
+        let q_u = self.arena.const_(q_n, [lu]);
+        let qmk_u = self.arena.const_(qmk_n, [lu]);
+        let eq_v = self.arena.const_(eq_n, [lv]);
+        let r_ty = {
+            let inner = self.arena.pi(Arena::ANONYMOUS, BD, b1, prop);
+            self.arena.pi(Arena::ANONYMOUS, BD, b0, inner)
+        };
+
+        // Quot.{u} : {α : Sort u} → (r : α → α → Prop) → Sort u
+        let q_ty = {
+            let p_r = self.arena.pi(Arena::ANONYMOUS, BD, r_ty, su);
+            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
+        };
+        // Quot.mk.{u} : {α : Sort u} → (r : α → α → Prop) → α → Quot.{u} α r
+        let qmk_ty = {
+            let ret = self.arena.app_n(q_u, &[b2, b1]);
+            let p_a = self.arena.pi(Arena::ANONYMOUS, BD, b1, ret);
+            let p_r = self.arena.pi(Arena::ANONYMOUS, BD, r_ty, p_a);
+            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
+        };
+        // Quot.lift.{u,v} : {α : Sort u} → {r : α → α → Prop} → {β : Sort v} → (f : α → β)
+        //   → (∀ a b, r a b → Eq.{v} β (f a) (f b)) → Quot.{u} α r → β
+        let qlift_ty = {
+            let q_ar = self.arena.app_n(q_u, &[b4, b3]);
+            let q_to_b = self.arena.pi(Arena::ANONYMOUS, BD, q_ar, b3);
+            // Under (α:#6, r:#5, β:#4, f:#3, a:#2, b:#1, _:#0): Eq.{v} β (f a) (f b)
+            let fa_s = self.arena.app(b3, b2);
+            let fb_s = self.arena.app(b3, b1);
+            let eq_fafb_s = self.arena.app_n(eq_v, &[b4, fa_s, fb_s]);
+            let rab = self.arena.app_n(b4, &[b1, b0]);
+            let h_pi = self.arena.pi(Arena::ANONYMOUS, BD, rab, eq_fafb_s);
+            let b_pi = self.arena.pi(Arena::ANONYMOUS, BD, b4, h_pi);
+            let a_pi = self.arena.pi(Arena::ANONYMOUS, BD, b3, b_pi);
+            let f_ty = self.arena.pi(Arena::ANONYMOUS, BD, b2, b1);
+            let p_h = self.arena.pi(Arena::ANONYMOUS, BD, a_pi, q_to_b);
+            let p_f = self.arena.pi(Arena::ANONYMOUS, BD, f_ty, p_h);
+            let p_b = self.arena.pi(Arena::ANONYMOUS, BI, sv, p_f);
+            let p_r = self.arena.pi(Arena::ANONYMOUS, BI, r_ty, p_b);
+            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
+        };
+        // Quot.ind.{u} : {α : Sort u} → {r : α → α → Prop} → {β : Quot.{u} α r → Prop}
+        //   → (∀ a, β (Quot.mk α r a)) → ∀ q, β q
+        let qind_ty = {
+            let q_ar_2 = self.arena.app_n(q_u, &[b1, b0]);
+            let beta_ty = self.arena.pi(Arena::ANONYMOUS, BD, q_ar_2, prop);
+            let q_ar_4 = self.arena.app_n(q_u, &[b3, b2]);
+            let bq = self.arena.app(b2, b0);
+            let all_q = self.arena.pi(Arena::ANONYMOUS, BD, q_ar_4, bq);
+            let mk_a = self.arena.app_n(qmk_u, &[b3, b2, b0]);
+            let b_mka = self.arena.app(b1, mk_a);
+            let all_a = self.arena.pi(Arena::ANONYMOUS, BD, b2, b_mka);
+            let p_h = self.arena.pi(Arena::ANONYMOUS, BD, all_a, all_q);
+            let p_b = self.arena.pi(Arena::ANONYMOUS, BI, beta_ty, p_h);
+            let p_r = self.arena.pi(Arena::ANONYMOUS, BI, r_ty, p_b);
+            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
+        };
+
+        let decls = [
+            Declaration::Quot { name: q_n, level_params: Box::new([u]), ty: q_ty, kind: QuotKind::Type },
+            Declaration::Quot { name: qmk_n, level_params: Box::new([u]), ty: qmk_ty, kind: QuotKind::Ctor },
+            Declaration::Quot { name: qlift_n, level_params: Box::new([u, v]), ty: qlift_ty, kind: QuotKind::Lift },
+            Declaration::Quot { name: qind_n, level_params: Box::new([u]), ty: qind_ty, kind: QuotKind::Ind },
+        ];
+        let mut inserted = Vec::with_capacity(4);
+        for d in decls {
+            let check = {
+                let mut tc = TypeChecker::new(&self.decls, &mut self.arena);
+                tc.check_decl(&d)
+            };
+            if let Err(e) = check {
+                for n in inserted {
+                    self.decls.remove(&n);
+                }
+                return Err(e);
+            }
+            let n = d.name();
+            self.decls.insert(n, d);
+            inserted.push(n);
         }
         Ok(())
     }
