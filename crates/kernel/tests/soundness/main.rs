@@ -520,3 +520,58 @@ fn rejects_large_elimination_when_a_field_only_occurs_inside_an_index() {
     assert_eq!(env.get(qrec_n).expect("Q.rec exists").level_params().len(), 1, "Q.rec eliminates into any Sort");
     assert_eq!(env.get(rec_n).expect("P.rec exists").level_params().len(), 0, "P.rec eliminates only into Prop");
 }
+
+/// Lean's unit-like rule: any two terms of a non-recursive structure with no fields are
+/// definitionally equal (Lean's `Std.Rii α` relies on this). A structure *with* a field must not
+/// get the same treatment.
+#[test]
+fn unit_like_structures_are_definitionally_equal_but_others_are_not() {
+    let mut env = Environment::new();
+    setup_false_bool_nat(&mut env);
+    let prop = env.arena.prop();
+    let l1 = env.arena.lvl_nat(1);
+    let type0 = env.arena.sort(l1);
+    let nat_c = env.arena.const_path("Nat", []);
+    let b0 = env.arena.bvar(0);
+    let b1 = env.arena.bvar(1);
+    let b2 = env.arena.bvar(2);
+
+    // structure U where (no fields);  structure W where val : Nat
+    let u_n = env.arena.name_from_path("U");
+    let umk_n = env.arena.name_from_path("U.mk");
+    let u_c = env.arena.const_(u_n, []);
+    env.add_inductive(InductiveSpec { level_params: Box::new([]), num_params: 0, types: vec![InductiveTypeSpec { name: u_n, ty: type0, ctors: vec![(umk_n, u_c)] }] }).unwrap();
+    let w_n = env.arena.name_from_path("W");
+    let wmk_n = env.arena.name_from_path("W.mk");
+    let w_c = env.arena.const_(w_n, []);
+    let wmk_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat_c, w_c);
+    env.add_inductive(InductiveSpec { level_params: Box::new([]), num_params: 0, types: vec![InductiveTypeSpec { name: w_n, ty: type0, ctors: vec![(wmk_n, wmk_ty)] }] }).unwrap();
+
+    // For T in {U, W}: axiom P_T : T -> Prop, and  def cast_T : (a b : T) -> P_T a -> P_T b := fun a b h => h
+    // type-checks exactly when `a` and `b` are definitionally equal.
+    let check = |env: &mut Environment, t: rigor_kernel::ExprId, tag: &str| {
+        let p_n = env.arena.name_from_path(&format!("P_{tag}"));
+        let p_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, t, prop);
+        env.add_decl(Declaration::Axiom { name: p_n, level_params: Box::new([]), ty: p_ty }).unwrap();
+        let p_c = env.arena.const_(p_n, []);
+        // inside binders a(#1) b(#0): P a -> P b
+        let pa = env.arena.app(p_c, b1);
+        let pb_under = env.arena.app(p_c, b1); // under the extra `h` binder, b is #1
+        let imp = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, pa, pb_under);
+        let ty = {
+            let inner = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, t, imp);
+            env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, t, inner)
+        };
+        let val = {
+            let pa_l = env.arena.app(p_c, b1);
+            let h = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, pa_l, b0);
+            let lb = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, t, h);
+            env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, t, lb)
+        };
+        let _ = b2;
+        let name = env.arena.name_from_path(&format!("cast_{tag}"));
+        env.add_decl(Declaration::Definition { name, level_params: Box::new([]), ty, val, hint: ReducibilityHint::Regular(0) })
+    };
+    assert!(check(&mut env, u_c, "U").is_ok(), "terms of a field-less structure are equal");
+    assert!(matches!(check(&mut env, w_c, "W"), Err(KernelError::TypeMismatch { .. })), "terms of a structure with a field are not");
+}

@@ -26,6 +26,12 @@ pub struct TypeChecker<'a> {
     next_fvar: u32,
     pub(crate) whnf_cache: FxHashMap<ExprId, ExprId>,
     pub(crate) infer_cache: FxHashMap<ExprId, ExprId>,
+    /// Lean's `infer_only` mode: types of terms built during reduction and definitional-equality
+    /// checking are inferred without re-checking application arguments (such intermediate terms
+    /// need not be well-typed on their own). Results live in a separate cache so that a term is
+    /// never treated as checked because it was only inferred.
+    pub(crate) infer_only: bool,
+    pub(crate) infer_only_cache: FxHashMap<ExprId, ExprId>,
     pub(crate) def_eq_cache: FxHashSet<(ExprId, ExprId)>,
     /// Pairs already shown not definitionally equal (Lean's failure cache); without it, nested
     /// structure eta and delta unfolding re-explore the same failing comparisons exponentially.
@@ -44,6 +50,8 @@ impl<'a> TypeChecker<'a> {
             next_fvar: 0,
             whnf_cache: FxHashMap::default(),
             infer_cache: FxHashMap::default(),
+            infer_only: false,
+            infer_only_cache: FxHashMap::default(),
             def_eq_cache: FxHashSet::default(),
             def_neq_cache: FxHashSet::default(),
             inst_lvl1_cache: FxHashMap::default(),
@@ -83,9 +91,23 @@ impl<'a> TypeChecker<'a> {
         if let Some(&ty) = self.infer_cache.get(&e) {
             return Ok(ty);
         }
+        if self.infer_only {
+            if let Some(&ty) = self.infer_only_cache.get(&e) {
+                return Ok(ty);
+            }
+        }
         let ty = self.infer_type_core(e)?;
-        self.infer_cache.insert(e, ty);
+        if self.infer_only { self.infer_only_cache.insert(e, ty); } else { self.infer_cache.insert(e, ty); }
         Ok(ty)
+    }
+
+    /// Infer a type without re-checking arguments (Lean's `infer_type(e, infer_only = true)`).
+    pub(crate) fn infer_type_only(&mut self, e: ExprId) -> Result<ExprId, KernelError> {
+        let prev = self.infer_only;
+        self.infer_only = true;
+        let r = self.infer_type(e);
+        self.infer_only = prev;
+        r
     }
 
     /// Infer the type of `ty`, reduce it to WHNF, and assert it is `Sort u`, returning `u`.
@@ -140,6 +162,9 @@ impl<'a> TypeChecker<'a> {
                     ExprData::Pi { ty, body, .. } => (*ty, *body),
                     _ => return Err(KernelError::ExpectedPi(f_ty_whnf)),
                 };
+                if self.infer_only {
+                    return Ok(instantiate1(self.arena, body, a));
+                }
                 let a_ty = self.infer_type(a)?;
                 if !self.is_def_eq(a_ty, dom)? {
                     return Err(KernelError::TypeMismatch {
@@ -176,8 +201,8 @@ impl<'a> TypeChecker<'a> {
             ExprData::Let { name, ty, val, body } => {
                 let (name, ty, val, body) = (*name, *ty, *val, *body);
                 let _u = self.infer_sort(ty)?;
-                let val_ty = self.infer_type(val)?;
-                if !self.is_def_eq(val_ty, ty)? {
+                let val_ty = if self.infer_only { ty } else { self.infer_type(val)? };
+                if !self.infer_only && !self.is_def_eq(val_ty, ty)? {
                     return Err(KernelError::TypeMismatch {
                         expected: ty,
                         got: val_ty,
@@ -317,3 +342,4 @@ fn check_unique_params(params: &[NameId]) -> Result<(), KernelError> {
     }
     Ok(())
 }
+

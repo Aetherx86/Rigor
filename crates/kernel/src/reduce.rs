@@ -155,7 +155,7 @@ impl<'a> TypeChecker<'a> {
                             if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
                                 let rule = &rec.rules[0];
                                 if let Some(Declaration::Constructor(c)) = self.decls.get(&rule.ctor_name) {
-                                    if let Ok(major_ty) = self.infer_type(major) {
+                                    if let Ok(major_ty) = self.infer_type_only(major) {
                                         let mut ctor_ty = if let Some(ref ls) = lvls_owned {
                                             let ind_lvls = &ls[ls.len() - c.level_params.len()..];
                                             self.inst_levels_cached(c.ty, &c.level_params, ind_lvls)
@@ -190,7 +190,7 @@ impl<'a> TypeChecker<'a> {
                             {
                                 if let Some(Declaration::Inductive(ind)) = self.decls.get(&rec.all[0]) {
                                     if !ind.is_prop && !ind.is_rec && ind.ctors.len() == 1 && ind.num_indices == 0 && ind.all.len() == 1 {
-                                        if let Ok(mty) = self.infer_type(major) {
+                                        if let Ok(mty) = self.infer_type_only(major) {
                                             let mty_w = self.whnf(mty);
                                             let (th, ta) = self.app_spine(mty_w);
                                             if let ExprData::Const(tn, tls) = self.arena.get_expr(th) {
@@ -328,6 +328,28 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Lean 4 kernel `reduce_nat`: O(1) machine evaluation of closed `Nat` literal primitives.
+    /// Does `e` mention a local without a `let` value?
+    fn has_opaque_fvar(&self, e: ExprId) -> bool {
+        if !self.arena.get_expr_meta(e).has_fvar() { return false; }
+        let mut stack = vec![e];
+        let mut seen = crate::hash::FxHashSet::default();
+        while let Some(x) = stack.pop() {
+            if !self.arena.get_expr_meta(x).has_fvar() || !seen.insert(x) { continue; }
+            match self.arena.get_expr(x) {
+                ExprData::FVar(fv) => match self.local_value(*fv) {
+                    None => return true,
+                    Some(v) => stack.push(v),
+                },
+                ExprData::App(f, a) => { stack.push(*f); stack.push(*a); }
+                ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => { stack.push(*ty); stack.push(*body); }
+                ExprData::Let { ty, val, body, .. } => { stack.push(*ty); stack.push(*val); stack.push(*body); }
+                ExprData::Proj { expr, .. } => stack.push(*expr),
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn try_reduce_nat(&mut self, name: NameId, spine: &[ExprId], allow_succ: bool) -> Option<(ExprId, usize)> {
         use crate::nat::{Nat, MAX_BITS};
         let len = spine.len();
@@ -358,9 +380,10 @@ impl<'a> TypeChecker<'a> {
             }
         };
         // As in Lean's `reduce_nat`: only closed terms can evaluate to literals, so never whnf an
-        // argument that mentions a free variable (that would unfold open arithmetic for nothing).
+        // argument that mentions a free variable without a value (that would unfold open
+        // arithmetic for nothing). `let`-bound variables count as closed: Lean substitutes them.
         let arity = if op == "succ" || op == "log2" { 1 } else { 2 };
-        if len < arity || spine[len - arity..].iter().any(|&x| self.arena.get_expr_meta(x).has_fvar()) {
+        if len < arity || spine[len - arity..].iter().any(|&x| self.has_opaque_fvar(x)) {
             return None;
         }
         if op == "succ" || op == "log2" {
@@ -417,8 +440,11 @@ impl<'a> TypeChecker<'a> {
         if matches!(self.arena.get_expr(e), ExprData::Sort(_) | ExprData::Pi { .. } | ExprData::Lit(_)) {
             return Ok(None);
         }
-        let ty = self.infer_type(e)?;
-        let sort = self.infer_sort(ty)?;
+        let prev = self.infer_only;
+        self.infer_only = true;
+        let r = self.infer_type(e).and_then(|ty| self.infer_sort(ty).map(|s| (ty, s)));
+        self.infer_only = prev;
+        let (ty, sort) = r?;
         Ok(level_is_zero(self.arena, sort).then_some(ty))
     }
 
@@ -514,7 +540,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 (Some((va, _, ppa, l0a, la)), None) => a = self.unfold_delta_app(va, ppa, l0a, la.as_deref(), &args_a),
                 (None, Some((vb, _, ppb, l0b, lb))) => b = self.unfold_delta_app(vb, ppb, l0b, lb.as_deref(), &args_b),
-                (None, None) => return Ok(self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)?),
+                (None, None) => return Ok(self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)? || self.try_unit_like(a, b)?),
             }
         }
     }
@@ -523,7 +549,7 @@ impl<'a> TypeChecker<'a> {
         if matches!(self.arena.get_expr(other), ExprData::Sort(_) | ExprData::Pi { .. } | ExprData::Lit(_) | ExprData::Lam { .. }) {
             return Ok(false);
         }
-        let other_ty = self.infer_type(other)?;
+        let other_ty = self.infer_type_only(other)?;
         let other_ty_w = self.whnf(other_ty);
         let ExprData::Pi { ty: dom, .. } = *self.arena.get_expr(other_ty_w) else { return Ok(false) };
         if !self.is_def_eq(ty, dom)? { return Ok(false); }
@@ -533,6 +559,25 @@ impl<'a> TypeChecker<'a> {
         let res = self.is_def_eq(lhs, rhs);
         self.pop_local();
         res
+    }
+
+    /// Lean's `is_def_eq_unit_like`: any two terms of a non-recursive structure whose single
+    /// constructor has no fields are equal (for example `Std.Rii α`), provided their types are.
+    fn try_unit_like(&mut self, a: ExprId, b: ExprId) -> Result<bool, KernelError> {
+        let a_ty = self.infer_type_only(a)?;
+        let a_ty_w = self.whnf(a_ty);
+        let (head, _) = self.app_spine(a_ty_w);
+        let ExprData::Const(iname, _) = *self.arena.get_expr(head) else { return Ok(false) };
+        let Some(Declaration::Inductive(ind)) = self.decls.get(&iname) else { return Ok(false) };
+        if ind.is_rec || ind.ctors.len() != 1 || ind.num_indices != 0 || ind.all.len() != 1 {
+            return Ok(false);
+        }
+        let Some(Declaration::Constructor(c)) = self.decls.get(&ind.ctors[0]) else { return Ok(false) };
+        if c.num_fields != 0 {
+            return Ok(false);
+        }
+        let b_ty = self.infer_type_only(b)?;
+        self.is_def_eq(a_ty_w, b_ty)
     }
 
     fn try_struct_eta(&mut self, ctor_side: ExprId, other: ExprId) -> Result<bool, KernelError> {
@@ -545,7 +590,7 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(false);
         }
-        let other_ty = self.infer_type(other)?;
+        let other_ty = self.infer_type_only(other)?;
         let other_ty_w = self.whnf(other_ty);
         let (ohead, oargs) = self.app_spine(other_ty_w);
         if !matches!(self.arena.get_expr(ohead), ExprData::Const(n, _) if *n == ind.name && oargs.len() == ind.num_params as usize) {
@@ -584,3 +629,4 @@ fn split_lvls(lvls: &[LevelId]) -> (Option<LevelId>, Option<Box<[LevelId]>>) {
         _ => (None, Some(lvls.into())),
     }
 }
+

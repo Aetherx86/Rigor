@@ -82,13 +82,34 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
     4. Def-eq failure cache (`def_neq_cache`); `reduce_nat` skips terms with free variables (as Lean); proof
        irrelevance is checked before structural comparison (Lean's order).
     5. `--check` runs on a 4 GiB-stack thread.
-  - Result now: the run passes the first ~2.26M of 6.5M lines (~35%) and then hangs on `BitVec.reverse_replicate`
-    (line 2,264,328; `zero => rfl` case). Diagnosis: whnf unfolds `Nat.add/mul/pow/sub` structurally (via
-    `Nat.brecOn`, `*.match_1`, `*._f`) and counts a literal down from 2^32 one step at a time. Lean avoids this
-    path; most likely its lazy-delta ordering (unfold the side with the greater height first, compare arguments
-    of same-head applications before unfolding, `is_def_eq_offset` for succ/literal) or its `whnf` cache.
-    NEXT: dump the exact def-eq pair at the top of that check (instrument `is_def_eq` depth <= 3 behind an env
-    var), compare with Lean's `lazy_delta_reduction` in src/kernel/type_checker.cpp, fix, then continue the run.
+    6. `reduce_nat` treated `let`-bound locals as open terms and refused to evaluate them, so `omega`
+       certificates (`Int.Internal.Linear.le_combine_cert` on `let` values) unfolded Nat arithmetic
+       structurally and counted down from 2^32. Lean substitutes `let` values, so they are closed; the guard now
+       only skips locals without a value (`has_opaque_fvar`). This was what hung `BitVec.reverse_replicate`'s
+       neighbourhood (line ~2.26M).
+    7. Lean's `infer_only` mode (`TypeChecker::infer_only`, `infer_type_only`, separate `infer_only_cache`):
+       types of terms built during reduction/def-eq (K-like `Eq.rec`, struct eta, proof irrelevance,
+       `is_proof`) are inferred without re-checking application arguments and `let` values. Such intermediate
+       terms need not be well-typed by themselves; Rigor used to reject `Std.Rii.forIn'_congr` (line 3,622,040)
+       with a TypeMismatch on `@Eq (x = y) h h'` produced by reduction. Top-level `check_decl` still runs in
+       full mode, and full-mode results are never read from the infer-only cache.
+    8. Lean's unit-like rule (`try_unit_like`, after struct eta as in Lean's `is_def_eq_core`): any two terms of a
+       non-recursive structure with one field-less constructor are equal. `Std.Rii α` has no fields, and
+       `Std.Rii.forIn'_congr` (line 3,622,040) needs `r = a` and `r = r'` to agree. Regression test
+       `unit_like_structures_are_definitionally_equal_but_others_are_not` (positive and negative case).
+  - RESULT 2026-11-22 05:45 KST: Rigor verifies ALL of Lean 4 v4.36.0-rc1 `Init`: 58,546 declarations
+    (59,978 env entries), 6,495,289 NDJSON lines, 331.7 MiB, in 27.9 s (28.3 s wall incl. process) with 726 MB
+    peak RSS. `lake env leanchecker --fresh Init` on the same toolchain: 28.5 s wall, 550 MB peak RSS.
+    So at full-library scale Rigor is at parity on time and uses ~32% more memory (the 3.7x-7.1x figures in
+    BENCHMARKS.md are for single small modules and do not carry over). Rigor's time includes JSON parsing of a
+    332 MiB file; leanchecker reads .olean files.
+  - Debug instrumentation used for the investigation has been removed. To re-create: see git history of this
+    worklog section (DEBUG_ON flag, def-eq depth printer, inference stack printer).
+  - NEXT: (a) memory (726 MB vs 550 MB): arena keeps every expression of every accepted declaration; consider
+    dropping proof bodies of theorems after checking (Lean keeps them), compacting caches; (b) speed: profile
+    the full run (`/usr/bin/sample`) and parallelise independent declarations; (c) Std and Lean library exports;
+    (d) TCB is 2,8xx SLOC, over the 2,500 target; (e) soundness hardening: mutation testing (perturb real
+    exported proofs and require rejection, cross-checked with leanchecker).
   - Init.Prelude (95 ms, 19.8 MB RSS) and Init.Core (96 ms, 24.7 MB RSS) still verify fully after these changes.
   - TCB: kernel is now 2,815 SLOC (nat.rs adds 253), over the 2,500 target; trimming is open work.
 
@@ -100,3 +121,5 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
 - 2026-11-22 02:19 KST: completed Phase 4 (head-to-head benchmark harness + Peak RSS script, Ackermann & primality reflection stress tests, `/usr/bin/sample` profile-guided spine-machine & arena optimizations up to 8.81x faster / -23.7% RSS, 19/19 tests green, TCB 2,484 SLOC, `BENCHMARKS.md`, commit `cb2ddff`).
 - 2026-11-22 04:07 KST: verified real Lean 4 v4.36.0 `Init.Prelude`, `Init.Core`, `Init.Data.Nat.Basic`, `Init.Data.List.Basic` via NDJSON `lean4export`, nested inductives, `to_ctor_when_structure`, `u128` `reduce_nat`, and `Arena::truncate_to` — beating `leanchecker --fresh` by 3.67x-7.11x wall time and 2.23x-3.15x lower Peak RSS while keeping TCB < 2,500 SLOC.
 - 2026-11-22 04:50 KST: Phase 5 started (full Init). Fixed unsound nested-index large elimination, string literal expansion, bignum Nat + all accelerated ops, failure cache, fvar guard in reduce_nat, proof-irrelevance order, big-stack checker. Blocked at BitVec.reverse_replicate (see Phase 5 NEXT).
+- 2026-11-22 05:20 KST: fixed let-bound locals in reduce_nat (run reached 56% of Init in 15.6 s), added Lean's infer_only mode for internal type inference (Std.Rii.forIn'_congr). Full Init run in progress.
+- 2026-11-22 05:45 KST: all of Init verified (58,546 decls, 27.9 s, 726 MB) after adding Lean's unit-like def-eq rule; leanchecker --fresh Init: 28.5 s, 550 MB. 23 tests green, debug code removed.
