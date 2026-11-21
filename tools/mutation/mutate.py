@@ -2,7 +2,7 @@
 """Soundness mutation-testing harness for the Rigor proof kernel.
 
 Generates syntactically valid NDJSON mutants of a Lean 4 lean4export file
-across five mutation operators and verifies that Rigor rejects broken proofs.
+across seven mutation operators and verifies that Rigor rejects broken proofs.
 Uses Python 3 standard library only.
 """
 
@@ -17,6 +17,16 @@ import tempfile
 import time
 from pathlib import Path
 
+ALL_OPS = [
+    "thm_value_swap",
+    "const_swap",
+    "arg_swap",
+    "level_change",
+    "def_body_rfl_break",
+    "inductive_mutation",
+    "level_arity_mismatch",
+]
+
 
 def parse_ndjson_index(path: Path):
     """Parse the NDJSON export and build lookup tables for mutation generation."""
@@ -28,16 +38,10 @@ def parse_ndjson_index(path: Path):
     max_il = 0
     max_ie = 0
 
-    # Declarations and constant metadata
-    # const_info[name_id] = {
-    #   "kind": "def"|"thm"|"axiom"|"opaque"|"ind"|"ctor"|"rec"|"quot",
-    #   "line": int,
-    #   "type": int,
-    #   "levelParams": list[int],
-    # }
     const_info = {}
     thms = []  # list of (line_idx, obj)
     defs = []  # list of (line_idx, obj)
+    inductives = []  # list of (line_idx, ind_obj)
     decl_name_by_line = {}
 
     for idx, line in enumerate(raw_lines):
@@ -112,6 +116,7 @@ def parse_ndjson_index(path: Path):
             decl_name_by_line[idx] = names[obj["name"]]
         elif "inductive" in d:
             ind = d["inductive"]
+            inductives.append((idx, ind))
             for t in ind["types"]:
                 const_info[t["name"]] = {
                     "kind": "ind",
@@ -136,7 +141,6 @@ def parse_ndjson_index(path: Path):
             if ind["types"]:
                 decl_name_by_line[idx] = names[ind["types"][0]["name"]]
 
-    # Precompute level params used by each level id
     lvl_params_cache = {0: frozenset()}
 
     def level_params_of(lid: int) -> frozenset:
@@ -156,7 +160,7 @@ def parse_ndjson_index(path: Path):
         lvl_params_cache[lid] = res
         return res
 
-    # Precompute loose bvar range and level params for each expr id (bottom-up since IDs are topological)
+    # Precompute loose bvar range and level params for each expr id
     expr_closed = {}
     expr_lparams = {}
     for eid in sorted(exprs.keys()):
@@ -214,6 +218,7 @@ def parse_ndjson_index(path: Path):
         "const_info": const_info,
         "thms": thms,
         "defs": defs,
+        "inductives": inductives,
         "decl_name_by_line": decl_name_by_line,
     }
 
@@ -280,10 +285,6 @@ def collect_consts_in_expr(exprs, root_eid: int, cap: int = 500) -> set:
 
 
 def find_paths(exprs, root_eid: int, pred, max_paths: int = 25, max_depth: int = 40):
-    """Find paths from root_eid to subexpressions matching pred(eid, expr_dict).
-
-    Each path is a list of (parent_eid, field_key) ending at target_eid.
-    """
     results = []
     visited = set()
 
@@ -341,10 +342,6 @@ def find_paths(exprs, root_eid: int, pred, max_paths: int = 25, max_depth: int =
 
 
 def rebuild_path(exprs, path, new_leaf_eid: int, next_ie: int):
-    """Clone ancestor exprs along `path` with fresh IDs starting at `next_ie`.
-
-    Returns (new_lines: list[str], new_root_eid: int, next_ie_after: int).
-    """
     new_lines = []
     cur_child = new_leaf_eid
     for parent_eid, slot in reversed(path):
@@ -360,6 +357,103 @@ def rebuild_path(exprs, path, new_leaf_eid: int, next_ie: int):
     return new_lines, cur_child, next_ie
 
 
+def shift_bvars(exprs, expr_closed, root_eid: int, cutoff: int, delta: int, next_ie: int):
+    """Shift all loose de Bruijn indices >= cutoff by +delta, emitting fresh expr lines."""
+    memo = {}
+    out_lines = []
+
+    def rec(eid: int, c: int) -> int:
+        nonlocal next_ie
+        if expr_closed[eid] <= c:
+            return eid
+        key = (eid, c)
+        if key in memo:
+            return memo[key]
+        e = exprs[eid]
+        if "bvar" in e:
+            idx = e["bvar"]
+            if idx < c:
+                res = eid
+            else:
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"bvar": idx + delta, "ie": res}, separators=(",", ":")))
+        elif "app" in e:
+            f2 = rec(e["app"]["fn"], c)
+            a2 = rec(e["app"]["arg"], c)
+            if f2 == e["app"]["fn"] and a2 == e["app"]["arg"]:
+                res = eid
+            else:
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"app": {"fn": f2, "arg": a2}, "ie": res}, separators=(",", ":")))
+        elif "lam" in e:
+            t2 = rec(e["lam"]["type"], c)
+            b2 = rec(e["lam"]["body"], c + 1)
+            if t2 == e["lam"]["type"] and b2 == e["lam"]["body"]:
+                res = eid
+            else:
+                sub = dict(e["lam"])
+                sub["type"] = t2
+                sub["body"] = b2
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"lam": sub, "ie": res}, separators=(",", ":")))
+        elif "forallE" in e:
+            t2 = rec(e["forallE"]["type"], c)
+            b2 = rec(e["forallE"]["body"], c + 1)
+            if t2 == e["forallE"]["type"] and b2 == e["forallE"]["body"]:
+                res = eid
+            else:
+                sub = dict(e["forallE"])
+                sub["type"] = t2
+                sub["body"] = b2
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"forallE": sub, "ie": res}, separators=(",", ":")))
+        elif "letE" in e:
+            t2 = rec(e["letE"]["type"], c)
+            v2 = rec(e["letE"]["value"], c)
+            b2 = rec(e["letE"]["body"], c + 1)
+            if t2 == e["letE"]["type"] and v2 == e["letE"]["value"] and b2 == e["letE"]["body"]:
+                res = eid
+            else:
+                sub = dict(e["letE"])
+                sub["type"] = t2
+                sub["value"] = v2
+                sub["body"] = b2
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"letE": sub, "ie": res}, separators=(",", ":")))
+        elif "proj" in e:
+            s2 = rec(e["proj"]["struct"], c)
+            if s2 == e["proj"]["struct"]:
+                res = eid
+            else:
+                sub = dict(e["proj"])
+                sub["struct"] = s2
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"proj": sub, "ie": res}, separators=(",", ":")))
+        elif "mdata" in e:
+            x2 = rec(e["mdata"]["expr"], c)
+            if x2 == e["mdata"]["expr"]:
+                res = eid
+            else:
+                sub = dict(e["mdata"])
+                sub["expr"] = x2
+                res = next_ie
+                next_ie += 1
+                out_lines.append(json.dumps({"mdata": sub, "ie": res}, separators=(",", ":")))
+        else:
+            res = eid
+        memo[key] = res
+        return res
+
+    new_root = rec(root_eid, cutoff)
+    return out_lines, new_root, next_ie
+
+
 def build_mutated_text(raw_lines, target_line: int, insert_before: list, replaced_line: str) -> str:
     out = []
     out.extend(raw_lines[:target_line])
@@ -372,6 +466,7 @@ def build_mutated_text(raw_lines, target_line: int, insert_before: list, replace
 def generate_mutants(idx_data, seed: int, per_op: int):
     rng = random.Random(seed)
     names = idx_data["names"]
+    levels = idx_data["levels"]
     exprs = idx_data["exprs"]
     expr_line = idx_data["expr_line"]
     expr_closed = idx_data["expr_closed"]
@@ -379,14 +474,13 @@ def generate_mutants(idx_data, seed: int, per_op: int):
     const_info = idx_data["const_info"]
     thms = idx_data["thms"]
     defs = idx_data["defs"]
+    inductives = idx_data["inductives"]
     max_ie = idx_data["max_ie"]
     max_il = idx_data["max_il"]
 
-    # Sort theorems and definitions preferring smaller value DAGs
     thms_by_size = sorted(thms, key=lambda item: (expr_dag_size(exprs, item[1]["value"]), item[0]))
     defs_by_size = sorted(defs, key=lambda item: (expr_dag_size(exprs, item[1]["value"]), item[0]))
 
-    # Index constants by universe parameter arity
     consts_by_arity = {}
     consts_by_type_arity = {}
     for nid, info in const_info.items():
@@ -398,8 +492,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
     for v in consts_by_type_arity.values():
         v.sort()
 
-    # Closed candidate expressions for Op 3 (arg_swap): pre-collect closed const/sort/lit exprs
-    # tagged with a coarse type key so we pick replacements of a genuinely different type.
     def coarse_type_key(eid: int):
         e = exprs[eid]
         if "const" in e:
@@ -446,30 +538,34 @@ def generate_mutants(idx_data, seed: int, per_op: int):
     rng.shuffle(op1_pool)
     op1_count = 0
     seen_op1 = set()
-    for l1, t1, cands in op1_pool:
+    for _pass in range(3):
         if op1_count >= per_op:
             break
-        l2, t2 = rng.choice(cands)
-        key = (t1["name"], t2["name"])
-        if key in seen_op1:
-            continue
-        seen_op1.add(key)
-        new_obj = dict(t1)
-        new_obj["value"] = t2["value"]
-        mutants.append({
-            "op": "thm_value_swap",
-            "target": names[t1["name"]],
-            "target_line": l1,
-            "insert_before": [],
-            "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
-            "detail": f"replaced value of {names[t1['name']]} with value of {names[t2['name']]}",
-        })
-        op1_count += 1
+        rng.shuffle(op1_pool)
+        for l1, t1, cands in op1_pool:
+            if op1_count >= per_op:
+                break
+            l2, t2 = rng.choice(cands)
+            key = (t1["name"], t2["name"])
+            if key in seen_op1:
+                continue
+            seen_op1.add(key)
+            new_obj = dict(t1)
+            new_obj["value"] = t2["value"]
+            mutants.append({
+                "op": "thm_value_swap",
+                "target": names[t1["name"]],
+                "target_line": l1,
+                "insert_before": [],
+                "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
+                "detail": f"replaced value of {names[t1['name']]} with value of {names[t2['name']]}",
+            })
+            op1_count += 1
 
     # ------------------------------------------------------------------
     # Operator 2: Constant swap inside a theorem or definition value
     # ------------------------------------------------------------------
-    op2_decls = [("thm", l, o) for l, o in thms_by_size] + [("def", l, o) for l, o in defs_by_size[:250]]
+    op2_decls = [("thm", l, o) for l, o in thms_by_size] + [("def", l, o) for l, o in defs_by_size[:400]]
     rng.shuffle(op2_decls)
     op2_count = 0
     seen_op2 = set()
@@ -478,7 +574,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
             break
         paths = find_paths(exprs, obj["value"], lambda _eid, e: "const" in e, max_paths=15)
         rng.shuffle(paths)
-        picked = False
         for path, ceid in paths:
             cobj = exprs[ceid]["const"]
             n1 = cobj["name"]
@@ -514,110 +609,112 @@ def generate_mutants(idx_data, seed: int, per_op: int):
                 "detail": f"in {dkind} {names[obj['name']]}, swapped const {names[n1]} -> {names[n2]} (arity {len(us)})",
             })
             op2_count += 1
-            picked = True
             break
-        if picked:
-            continue
 
     # ------------------------------------------------------------------
     # Operator 3: Argument swap in an app node used by a theorem value
     # ------------------------------------------------------------------
     op3_thms = list(thms_by_size)
-    rng.shuffle(op3_thms)
     op3_count = 0
     seen_op3 = set()
-    for lno, obj in op3_thms:
+    for _pass in range(3):
         if op3_count >= per_op:
             break
-        lp_set = frozenset(obj["levelParams"])
-        paths = find_paths(exprs, obj["value"], lambda _eid, e: "app" in e, max_paths=20)
-        rng.shuffle(paths)
-        for path, aeid in paths:
-            app_obj = exprs[aeid]["app"]
-            fn_id = app_obj["fn"]
-            arg_id = app_obj["arg"]
-            arg_tkey = coarse_type_key(arg_id)
-            # Sample candidate replacement arguments defined before lno with compatible level params & different type
-            cands = []
-            for _ in range(40):
-                el, ceid, clp, ctkey = rng.choice(closed_arg_pool)
-                if el < lno and ceid != arg_id and clp.issubset(lp_set) and ctkey != arg_tkey:
-                    cands.append(ceid)
-                    if len(cands) >= 5:
-                        break
-            if not cands:
-                continue
-            alt_arg = rng.choice(cands)
-            key = (obj["name"], aeid, alt_arg)
-            if key in seen_op3:
-                continue
-            seen_op3.add(key)
-            next_ie = max_ie + 1
-            leaf_id = next_ie
-            next_ie += 1
-            leaf_line = json.dumps({"app": {"fn": fn_id, "arg": alt_arg}, "ie": leaf_id}, separators=(",", ":"))
-            anc_lines, new_root, _ = rebuild_path(exprs, path, leaf_id, next_ie)
-            new_obj = dict(obj)
-            new_obj["value"] = new_root
-            mutants.append({
-                "op": "arg_swap",
-                "target": names[obj["name"]],
-                "target_line": lno,
-                "insert_before": [leaf_line] + anc_lines,
-                "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
-                "detail": f"in thm {names[obj['name']]}, swapped app({aeid}) arg {arg_id} -> {alt_arg}",
-            })
-            op3_count += 1
-            break
+        rng.shuffle(op3_thms)
+        for lno, obj in op3_thms:
+            if op3_count >= per_op:
+                break
+            lp_set = frozenset(obj["levelParams"])
+            paths = find_paths(exprs, obj["value"], lambda _eid, e: "app" in e, max_paths=20)
+            rng.shuffle(paths)
+            for path, aeid in paths:
+                app_obj = exprs[aeid]["app"]
+                fn_id = app_obj["fn"]
+                arg_id = app_obj["arg"]
+                arg_tkey = coarse_type_key(arg_id)
+                cands = []
+                for _ in range(40):
+                    el, ceid, clp, ctkey = rng.choice(closed_arg_pool)
+                    if el < lno and ceid != arg_id and clp.issubset(lp_set) and ctkey != arg_tkey:
+                        cands.append(ceid)
+                        if len(cands) >= 5:
+                            break
+                if not cands:
+                    continue
+                alt_arg = rng.choice(cands)
+                key = (obj["name"], aeid, alt_arg)
+                if key in seen_op3:
+                    continue
+                seen_op3.add(key)
+                next_ie = max_ie + 1
+                leaf_id = next_ie
+                next_ie += 1
+                leaf_line = json.dumps({"app": {"fn": fn_id, "arg": alt_arg}, "ie": leaf_id}, separators=(",", ":"))
+                anc_lines, new_root, _ = rebuild_path(exprs, path, leaf_id, next_ie)
+                new_obj = dict(obj)
+                new_obj["value"] = new_root
+                mutants.append({
+                    "op": "arg_swap",
+                    "target": names[obj["name"]],
+                    "target_line": lno,
+                    "insert_before": [leaf_line] + anc_lines,
+                    "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
+                    "detail": f"in thm {names[obj['name']]}, swapped app({aeid}) arg {arg_id} -> {alt_arg}",
+                })
+                op3_count += 1
+                break
 
     # ------------------------------------------------------------------
     # Operator 4: Universe level change on a const node in a theorem value
     # ------------------------------------------------------------------
     op4_thms = list(thms_by_size)
-    rng.shuffle(op4_thms)
     op4_count = 0
     seen_op4 = set()
-    for lno, obj in op4_thms:
+    for _pass in range(3):
         if op4_count >= per_op:
             break
-        paths = find_paths(
-            exprs,
-            obj["value"],
-            lambda _eid, e: "const" in e and len(e["const"]["us"]) >= 1,
-            max_paths=20,
-        )
-        rng.shuffle(paths)
-        for path, ceid in paths:
-            cobj = exprs[ceid]["const"]
-            n1 = cobj["name"]
-            us = list(cobj["us"])
-            pos = rng.randrange(len(us))
-            old_u = us[pos]
-            key = (obj["name"], ceid, pos)
-            if key in seen_op4:
-                continue
-            seen_op4.add(key)
-            new_il = max_il + 1
-            lvl_line = json.dumps({"succ": old_u, "il": new_il}, separators=(",", ":"))
-            new_us = list(us)
-            new_us[pos] = new_il
-            next_ie = max_ie + 1
-            leaf_id = next_ie
-            next_ie += 1
-            leaf_line = json.dumps({"const": {"name": n1, "us": new_us}, "ie": leaf_id}, separators=(",", ":"))
-            anc_lines, new_root, _ = rebuild_path(exprs, path, leaf_id, next_ie)
-            new_obj = dict(obj)
-            new_obj["value"] = new_root
-            mutants.append({
-                "op": "level_change",
-                "target": names[obj["name"]],
-                "target_line": lno,
-                "insert_before": [lvl_line, leaf_line] + anc_lines,
-                "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
-                "detail": f"in thm {names[obj['name']]}, bumped level arg[{pos}] of {names[n1]} from il={old_u} to succ({old_u})",
-            })
-            op4_count += 1
-            break
+        rng.shuffle(op4_thms)
+        for lno, obj in op4_thms:
+            if op4_count >= per_op:
+                break
+            paths = find_paths(
+                exprs,
+                obj["value"],
+                lambda _eid, e: "const" in e and len(e["const"]["us"]) >= 1,
+                max_paths=20,
+            )
+            rng.shuffle(paths)
+            for path, ceid in paths:
+                cobj = exprs[ceid]["const"]
+                n1 = cobj["name"]
+                us = list(cobj["us"])
+                pos = rng.randrange(len(us))
+                old_u = us[pos]
+                key = (obj["name"], ceid, pos)
+                if key in seen_op4:
+                    continue
+                seen_op4.add(key)
+                new_il = max_il + 1
+                lvl_line = json.dumps({"succ": old_u, "il": new_il}, separators=(",", ":"))
+                new_us = list(us)
+                new_us[pos] = new_il
+                next_ie = max_ie + 1
+                leaf_id = next_ie
+                next_ie += 1
+                leaf_line = json.dumps({"const": {"name": n1, "us": new_us}, "ie": leaf_id}, separators=(",", ":"))
+                anc_lines, new_root, _ = rebuild_path(exprs, path, leaf_id, next_ie)
+                new_obj = dict(obj)
+                new_obj["value"] = new_root
+                mutants.append({
+                    "op": "level_change",
+                    "target": names[obj["name"]],
+                    "target_line": lno,
+                    "insert_before": [lvl_line, leaf_line] + anc_lines,
+                    "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
+                    "detail": f"in thm {names[obj['name']]}, bumped level arg[{pos}] of {names[n1]} from il={old_u} to succ({old_u})",
+                })
+                op4_count += 1
+                break
 
     # ------------------------------------------------------------------
     # Operator 5: Definition body change for defs proven about by later rfl theorems
@@ -627,7 +724,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
     bool_false_id = next((nid for nid, nm in names.items() if nm == "Bool.false"), None)
     def_by_name = {obj["name"]: (lno, obj) for lno, obj in defs}
 
-    # Map each definition to later theorems proved using rfl/Eq.refl/HEq.refl whose type mentions it
     rfl_dependents = {}
     for tidx, tobj in thms:
         vconsts = collect_consts_in_expr(exprs, tobj["value"])
@@ -638,14 +734,13 @@ def generate_mutants(idx_data, seed: int, per_op: int):
             if cn in def_by_name and def_by_name[cn][0] < tidx:
                 rfl_dependents.setdefault(cn, []).append(names[tobj["name"]])
 
-    # Also include 1-hop helper defs unfolded by those directly-referenced defs
-    for cn, thm_list in list(rfl_dependents.items()):
-        didx, dobj = def_by_name[cn]
-        for sub in collect_consts_in_expr(exprs, dobj["value"]):
-            if sub in def_by_name and def_by_name[sub][0] < didx and sub not in rfl_dependents:
-                rfl_dependents[sub] = [f"{t} (via {names[cn]})" for t in thm_list[:2]]
+    for _hop in range(2):
+        for cn, thm_list in list(rfl_dependents.items()):
+            didx, dobj = def_by_name[cn]
+            for sub in collect_consts_in_expr(exprs, dobj["value"]):
+                if sub in def_by_name and def_by_name[sub][0] < didx and sub not in rfl_dependents:
+                    rfl_dependents[sub] = [f"{t} (via {names[cn]})" for t in thm_list[:2]]
 
-    # Sort rfl-tested definitions by size ascending
     rfl_def_items = sorted(
         [(def_by_name[cn][0], def_by_name[cn][1], rfl_dependents[cn]) for cn in rfl_dependents],
         key=lambda x: (expr_dag_size(exprs, x[1]["value"]), x[0]),
@@ -659,7 +754,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
         nonlocal op5_count
         dname = dobj["name"]
 
-        # Strategy 5a: Increment a natVal literal inside D.value (preserves type Nat!)
         nat_paths = find_paths(exprs, dobj["value"], lambda _eid, e: "natVal" in e, max_paths=10)
         rng.shuffle(nat_paths)
         for path, neid in nat_paths:
@@ -687,7 +781,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
             op5_count += 1
             return True
 
-        # Strategy 5b: Flip Bool.true <-> Bool.false inside D.value (preserves type Bool!)
         if bool_true_id is not None and bool_false_id is not None:
             bool_paths = find_paths(
                 exprs,
@@ -721,8 +814,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
                 op5_count += 1
                 return True
 
-        # Strategy 5c: Swap an inner const with another earlier non-theorem const of the EXACT SAME type
-        # (keeps def well-typed so the later rfl theorem fails on definitional equality!)
         c_paths = find_paths(exprs, dobj["value"], lambda _eid, e: "const" in e, max_paths=15)
         rng.shuffle(c_paths)
         for path, ceid in c_paths:
@@ -762,7 +853,6 @@ def generate_mutants(idx_data, seed: int, per_op: int):
             op5_count += 1
             return True
 
-        # Strategy 5d: Swap whole def body with an earlier def of the exact same type
         lp_d = set(dobj["levelParams"])
         same_defs = [
             d2
@@ -791,13 +881,11 @@ def generate_mutants(idx_data, seed: int, per_op: int):
                 return True
         return False
 
-    # Pass 1: one mutant per distinct rfl-tested definition
     for lno, dobj, dep_thms in rfl_def_items:
         if op5_count >= per_op:
             break
         try_op5_on_def(lno, dobj, dep_thms)
-    # Pass 2: if still under per_op, emit additional distinct mutations on rfl-tested defs
-    for _ in range(3):
+    for _ in range(5):
         if op5_count >= per_op:
             break
         rng.shuffle(rfl_def_items)
@@ -805,6 +893,333 @@ def generate_mutants(idx_data, seed: int, per_op: int):
             if op5_count >= per_op:
                 break
             try_op5_on_def(lno, dobj, dep_thms)
+
+    # ------------------------------------------------------------------
+    # Operator 6: Inductive mutation (negative occurrence, sort change,
+    #             Prop->Type field injection, or ctor field type corruption)
+    # ------------------------------------------------------------------
+    single_inds = [
+        (lno, ind)
+        for lno, ind in inductives
+        if len(ind["types"]) == 1 and not ind["types"][0].get("isUnsafe", False)
+    ]
+    single_inds.sort(
+        key=lambda item: (
+            expr_dag_size(exprs, item[1]["types"][0]["type"])
+            + sum(expr_dag_size(exprs, c["type"]) for c in item[1]["ctors"]),
+            item[0],
+        )
+    )
+
+    op6_count = 0
+    seen_op6 = set()
+
+    def peel_forall_spine(root_eid: int, count: int):
+        """Return (path_to_body, body_eid) after peeling `count` forallE binders, or None."""
+        path = []
+        cur = root_eid
+        for _ in range(count):
+            e = exprs[cur]
+            if "forallE" not in e:
+                return None
+            path.append((cur, "forallE.body"))
+            cur = e["forallE"]["body"]
+        return path, cur
+
+    def find_final_sort(root_eid: int):
+        path = []
+        cur = root_eid
+        while "forallE" in exprs[cur]:
+            path.append((cur, "forallE.body"))
+            cur = exprs[cur]["forallE"]["body"]
+        if "sort" in exprs[cur]:
+            return path, cur, exprs[cur]["sort"]
+        return None
+
+    def try_op6(lno, ind, strategy):
+        nonlocal op6_count
+        t0 = ind["types"][0]
+        iname = t0["name"]
+        np = t0["numParams"]
+        nidx = t0["numIndices"]
+        lps = t0["levelParams"]
+        ctors = ind["ctors"]
+
+        if strategy == "neg_occ" and nidx == 0 and ctors:
+            c_idx = rng.randrange(len(ctors))
+            c = ctors[c_idx]
+            key = (iname, "neg_occ", c["name"])
+            if key in seen_op6:
+                return False
+            peeled = peel_forall_spine(c["type"], np)
+            if peeled is None:
+                return False
+            path, rest_eid = peeled
+            next_il = max_il + 1
+            next_ie = max_ie + 1
+            extra_lines = []
+            # Build level param IDs for I.{lps}
+            lp_lids = []
+            for lp_name in lps:
+                lid = next_il
+                next_il += 1
+                extra_lines.append(json.dumps({"param": lp_name, "il": lid}, separators=(",", ":")))
+                lp_lids.append(lid)
+            # Build I_app = I.{lps} #(np-1) ... #0
+            cur_app = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({"const": {"name": iname, "us": lp_lids}, "ie": cur_app}, separators=(",", ":")))
+            for k in range(np - 1, -1, -1):
+                bv_id = next_ie
+                next_ie += 1
+                extra_lines.append(json.dumps({"bvar": k, "ie": bv_id}, separators=(",", ":")))
+                app_id = next_ie
+                next_ie += 1
+                extra_lines.append(json.dumps({"app": {"fn": cur_app, "arg": bv_id}, "ie": app_id}, separators=(",", ":")))
+                cur_app = app_id
+            # Prop sort = Sort 0
+            prop_id = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({"sort": 0, "ie": prop_id}, separators=(",", ":")))
+            # Negative domain: (I_app -> Prop)
+            neg_dom = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({
+                "forallE": {"name": 0, "type": cur_app, "body": prop_id, "binderInfo": "default"},
+                "ie": neg_dom,
+            }, separators=(",", ":")))
+            # Shift loose bvars in rest_eid by +1 for the newly prepended binder
+            sh_lines, shifted_rest, next_ie = shift_bvars(exprs, expr_closed, rest_eid, 0, 1, next_ie)
+            extra_lines.extend(sh_lines)
+            # Prepend `(bad : I_app -> Prop) -> shifted_rest`
+            new_rest = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({
+                "forallE": {"name": 0, "type": neg_dom, "body": shifted_rest, "binderInfo": "default"},
+                "ie": new_rest,
+            }, separators=(",", ":")))
+            anc_lines, new_cty, _ = rebuild_path(exprs, path, new_rest, next_ie)
+            extra_lines.extend(anc_lines)
+
+            new_ind = json.loads(json.dumps(ind))
+            new_ind["ctors"][c_idx]["type"] = new_cty
+            seen_op6.add(key)
+            mutants.append({
+                "op": "inductive_mutation",
+                "target": names[iname],
+                "target_line": lno,
+                "insert_before": extra_lines,
+                "replaced_line": json.dumps({"inductive": new_ind}, separators=(",", ":")),
+                "detail": f"in inductive {names[iname]} ctor {names[c['name']]}, injected negative occurrence ({names[iname]} -> Prop)",
+            })
+            op6_count += 1
+            return True
+
+        if strategy == "sort_change":
+            fs = find_final_sort(t0["type"])
+            if fs is None:
+                return False
+            path, _seid, old_lvl = fs
+            key = (iname, "sort_change", old_lvl)
+            if key in seen_op6:
+                return False
+            next_il = max_il + 1
+            next_ie = max_ie + 1
+            extra_lines = []
+            # If Prop (0) -> Type 0 (succ 0); if non-Prop with level params -> downgrade to Type 0 (succ 0)
+            # to trigger UniverseTooSmall; else bump to succ(old_lvl).
+            if old_lvl == 0:
+                new_lvl = next_il
+                next_il += 1
+                extra_lines.append(json.dumps({"succ": 0, "il": new_lvl}, separators=(",", ":")))
+                desc = "changed sort Prop -> Type 0"
+            elif lps:
+                new_lvl = next_il
+                next_il += 1
+                extra_lines.append(json.dumps({"succ": 0, "il": new_lvl}, separators=(",", ":")))
+                desc = f"downgraded universe-polymorphic sort il={old_lvl} -> Type 0"
+            else:
+                new_lvl = next_il
+                next_il += 1
+                extra_lines.append(json.dumps({"succ": old_lvl, "il": new_lvl}, separators=(",", ":")))
+                desc = f"bumped inductive sort il={old_lvl} -> succ({old_lvl})"
+            new_sort_eid = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({"sort": new_lvl, "ie": new_sort_eid}, separators=(",", ":")))
+            anc_lines, new_ity, _ = rebuild_path(exprs, path, new_sort_eid, next_ie)
+            extra_lines.extend(anc_lines)
+
+            new_ind = json.loads(json.dumps(ind))
+            new_ind["types"][0]["type"] = new_ity
+            seen_op6.add(key)
+            mutants.append({
+                "op": "inductive_mutation",
+                "target": names[iname],
+                "target_line": lno,
+                "insert_before": extra_lines,
+                "replaced_line": json.dumps({"inductive": new_ind}, separators=(",", ":")),
+                "detail": f"in inductive {names[iname]}, {desc}",
+            })
+            op6_count += 1
+            return True
+
+        if strategy == "prop_type_field" and ctors:
+            fs = find_final_sort(t0["type"])
+            if fs is None or fs[2] != 0:
+                return False
+            c_idx = rng.randrange(len(ctors))
+            c = ctors[c_idx]
+            key = (iname, "prop_type_field", c["name"])
+            if key in seen_op6:
+                return False
+            peeled = peel_forall_spine(c["type"], np)
+            if peeled is None:
+                return False
+            path, rest_eid = peeled
+            next_il = max_il + 1
+            next_ie = max_ie + 1
+            extra_lines = []
+            # Type 0 = Sort (succ 0)
+            l1 = next_il
+            next_il += 1
+            extra_lines.append(json.dumps({"succ": 0, "il": l1}, separators=(",", ":")))
+            type0_id = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({"sort": l1, "ie": type0_id}, separators=(",", ":")))
+            sh_lines, shifted_rest, next_ie = shift_bvars(exprs, expr_closed, rest_eid, 0, 1, next_ie)
+            extra_lines.extend(sh_lines)
+            new_rest = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({
+                "forallE": {"name": 0, "type": type0_id, "body": shifted_rest, "binderInfo": "default"},
+                "ie": new_rest,
+            }, separators=(",", ":")))
+            anc_lines, new_cty, _ = rebuild_path(exprs, path, new_rest, next_ie)
+            extra_lines.extend(anc_lines)
+
+            new_ind = json.loads(json.dumps(ind))
+            new_ind["ctors"][c_idx]["type"] = new_cty
+            seen_op6.add(key)
+            mutants.append({
+                "op": "inductive_mutation",
+                "target": names[iname],
+                "target_line": lno,
+                "insert_before": extra_lines,
+                "replaced_line": json.dumps({"inductive": new_ind}, separators=(",", ":")),
+                "detail": f"in Prop inductive {names[iname]} ctor {names[c['name']]}, injected non-Prop field (x : Type 0)",
+            })
+            op6_count += 1
+            return True
+
+        if strategy == "ctor_field_change" and ctors:
+            c_idx = rng.randrange(len(ctors))
+            c = ctors[c_idx]
+            peeled = peel_forall_spine(c["type"], np)
+            if peeled is None:
+                return False
+            path, rest_eid = peeled
+            if "forallE" not in exprs[rest_eid]:
+                return False
+            key = (iname, "ctor_field_change", c["name"])
+            if key in seen_op6:
+                return False
+            # Replace first constructor field type with Sort(succ(succ(0))) = Type 1 (guaranteed universe too large or incompatible!)
+            next_il = max_il + 1
+            next_ie = max_ie + 1
+            extra_lines = []
+            l1 = next_il
+            l2 = next_il + 1
+            extra_lines.append(json.dumps({"succ": 0, "il": l1}, separators=(",", ":")))
+            extra_lines.append(json.dumps({"succ": l1, "il": l2}, separators=(",", ":")))
+            type1_id = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({"sort": l2, "ie": type1_id}, separators=(",", ":")))
+            orig_fe = dict(exprs[rest_eid]["forallE"])
+            orig_fe["type"] = type1_id
+            new_rest = next_ie
+            next_ie += 1
+            extra_lines.append(json.dumps({"forallE": orig_fe, "ie": new_rest}, separators=(",", ":")))
+            anc_lines, new_cty, _ = rebuild_path(exprs, path, new_rest, next_ie)
+            extra_lines.extend(anc_lines)
+
+            new_ind = json.loads(json.dumps(ind))
+            new_ind["ctors"][c_idx]["type"] = new_cty
+            seen_op6.add(key)
+            mutants.append({
+                "op": "inductive_mutation",
+                "target": names[iname],
+                "target_line": lno,
+                "insert_before": extra_lines,
+                "replaced_line": json.dumps({"inductive": new_ind}, separators=(",", ":")),
+                "detail": f"in inductive {names[iname]} ctor {names[c['name']]}, changed first field type to Type 1",
+            })
+            op6_count += 1
+            return True
+
+        return False
+
+    # Cycle across all 4 inductive mutation strategies for broad soundness coverage
+    strategies = ["neg_occ", "sort_change", "prop_type_field", "ctor_field_change"]
+    ind_pool = list(single_inds)
+    for _pass in range(4):
+        if op6_count >= per_op:
+            break
+        rng.shuffle(ind_pool)
+        for lno, ind in ind_pool:
+            if op6_count >= per_op:
+                break
+            order = list(strategies)
+            rng.shuffle(order)
+            for st in order:
+                if try_op6(lno, ind, st):
+                    break
+
+    # ------------------------------------------------------------------
+    # Operator 7: Universe-parameter count mismatch on a const node in a theorem
+    # ------------------------------------------------------------------
+    op7_thms = list(thms_by_size)
+    op7_count = 0
+    seen_op7 = set()
+    for _pass in range(3):
+        if op7_count >= per_op:
+            break
+        rng.shuffle(op7_thms)
+        for lno, obj in op7_thms:
+            if op7_count >= per_op:
+                break
+            paths = find_paths(exprs, obj["value"], lambda _eid, e: "const" in e, max_paths=20)
+            rng.shuffle(paths)
+            for path, ceid in paths:
+                cobj = exprs[ceid]["const"]
+                n1 = cobj["name"]
+                us = list(cobj["us"])
+                if len(us) >= 1 and rng.random() < 0.5:
+                    action = "drop"
+                    new_us = us[:-1]
+                else:
+                    action = "add"
+                    new_us = us + [0]
+                key = (obj["name"], ceid, action)
+                if key in seen_op7:
+                    continue
+                seen_op7.add(key)
+                next_ie = max_ie + 1
+                leaf_id = next_ie
+                next_ie += 1
+                leaf_line = json.dumps({"const": {"name": n1, "us": new_us}, "ie": leaf_id}, separators=(",", ":"))
+                anc_lines, new_root, _ = rebuild_path(exprs, path, leaf_id, next_ie)
+                new_obj = dict(obj)
+                new_obj["value"] = new_root
+                mutants.append({
+                    "op": "level_arity_mismatch",
+                    "target": names[obj["name"]],
+                    "target_line": lno,
+                    "insert_before": [leaf_line] + anc_lines,
+                    "replaced_line": json.dumps({"thm": new_obj}, separators=(",", ":")),
+                    "detail": f"in thm {names[obj['name']]}, {action} level arg on {names[n1]} ({len(us)} -> {len(new_us)})",
+                })
+                op7_count += 1
+                break
 
     return mutants
 
@@ -839,7 +1254,13 @@ def run_checker(checker_bin: Path, ndjson_path: Path):
                     err_line = ln.strip()
                     break
         if not err_line:
-            err_line = (stderr_lines[0] if stderr_lines else stdout.splitlines()[0] if stdout else f"exit={proc.returncode}")
+            err_line = (
+                stderr_lines[0]
+                if stderr_lines
+                else stdout.splitlines()[0]
+                if stdout
+                else f"exit={proc.returncode}"
+            )
     else:
         err_line = next((ln for ln in stdout.splitlines() if ln.startswith("CHECK_OK")), stdout)
     return accepted, proc.returncode, err_line
@@ -876,39 +1297,32 @@ def evaluate_mutant(args_tuple):
     }
 
 
-def write_report(report_path: Path, cmd_str: str, sanity_line: str, results: list, elapsed_s: float):
-    ops = [
-        "thm_value_swap",
-        "const_swap",
-        "arg_swap",
-        "level_change",
-        "def_body_rfl_break",
-    ]
-    by_op = {op: [r for r in results if r["op"] == op] for op in ops}
+def format_report_section(title: str, cmd_str: str, sanity_line: str, results: list, elapsed_s: float) -> str:
+    by_op = {op: [r for r in results if r["op"] == op] for op in ALL_OPS}
     total = len(results)
     rejected = sum(1 for r in results if r["observed"] == "REJECT")
     accepted_list = [r for r in results if r["observed"] == "ACCEPT"]
 
     lines = [
-        "# Rigor Soundness Mutation-Testing Report",
+        f"## {title}",
         "",
-        "## Command",
+        "### Command",
         "",
         "```sh",
         cmd_str,
         "```",
         "",
-        "## Sanity Check (Unmutated Input)",
+        "### Sanity Check (Unmutated Input)",
         "",
         f"- Result: PASS (`{sanity_line}`)",
         f"- Total elapsed time: {elapsed_s:.2f} s",
         "",
-        "## Summary by Mutation Operator",
+        "### Summary by Mutation Operator",
         "",
         "| Operator | Total | Rejected | Accepted | Rejection Rate |",
         "|---|---:|---:|---:|---:|",
     ]
-    for op in ops:
+    for op in ALL_OPS:
         rs = by_op[op]
         n = len(rs)
         rej = sum(1 for r in rs if r["observed"] == "REJECT")
@@ -919,54 +1333,53 @@ def write_report(report_path: Path, cmd_str: str, sanity_line: str, results: lis
     lines.append(f"| **Total** | **{total}** | **{rejected}** | **{len(accepted_list)}** | **{rate_all:.1f}%** |")
     lines.append("")
 
-    # Breakdown for Op 5: rejected at later declaration vs at mutated def itself
-    op5_rej = [r for r in by_op["def_body_rfl_break"] if r["observed"] == "REJECT"]
-    later_fails = 0
-    for r in op5_rej:
-        err = r["error_line"]
-        marker = "kernel rejected declaration "
-        if marker in err:
-            decl_failed = err.split(marker, 1)[1].split(":", 1)[0].strip()
-            if decl_failed and decl_failed != r["target"]:
-                later_fails += 1
-        elif "line: " in err:
-            after = err.split("line: ", 1)[1]
-            digits = ""
-            for ch in after:
-                if ch.isdigit():
-                    digits += ch
-                else:
-                    break
-            if digits and int(digits) > r["mutated_line"]:
-                later_fails += 1
-    if op5_rej:
+    # Breakdown for Op 5 & Op 6
+    for op_name, label in [
+        ("def_body_rfl_break", "Operator 5 (`def_body_rfl_break`)"),
+        ("inductive_mutation", "Operator 6 (`inductive_mutation`)"),
+    ]:
+        rej_rs = [r for r in by_op[op_name] if r["observed"] == "REJECT"]
+        if not rej_rs:
+            continue
+        later = 0
+        for r in rej_rs:
+            err = r["error_line"]
+            marker = "kernel rejected declaration "
+            if marker in err:
+                decl_failed = err.split(marker, 1)[1].split(":", 1)[0].strip()
+                if decl_failed and decl_failed != r["target"]:
+                    later += 1
+            elif "line: " in err:
+                after = err.split("line: ", 1)[1]
+                digits = ""
+                for ch in after:
+                    if ch.isdigit():
+                        digits += ch
+                    else:
+                        break
+                if digits and int(digits) > r["mutated_line"]:
+                    later += 1
         lines.extend([
-            "## Operator 5 (`def_body_rfl_break`) Rejection Breakdown",
+            f"### {label} Rejection Breakdown",
             "",
-            f"- Rejected mutants: {len(op5_rej)}",
-            f"- Rejected at a later dependent declaration (mutated definition remained well-typed and broke a downstream proof/rfl check): {later_fails}",
-            f"- Rejected at the mutated definition line itself: {len(op5_rej) - later_fails}",
+            f"- Rejected mutants: {len(rej_rs)}",
+            f"- Rejected at a later dependent declaration: {later}",
+            f"- Rejected at the mutated declaration itself: {len(rej_rs) - later}",
             "",
         ])
 
-    lines.append("## Accepted Mutants")
+    lines.append("### Accepted Mutants")
     lines.append("")
     if not accepted_list:
         lines.append("None. Every generated mutant was rejected by Rigor.")
     else:
-        lines.append(
-            "The following mutants were accepted by Rigor and require manual review to determine "
-            "whether each mutation was semantically harmless (for example, proof irrelevance, "
-            "unreachable branch, or definitionally equal replacement) or a genuine soundness bug:"
-        )
-        lines.append("")
         for r in accepted_list:
             lines.append(
                 f"- Mutant #{r['id']} (`{r['op']}`): target `{r['target']}` (line {r['target_line']}) -- "
                 f"{r['detail']} | output: `{r['error_line']}`"
             )
     lines.append("")
-    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
 
 
 def main():
@@ -993,6 +1406,17 @@ def main():
         help="Output Markdown report path",
     )
     parser.add_argument(
+        "--append-report",
+        action="store_true",
+        help="Append section to existing report instead of overwriting",
+    )
+    parser.add_argument(
+        "--section-title",
+        type=str,
+        default="Mutation Run",
+        help="Section title when appending to report",
+    )
+    parser.add_argument(
         "--json-out",
         type=Path,
         default=Path.home() / "rigor/tools/mutation/results.json",
@@ -1002,19 +1426,16 @@ def main():
 
     t0 = time.monotonic()
 
-    # 1. Sanity check on unmutated input
     ok, rc, sanity_line = run_checker(args.checker, args.input)
     if not ok:
         print(f"SANITY CHECK FAILED (rc={rc}): {sanity_line}", file=sys.stderr)
         sys.exit(2)
     print(f"SANITY_OK: {sanity_line}")
 
-    # 2. Index input and generate mutants
     idx_data = parse_ndjson_index(args.input)
     mutants = generate_mutants(idx_data, seed=args.seed, per_op=args.per_op)
     print(f"Generated {len(mutants)} mutants (seed={args.seed}, per_op={args.per_op})")
 
-    # 3. Evaluate all mutants
     results = []
     with tempfile.TemporaryDirectory(prefix="rigor_mut_") as tmp_dir:
         tasks = [
@@ -1031,7 +1452,6 @@ def main():
 
     elapsed = time.monotonic() - t0
 
-    # Print any accepted mutants immediately for human inspection
     accepted = [r for r in results if r["observed"] == "ACCEPT"]
     for r in accepted:
         print(
@@ -1039,7 +1459,6 @@ def main():
             f"{r['detail']}"
         )
 
-    # Save JSON results and Markdown report
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
 
@@ -1048,11 +1467,15 @@ def main():
         f"--input {args.input} --checker {args.checker} --seed {args.seed} "
         f"--per-op {args.per_op} --workers {args.workers} --report {args.report}"
     )
-    write_report(args.report, cmd_str, sanity_line, results, elapsed)
+    section = format_report_section(args.section_title, cmd_str, sanity_line, results, elapsed)
+    if args.append_report and args.report.exists():
+        prev = args.report.read_text(encoding="utf-8").rstrip()
+        args.report.write_text(prev + "\n\n---\n\n" + section, encoding="utf-8")
+    else:
+        header = "# Rigor Soundness Mutation-Testing Report\n\n"
+        args.report.write_text(header + section, encoding="utf-8")
 
-    # Print summary table to stdout
-    ops = ["thm_value_swap", "const_swap", "arg_swap", "level_change", "def_body_rfl_break"]
-    for op in ops:
+    for op in ALL_OPS:
         rs = [r for r in results if r["op"] == op]
         rej = sum(1 for r in rs if r["observed"] == "REJECT")
         print(f"  {op}: total={len(rs)} rejected={rej} accepted={len(rs) - rej}")

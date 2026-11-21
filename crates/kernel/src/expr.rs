@@ -54,8 +54,18 @@ pub fn instantiate_level_params(arena: &mut Arena, e: ExprId, params: &[NameId],
                 let l2 = level_instantiate(a, l, params, args);
                 Some(if l2 == l { node } else { a.sort(l2) })
             }
-            ExprData::Const(name, lvls) => {
-                let (name, lvls) = (*name, lvls.clone());
+            ExprData::Const(name, lvls_id) => {
+                let (name, lvls_id) = (*name, *lvls_id);
+                let n = a.get_level_list(lvls_id).len();
+                if n == 0 {
+                    return Some(node);
+                }
+                if n == 1 {
+                    let l = a.get_level_list(lvls_id)[0];
+                    let l2 = level_instantiate(a, l, params, args);
+                    return Some(if l2 == l { node } else { a.const_(name, [l2]) });
+                }
+                let lvls: Box<[LevelId]> = a.get_level_list(lvls_id).into();
                 let mut changed = false;
                 let out: Vec<LevelId> = lvls.iter().map(|&l| {
                     let l2 = level_instantiate(a, l, params, args);
@@ -102,12 +112,12 @@ where
             let b2 = map_children(arena, body, off + 1, steps, cache, leaf);
             if ty2 == ty && b2 == body { e } else { arena.pi(name, bi, ty2, b2) }
         }
-        ExprData::Let { name, ty, val, body } => {
-            let (name, ty, val, body) = (*name, *ty, *val, *body);
+        ExprData::Let { ty, val, body } => {
+            let (ty, val, body) = (*ty, *val, *body);
             let ty2 = map_children(arena, ty, off, steps, cache, leaf);
             let v2 = map_children(arena, val, off, steps, cache, leaf);
             let b2 = map_children(arena, body, off + 1, steps, cache, leaf);
-            if ty2 == ty && v2 == val && b2 == body { e } else { arena.let_(name, ty2, v2, b2) }
+            if ty2 == ty && v2 == val && b2 == body { e } else { arena.let_(Arena::ANONYMOUS, ty2, v2, b2) }
         }
         ExprData::Proj { struct_name, idx, expr } => {
             let (s, i, x) = (*struct_name, *idx, *expr);
@@ -176,7 +186,7 @@ fn check_lvl_rec(arena: &Arena, e: ExprId, allowed: &[NameId], visited: &mut FxH
     match arena.get_expr(e) {
         ExprData::Sort(l) => level_check_params(arena, *l, allowed),
         ExprData::Const(_, lvls) => {
-            for &l in lvls.iter() { level_check_params(arena, l, allowed)?; }
+            for &l in arena.get_level_list(*lvls) { level_check_params(arena, l, allowed)?; }
             Ok(())
         }
         ExprData::App(f, a) => { check_lvl_rec(arena, *f, allowed, visited)?; check_lvl_rec(arena, *a, allowed, visited) }

@@ -2,7 +2,7 @@
 //! Supports beta, zeta, iota, K-like, quotient, `Nat` literals, structure projections,
 //! height-ordered delta, proof irrelevance in `Prop`, and function + structure eta-conversion.
 
-use crate::arena::{BinderInfo, ExprData, ExprId, FVarId, LevelId, Literal, NameId};
+use crate::arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelId, LevelListId, Literal, NameId};
 use crate::check::TypeChecker;
 use crate::env::{Declaration, QuotKind};
 use crate::error::KernelError;
@@ -28,12 +28,17 @@ impl<'a> TypeChecker<'a> {
     }
 
     #[inline]
-    fn inst_levels_opt(&mut self, e: ExprId, params: &[NameId], l0: Option<LevelId>, lvls: Option<&[LevelId]>) -> ExprId {
-        match (l0, lvls) {
-            (Some(l), _) => self.inst_levels_cached(e, params, &[l]),
-            (None, Some(ls)) => self.inst_levels_cached(e, params, ls),
-            (None, None) => e,
+    fn inst_levels_list(&mut self, e: ExprId, params: &[NameId], lvls_id: LevelListId) -> ExprId {
+        if params.is_empty() || !self.arena.get_expr_meta(e).has_level_param() {
+            return e;
         }
+        let lvls = self.arena.get_level_list(lvls_id);
+        if lvls.len() == 1 {
+            let l0 = lvls[0];
+            return self.inst_levels_cached(e, params, &[l0]);
+        }
+        let owned: Box<[LevelId]> = lvls.into();
+        instantiate_level_params(self.arena, e, params, &owned)
     }
 
     /// Reduce `e` to weak head normal form (beta + zeta + iota + proj + quot + delta).
@@ -109,11 +114,10 @@ impl<'a> TypeChecker<'a> {
                         break;
                     }
                 }
-                ExprData::Const(name, lvls) => {
-                    let name = *name;
-                    let lvl_len = lvls.len();
-                    let (l0, lvls_owned) = split_lvls(lvls);
-                    if lvl_len == 0 {
+                ExprData::Const(name, lvls_id) => {
+                    let (name, lvls_id) = (*name, *lvls_id);
+                    let lvl_len = self.arena.get_level_list(lvls_id).len();
+                    if lvls_id == Arena::EMPTY_LEVELS {
                         if let Some((res, consumed)) = self.try_reduce_nat(name, &spine, allow_delta) {
                             let new_len = spine.len() - consumed;
                             spine.truncate(new_len);
@@ -148,21 +152,28 @@ impl<'a> TypeChecker<'a> {
                                 break;
                             }
                             let mut major = self.whnf_lit_ctor(spine[len - 1 - major_idx]);
-                            if let ExprData::Lit(Literal::Nat(k)) = self.arena.get_expr(major) {
-                                let k = k.clone();
-                                major = self.expand_nat_lit(&k);
+                            if let ExprData::Lit(lid) = *self.arena.get_expr(major) {
+                                if let Literal::Nat(k) = self.arena.get_lit(lid) {
+                                    let k = k.clone();
+                                    major = self.expand_nat_lit(&k);
+                                }
                             }
                             if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
                                 let rule = &rec.rules[0];
                                 if let Some(Declaration::Constructor(c)) = self.decls.get(&rule.ctor_name) {
                                     if let Ok(major_ty) = self.infer_type_only(major) {
-                                        let mut ctor_ty = if let Some(ref ls) = lvls_owned {
-                                            let ind_lvls = &ls[ls.len() - c.level_params.len()..];
-                                            self.inst_levels_cached(c.ty, &c.level_params, ind_lvls)
-                                        } else if c.level_params.is_empty() {
+                                        let mut ctor_ty = if c.level_params.is_empty() {
                                             c.ty
                                         } else {
-                                            self.inst_levels_cached(c.ty, &c.level_params, &[l0.unwrap()])
+                                            let ls = self.arena.get_level_list(lvls_id);
+                                            let start = ls.len() - c.level_params.len();
+                                            if c.level_params.len() == 1 {
+                                                let l0 = ls[start];
+                                                self.inst_levels_cached(c.ty, &c.level_params, &[l0])
+                                            } else {
+                                                let ind_lvls: Box<[LevelId]> = ls[start..].into();
+                                                self.inst_levels_cached(c.ty, &c.level_params, &ind_lvls)
+                                            }
                                         };
                                         let mut ok = true;
                                         for i in 0..rec.num_params as usize {
@@ -175,7 +186,7 @@ impl<'a> TypeChecker<'a> {
                                             }
                                         }
                                         if ok && self.is_def_eq(major_ty, ctor_ty).unwrap_or(false) {
-                                            cur = self.inst_levels_opt(rule.rhs, &rec.level_params, l0, lvls_owned.as_deref());
+                                            cur = self.inst_levels_list(rule.rhs, &rec.level_params, lvls_id);
                                             spine.drain(len - 1 - major_idx..len - prefix_end);
                                             continue;
                                         }
@@ -193,10 +204,9 @@ impl<'a> TypeChecker<'a> {
                                         if let Ok(mty) = self.infer_type_only(major) {
                                             let mty_w = self.whnf(mty);
                                             let (th, ta) = self.app_spine(mty_w);
-                                            if let ExprData::Const(tn, tls) = self.arena.get_expr(th) {
-                                                if *tn == ind.name && ta.len() == ind.num_params as usize {
-                                                    let tls = tls.clone();
-                                                    mhead = self.arena.const_(ind.ctors[0], tls);
+                                            if let ExprData::Const(tn, tls) = *self.arena.get_expr(th) {
+                                                if tn == ind.name && ta.len() == ind.num_params as usize {
+                                                    mhead = self.arena.intern_expr(ExprData::Const(ind.ctors[0], tls));
                                                     margs = ta;
                                                     for fi in 0..rec.rules[0].num_fields {
                                                         margs.push(self.arena.proj(ind.name, fi, major));
@@ -215,7 +225,7 @@ impl<'a> TypeChecker<'a> {
                                         _ => rec.num_params,
                                     };
                                     if margs.len() == (ctor_np + rule.num_fields) as usize {
-                                        cur = self.inst_levels_opt(rule.rhs, &rec.level_params, l0, lvls_owned.as_deref());
+                                        cur = self.inst_levels_list(rule.rhs, &rec.level_params, lvls_id);
                                         let keep_tail = len - 1 - major_idx;
                                         spine.splice(
                                             keep_tail..len - prefix_end,
@@ -231,7 +241,7 @@ impl<'a> TypeChecker<'a> {
                             if let Some((val, _)) = decl.delta_value() {
                                 let params = decl.level_params();
                                 if lvl_len == params.len() {
-                                    cur = self.inst_levels_opt(val, params, l0, lvls_owned.as_deref());
+                                    cur = self.inst_levels_list(val, params, lvls_id);
                                     continue;
                                 }
                             }
@@ -319,10 +329,12 @@ impl<'a> TypeChecker<'a> {
     /// WHNF that also opens a string literal into its constructor form.
     fn whnf_lit_ctor(&mut self, e: ExprId) -> ExprId {
         let w = self.whnf(e);
-        if let ExprData::Lit(Literal::Str(s)) = self.arena.get_expr(w) {
-            let s = s.clone();
-            let ex = self.expand_str_lit(&s);
-            return self.whnf(ex);
+        if let ExprData::Lit(lid) = *self.arena.get_expr(w) {
+            if let Literal::Str(s) = self.arena.get_lit(lid) {
+                let s = s.clone();
+                let ex = self.expand_str_lit(&s);
+                return self.whnf(ex);
+            }
         }
         w
     }
@@ -367,9 +379,12 @@ impl<'a> TypeChecker<'a> {
         };
         let as_nat = |tc: &mut Self, e: ExprId| -> Option<Nat> {
             let w = tc.whnf(e);
-            match tc.arena.get_expr(w) {
-                ExprData::Lit(Literal::Nat(n)) => Some(n.clone()),
-                ExprData::Const(cn, _) => match tc.arena.get_name(*cn) {
+            match *tc.arena.get_expr(w) {
+                ExprData::Lit(lid) => match tc.arena.get_lit(lid) {
+                    Literal::Nat(n) => Some(n.clone()),
+                    _ => None,
+                },
+                ExprData::Const(cn, _) => match tc.arena.get_name(cn) {
                     crate::arena::NameData::Str(p, s) if s.as_ref() == "zero" => match tc.arena.get_name(*p) {
                         crate::arena::NameData::Str(g, ps) if *g == crate::arena::Arena::ANONYMOUS && ps.as_ref() == "Nat" => Some(Nat::zero()),
                         _ => None,
@@ -420,18 +435,17 @@ impl<'a> TypeChecker<'a> {
         Some((self.arena.lit_nat_big(r), 2))
     }
 
-    fn delta_info(&self, head: ExprId) -> Option<(ExprId, u64, &'a [NameId], Option<LevelId>, Option<Box<[LevelId]>>)> {
-        let ExprData::Const(name, lvls) = self.arena.get_expr(head) else { return None };
-        let decl = self.decls.get(name)?;
+    fn delta_info(&self, head: ExprId) -> Option<(ExprId, u64, &'a [NameId], LevelListId)> {
+        let ExprData::Const(name, lvls_id) = *self.arena.get_expr(head) else { return None };
+        let decl = self.decls.get(&name)?;
         let (val, prio) = decl.delta_value()?;
         let params = decl.level_params();
-        if lvls.len() != params.len() { return None; }
-        let (l0, lvls_owned) = split_lvls(lvls);
-        Some((val, prio, params, l0, lvls_owned))
+        if self.arena.get_level_list(lvls_id).len() != params.len() { return None; }
+        Some((val, prio, params, lvls_id))
     }
 
-    fn unfold_delta_app(&mut self, val: ExprId, params: &[NameId], l0: Option<LevelId>, lvls: Option<&[LevelId]>, args: &[ExprId]) -> ExprId {
-        let inst = self.inst_levels_opt(val, params, l0, lvls);
+    fn unfold_delta_app(&mut self, val: ExprId, params: &[NameId], lvls_id: LevelListId, args: &[ExprId]) -> ExprId {
+        let inst = self.inst_levels_list(val, params, lvls_id);
         let spine: Vec<ExprId> = args.iter().rev().copied().collect();
         self.whnf_spine_with(inst, spine, false)
     }
@@ -472,10 +486,20 @@ impl<'a> TypeChecker<'a> {
                     return Ok(level_eq(self.arena, u, v));
                 }
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
-                (ExprData::Lit(Literal::Nat(k)), _) => { let k = k.clone(); a = self.expand_nat_lit(&k); continue; }
-                (_, ExprData::Lit(Literal::Nat(k))) => { let k = k.clone(); b = self.expand_nat_lit(&k); continue; }
-                (ExprData::Lit(Literal::Str(sv)), _) => { let sv = sv.clone(); let ex = self.expand_str_lit(&sv); a = self.whnf_no_delta(ex); continue; }
-                (_, ExprData::Lit(Literal::Str(sv))) => { let sv = sv.clone(); let ex = self.expand_str_lit(&sv); b = self.whnf_no_delta(ex); continue; }
+                (ExprData::Lit(lid), _) => {
+                    match self.arena.get_lit(*lid).clone() {
+                        Literal::Nat(k) => a = self.expand_nat_lit(&k),
+                        Literal::Str(sv) => { let ex = self.expand_str_lit(&sv); a = self.whnf_no_delta(ex); }
+                    }
+                    continue;
+                }
+                (_, ExprData::Lit(lid)) => {
+                    match self.arena.get_lit(*lid).clone() {
+                        Literal::Nat(k) => b = self.expand_nat_lit(&k),
+                        Literal::Str(sv) => { let ex = self.expand_str_lit(&sv); b = self.whnf_no_delta(ex); }
+                    }
+                    continue;
+                }
                 (ExprData::Pi { name, binder_info, ty: t1, body: b1 }, ExprData::Pi { ty: t2, body: b2, .. }) => {
                     let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
                     if !self.is_def_eq(t1, t2)? { return Ok(false); }
@@ -534,12 +558,12 @@ impl<'a> TypeChecker<'a> {
             }
 
             match (self.delta_info(ha), self.delta_info(hb)) {
-                (Some((va, pa, ppa, l0a, la)), Some((vb, pb, ppb, l0b, lb))) => {
-                    if pa >= pb { a = self.unfold_delta_app(va, ppa, l0a, la.as_deref(), &args_a); }
-                    if pb >= pa { b = self.unfold_delta_app(vb, ppb, l0b, lb.as_deref(), &args_b); }
+                (Some((va, pa, ppa, la)), Some((vb, pb, ppb, lb))) => {
+                    if pa >= pb { a = self.unfold_delta_app(va, ppa, la, &args_a); }
+                    if pb >= pa { b = self.unfold_delta_app(vb, ppb, lb, &args_b); }
                 }
-                (Some((va, _, ppa, l0a, la)), None) => a = self.unfold_delta_app(va, ppa, l0a, la.as_deref(), &args_a),
-                (None, Some((vb, _, ppb, l0b, lb))) => b = self.unfold_delta_app(vb, ppb, l0b, lb.as_deref(), &args_b),
+                (Some((va, _, ppa, la)), None) => a = self.unfold_delta_app(va, ppa, la, &args_a),
+                (None, Some((vb, _, ppb, lb))) => b = self.unfold_delta_app(vb, ppb, lb, &args_b),
                 (None, None) => return Ok(self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)? || self.try_unit_like(a, b)?),
             }
         }
@@ -605,28 +629,21 @@ impl<'a> TypeChecker<'a> {
 
     fn heads_equal(&mut self, ha: ExprId, hb: ExprId) -> bool {
         if ha == hb { return true; }
-        match (self.arena.get_expr(ha), self.arena.get_expr(hb)) {
-            (ExprData::Const(na, la), ExprData::Const(nb, lb)) if na == nb && la.len() == lb.len() => {
-                let (la, lb) = (la.clone(), lb.clone());
+        match (*self.arena.get_expr(ha), *self.arena.get_expr(hb)) {
+            (ExprData::Const(na, la), ExprData::Const(nb, lb)) if na == nb => {
+                if la == lb { return true; }
+                let (sa, sb) = (self.arena.get_level_list(la), self.arena.get_level_list(lb));
+                if sa.len() != sb.len() { return false; }
+                let (la, lb): (Box<[LevelId]>, Box<[LevelId]>) = (sa.into(), sb.into());
                 la.iter().zip(lb.iter()).all(|(&x, &y)| level_eq(self.arena, x, y))
             }
             (ExprData::Proj { struct_name: sa, idx: ia, expr: ea }, ExprData::Proj { struct_name: sb, idx: ib, expr: eb })
                 if sa == sb && ia == ib =>
             {
-                let (ea, eb) = (*ea, *eb);
                 self.is_def_eq(ea, eb).unwrap_or(false)
             }
             _ => false,
         }
-    }
-}
-
-#[inline]
-fn split_lvls(lvls: &[LevelId]) -> (Option<LevelId>, Option<Box<[LevelId]>>) {
-    match lvls.len() {
-        0 => (None, None),
-        1 => (Some(lvls[0]), None),
-        _ => (None, Some(lvls.into())),
     }
 }
 

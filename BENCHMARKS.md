@@ -1,5 +1,24 @@
 # Rigor Benchmarks & Optimization Report
 
+## 0. Full Lean 4 `Init` library vs `leanchecker --fresh` (2026-11-22)
+
+All of Lean 4 v4.36.0-rc1 `Init`: 58,546 declarations (59,978 environment entries), exported with
+`lake env lean4export Init` (6,495,289 NDJSON lines, 331.7 MiB). Same Apple M4 (10 cores), measured with
+`/usr/bin/time -l` on an otherwise idle machine:
+
+| Checker | Wall time | Peak RSS |
+| :--- | ---: | ---: |
+| `lake env leanchecker --fresh Init` | 28.67 s | 547 MB |
+| Rigor, parallel (`rigor-bench --check`, 10 threads) | 7.78 s | 445 MB |
+| Rigor, sequential (`RIGOR_SEQUENTIAL=1`) | 23.89 s | 377 MB |
+
+Rigor's time includes parsing the 332 MiB JSON export; leanchecker reads compiled `.olean` files. Both
+accept the whole library. Soundness evidence beyond acceptance: `tools/mutation/` (1,300 mutants of
+Init.Prelude and Init.Core; every meaning-changing mutant rejected, see REPORT.md).
+
+The single-module figures in the sections below were measured earlier, before full-library support, and
+are not representative of whole-library performance.
+
 This document records reproducible performance, Peak RSS memory, and CPU profiling results for **Rigor** across Phases 1–4, including before/after optimization metrics and instructions for head-to-head comparison against Lean 4's `lean4checker`.
 
 ## Test Environment

@@ -173,12 +173,18 @@ impl Environment {
             self.deferred.push(name);
             return Ok(());
         }
-        let (nl, ll, el) = (self.arena.name_len(), self.arena.level_len(), self.arena.expr_len());
+        let (nl, ll, lll, litl, el) = (
+            self.arena.name_len(),
+            self.arena.level_len(),
+            self.arena.level_list_len(),
+            self.arena.lit_len(),
+            self.arena.expr_len(),
+        );
         let res = {
             let mut tc = TypeChecker::new(&self.decls, &mut self.arena);
             tc.check_decl(&decl)
         };
-        self.arena.truncate_to(nl, ll, el);
+        self.arena.truncate_to(nl, ll, lll, litl, el);
         res?;
         self.decls.insert(name, decl);
         Ok(())

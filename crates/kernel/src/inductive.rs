@@ -88,12 +88,12 @@ fn replace_expr(arena: &mut Arena, e: ExprId, from: ExprId, to: ExprId) -> ExprI
             let (t2, b2) = (replace_expr(arena, t, from, to), replace_expr(arena, b, from, to));
             if t2 == t && b2 == b { e } else { arena.pi(n, bi, t2, b2) }
         }
-        ExprData::Let { name, ty, val, body } => {
-            let (n, t, v, b) = (*name, *ty, *val, *body);
+        ExprData::Let { ty, val, body } => {
+            let (t, v, b) = (*ty, *val, *body);
             let t2 = replace_expr(arena, t, from, to);
             let v2 = replace_expr(arena, v, from, to);
             let b2 = replace_expr(arena, b, from, to);
-            if t2 == t && v2 == v && b2 == b { e } else { arena.let_(n, t2, v2, b2) }
+            if t2 == t && v2 == v && b2 == b { e } else { arena.let_(Arena::ANONYMOUS, t2, v2, b2) }
         }
         ExprData::Proj { struct_name, idx, expr } => {
             let (s, i, x) = (*struct_name, *idx, *expr);
@@ -243,8 +243,8 @@ pub fn check_inductive_block(
                         }
                         if !bad_dom {
                             let (hd, args) = tc.app_spine(fty);
-                            if let ExprData::Const(jn, jlvls) = tc.arena.get_expr(hd) {
-                                let (jn, jlvls) = (*jn, jlvls.clone());
+                            if let ExprData::Const(jn, jlvls_id) = *tc.arena.get_expr(hd) {
+                                let jlvls: Box<[LevelId]> = tc.arena.get_level_list(jlvls_id).into();
                                 if !orig_names.contains(&jn) && !nested_aux.iter().any(|x| x.aux_name == jn) {
                                     if let Some(Declaration::Inductive(ji)) = decls.get(&jn) {
                                         let jnp = ji.num_params as usize;
@@ -253,7 +253,7 @@ pub fn check_inductive_block(
                                             && !args[jnp..].iter().any(|&a| expr_mentions_any_const(tc.arena, a, &orig_names))
                                             && !args[..jnp].iter().any(|&a| fields.iter().any(|fb: &Binder| expr_mentions_fvar(tc.arena, a, fb.fv)))
                                         {
-                                            let j_head = tc.arena.const_(jn, jlvls.clone());
+                                            let j_head = tc.arena.intern_expr(ExprData::Const(jn, jlvls_id));
                                             let orig_app = tc.arena.app_n(j_head, &args[..jnp]);
                                             let aux_name = if let Some(ex) = nested_aux.iter().find(|x| x.orig_app == orig_app)
                                                 .or_else(|| new_aux_to_add.iter().find(|(_, _, x)| x.orig_app == orig_app).map(|(_, _, x)| x))
@@ -262,7 +262,7 @@ pub fn check_inductive_block(
                                             } else {
                                                 let idx = nested_aux.len() + new_aux_to_add.len() + 1;
                                                 let an = tc.arena.name_str(spec.types[0].name, &format!("_nested_{idx}"));
-                                                let aux_head = tc.arena.const_(an, param_lvls.clone());
+                                                let aux_head = tc.arena.const_(an, &param_lvls);
                                                 let aux_app = tc.arena.app_n(aux_head, &p_fve);
                                                 // Build auxiliary type: instantiate `ji.ty` with `jlvls` & `args[..jnp]`, wrap `p_fvs`.
                                                 let mut jty = instantiate_level_params(tc.arena, ji.ty, &ji.level_params, &jlvls);
@@ -302,7 +302,7 @@ pub fn check_inductive_block(
                                                     let octy = replace_expr(tc.arena, octy, orig_app, aux_app);
                                                     let aux_cn = tc.arena.name_num(an, k as u64);
                                                     let aux_cty = wrap_pis(tc.arena, &p_fvs, octy);
-                                                    let orig_c_head = tc.arena.const_(orig_cn, jlvls.clone());
+                                                    let orig_c_head = tc.arena.intern_expr(ExprData::Const(orig_cn, jlvls_id));
                                                     let orig_c_app = tc.arena.app_n(orig_c_head, &args[..jnp]);
                                                     aux_ctors.push((aux_cn, aux_cty));
                                                     aux_ctor_map.push((aux_cn, orig_cn, orig_c_app));
@@ -316,7 +316,7 @@ pub fn check_inductive_block(
                                                 new_aux_to_add.push((its, pi, NestedAux { aux_name: an, orig_app, ctors: aux_ctor_map }));
                                                 an
                                             };
-                                            let aux_head = tc.arena.const_(aux_name, param_lvls.clone());
+                                            let aux_head = tc.arena.const_(aux_name, &param_lvls);
                                             let aux_app = tc.arena.app_n(aux_head, &p_fve);
                                             ty = replace_expr(tc.arena, ty, orig_app, aux_app);
                                         }
@@ -445,9 +445,9 @@ pub fn check_inductive_block(
                 cur = instantiate1(tc.arena, body, fve);
             }
             let (head, args) = tc.app_spine(cur);
-            let ok_head = match tc.arena.get_expr(head) {
-                ExprData::Const(hname, hlvls) => {
-                    let (hn, hl) = (*hname, hlvls.clone());
+            let ok_head = match *tc.arena.get_expr(head) {
+                ExprData::Const(hn, hl_id) => {
+                    let hl: Box<[LevelId]> = tc.arena.get_level_list(hl_id).into();
                     hn == ind.name && lvls_eq(tc.arena, &hl, &param_lvls)
                 }
                 _ => false,
@@ -495,11 +495,11 @@ pub fn check_inductive_block(
     // Helper to restore synthetic nested names (`aux_name`, `aux_ctor`) back to real `J params` / `J.ctor params`.
     let restore = |arena: &mut Arena, mut e: ExprId| -> ExprId {
         for aux in &nested_aux {
-            let ah = arena.const_(aux.aux_name, param_lvls.clone());
+            let ah = arena.const_(aux.aux_name, &param_lvls);
             let a_app = arena.app_n(ah, &param_fve);
             e = replace_expr(arena, e, a_app, aux.orig_app);
             for &(aux_cn, _, orig_c_app) in &aux.ctors {
-                let ch = arena.const_(aux_cn, param_lvls.clone());
+                let ch = arena.const_(aux_cn, &param_lvls);
                 let c_app = arena.app_n(ch, &param_fve);
                 e = replace_expr(arena, e, c_app, orig_c_app);
             }
@@ -546,7 +546,7 @@ pub fn check_inductive_block(
 
     let mut motive_fvs = Vec::with_capacity(parsed_inds.len());
     for (ti, ind) in parsed_inds.iter().enumerate() {
-        let ind_c = tc.arena.const_(ind.name, param_lvls.clone());
+        let ind_c = tc.arena.const_(ind.name, &param_lvls);
         let idx_e: Vec<ExprId> = ind.indices.iter().map(|ix| tc.arena.fvar(ix.fv)).collect();
         let major_ty = { let p = tc.arena.app_n(ind_c, &param_fve); tc.arena.app_n(p, &idx_e) };
         let t_n = tc.arena.name_from_path("t");
@@ -561,7 +561,7 @@ pub fn check_inductive_block(
 
     let mut minor_fvs = Vec::with_capacity(parsed_ctors.len());
     for c in &parsed_ctors {
-        let ctor_c = tc.arena.const_(c.name, param_lvls.clone());
+        let ctor_c = tc.arena.const_(c.name, &param_lvls);
         let field_e: Vec<ExprId> = c.fields.iter().map(|f| tc.arena.fvar(f.fv)).collect();
         let ctor_val = { let p = tc.arena.app_n(ctor_c, &param_fve); tc.arena.app_n(p, &field_e) };
         let mut mty = tc.arena.app_n(motive_fve[c.ind_idx], &c.result_indices);
@@ -582,7 +582,7 @@ pub fn check_inductive_block(
     let minor_fve: Vec<ExprId> = minor_fvs.iter().map(|m| tc.arena.fvar(m.fv)).collect();
 
     for (ti, ind) in parsed_inds.iter().enumerate() {
-        let ind_c = tc.arena.const_(ind.name, param_lvls.clone());
+        let ind_c = tc.arena.const_(ind.name, &param_lvls);
         let idx_e: Vec<ExprId> = ind.indices.iter().map(|ix| tc.arena.fvar(ix.fv)).collect();
         let major_ty = { let p = tc.arena.app_n(ind_c, &param_fve); tc.arena.app_n(p, &idx_e) };
         let major_fv = tc.fresh_fvar();
@@ -603,7 +603,7 @@ pub fn check_inductive_block(
             let field_e: Vec<ExprId> = c.fields.iter().map(|f| tc.arena.fvar(f.fv)).collect();
             let mut rhs = tc.arena.app_n(minor_fve[mi], &field_e);
             for rf in &c.rec_fields {
-                let target_rec = tc.arena.const_(rec_names[rf.target_ind], rec_lvl_args.clone());
+                let target_rec = tc.arena.const_(rec_names[rf.target_ind], &rec_lvl_args);
                 let eb_e: Vec<ExprId> = rf.extra.iter().map(|e| tc.arena.fvar(e.fv)).collect();
                 let f_app = tc.arena.app_n(field_e[rf.field_idx], &eb_e);
                 let mut ih = tc.arena.app_n(target_rec, &param_fve);
@@ -664,9 +664,9 @@ fn check_strict_positivity(
     }
     let (head, args) = tc.app_spine(ty);
     for _ in &extra { tc.pop_local(); }
-    let target_ind = match tc.arena.get_expr(head) {
-        ExprData::Const(hname, hlvls) => {
-            let (hn, hl) = (*hname, hlvls.clone());
+    let target_ind = match *tc.arena.get_expr(head) {
+        ExprData::Const(hn, hl_id) => {
+            let hl: Box<[LevelId]> = tc.arena.get_level_list(hl_id).into();
             lvls_eq(tc.arena, &hl, param_lvls).then(|| all_names.iter().position(|&x| x == hn)).flatten()
         }
         _ => None,

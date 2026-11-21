@@ -4,3 +4,4 @@
 *.svg
 flamegraph.svg
 perf.data*
+tools/mutation/results*.json

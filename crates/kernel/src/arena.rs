@@ -9,6 +9,10 @@ pub struct NameId(pub u32);
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LevelId(pub u32);
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LevelListId(pub u32);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LitId(pub u32);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExprId(pub u32);
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FVarId(pub u32);
@@ -48,17 +52,17 @@ pub enum Literal {
     Str(Box<str>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ExprData {
     BVar(u32),
     FVar(FVarId),
     Sort(LevelId),
-    Const(NameId, Box<[LevelId]>),
+    Const(NameId, LevelListId),
     App(ExprId, ExprId),
     Lam { name: NameId, binder_info: BinderInfo, ty: ExprId, body: ExprId },
     Pi { name: NameId, binder_info: BinderInfo, ty: ExprId, body: ExprId },
-    Let { name: NameId, ty: ExprId, val: ExprId, body: ExprId },
-    Lit(Literal),
+    Let { ty: ExprId, val: ExprId, body: ExprId },
+    Lit(LitId),
     Proj { struct_name: NameId, idx: u32, expr: ExprId },
 }
 
@@ -86,12 +90,18 @@ pub struct Arena {
     parent: Option<Arc<Arena>>,
     name_base: u32,
     level_base: u32,
+    level_list_base: u32,
+    lit_base: u32,
     expr_base: u32,
     names: Vec<NameData>,
     name_map: FxHashMap<NameData, NameId>,
     levels: Vec<LevelData>,
     level_meta: Vec<LevelMeta>,
     level_map: FxHashMap<LevelData, LevelId>,
+    level_lists: Vec<Box<[LevelId]>>,
+    level_list_map: FxHashMap<Box<[LevelId]>, LevelListId>,
+    lits: Vec<Literal>,
+    lit_map: FxHashMap<Literal, LitId>,
     exprs: Vec<ExprData>,
     expr_meta: Vec<ExprMeta>,
     /// Hash-consing index over this arena's own expressions: open addressing with linear probing,
@@ -109,18 +119,25 @@ impl Default for Arena {
 impl Arena {
     pub const ANONYMOUS: NameId = NameId(0);
     pub const LEVEL_ZERO: LevelId = LevelId(0);
+    pub const EMPTY_LEVELS: LevelListId = LevelListId(0);
 
     pub fn new() -> Self {
         let mut a = Self {
             parent: None,
             name_base: 0,
             level_base: 0,
+            level_list_base: 0,
+            lit_base: 0,
             expr_base: 0,
             names: Vec::with_capacity(256),
             name_map: FxHashMap::default(),
             levels: Vec::with_capacity(128),
             level_meta: Vec::with_capacity(128),
             level_map: FxHashMap::default(),
+            level_lists: Vec::with_capacity(64),
+            level_list_map: FxHashMap::default(),
+            lits: Vec::with_capacity(64),
+            lit_map: FxHashMap::default(),
             exprs: Vec::with_capacity(1024),
             expr_meta: Vec::with_capacity(1024),
             expr_table: Vec::new(),
@@ -129,22 +146,35 @@ impl Arena {
         };
         let n0 = a.intern_name_raw(NameData::Anonymous);
         let l0 = a.intern_level_raw(LevelData::Zero);
-        debug_assert_eq!((n0, l0), (Self::ANONYMOUS, Self::LEVEL_ZERO));
+        let ll0 = a.intern_level_list(&[]);
+        debug_assert_eq!((n0, l0, ll0), (Self::ANONYMOUS, Self::LEVEL_ZERO, Self::EMPTY_LEVELS));
         a
     }
 
     pub fn child(parent: Arc<Arena>) -> Self {
-        let (name_base, level_base, expr_base) = (parent.name_len(), parent.level_len(), parent.expr_len());
+        let (name_base, level_base, level_list_base, lit_base, expr_base) = (
+            parent.name_len(),
+            parent.level_len(),
+            parent.level_list_len(),
+            parent.lit_len(),
+            parent.expr_len(),
+        );
         Self {
             parent: Some(parent),
             name_base,
             level_base,
+            level_list_base,
+            lit_base,
             expr_base,
             names: Vec::new(),
             name_map: FxHashMap::default(),
             levels: Vec::new(),
             level_meta: Vec::new(),
             level_map: FxHashMap::default(),
+            level_lists: Vec::new(),
+            level_list_map: FxHashMap::default(),
+            lits: Vec::new(),
+            lit_map: FxHashMap::default(),
             exprs: Vec::new(),
             expr_meta: Vec::new(),
             expr_table: Vec::new(),
@@ -157,6 +187,10 @@ impl Arena {
     pub fn name_len(&self) -> u32 { self.name_base + self.names.len() as u32 }
     #[inline]
     pub fn level_len(&self) -> u32 { self.level_base + self.levels.len() as u32 }
+    #[inline]
+    pub fn level_list_len(&self) -> u32 { self.level_list_base + self.level_lists.len() as u32 }
+    #[inline]
+    pub fn lit_len(&self) -> u32 { self.lit_base + self.lits.len() as u32 }
     #[inline]
     pub fn expr_len(&self) -> u32 { self.expr_base + self.exprs.len() as u32 }
 
@@ -224,6 +258,60 @@ impl Arena {
     pub fn get_level_meta(&self, id: LevelId) -> LevelMeta {
         if id.0 < self.level_base { self.parent.as_deref().unwrap().get_level_meta(id) }
         else { self.level_meta[(id.0 - self.level_base) as usize] }
+    }
+
+    // ---------------------------------------------------------------- Level lists
+    fn lookup_level_list(&self, levels: &[LevelId]) -> Option<LevelListId> {
+        self.level_list_map
+            .get(levels)
+            .copied()
+            .or_else(|| self.parent.as_deref().and_then(|p| p.lookup_level_list(levels)))
+    }
+    pub fn intern_level_list(&mut self, levels: &[LevelId]) -> LevelListId {
+        if levels.is_empty() && self.level_list_len() > 0 {
+            return Self::EMPTY_LEVELS;
+        }
+        if let Some(id) = self.lookup_level_list(levels) {
+            return id;
+        }
+        let boxed: Box<[LevelId]> = levels.into();
+        let id = LevelListId(self.level_list_len());
+        self.level_lists.push(boxed.clone());
+        self.level_list_map.insert(boxed, id);
+        id
+    }
+    #[inline]
+    pub fn get_level_list(&self, id: LevelListId) -> &[LevelId] {
+        if id.0 < self.level_list_base {
+            self.parent.as_deref().unwrap().get_level_list(id)
+        } else {
+            &self.level_lists[(id.0 - self.level_list_base) as usize]
+        }
+    }
+
+    // ---------------------------------------------------------------- Literals
+    fn lookup_lit(&self, data: &Literal) -> Option<LitId> {
+        self.lit_map
+            .get(data)
+            .copied()
+            .or_else(|| self.parent.as_deref().and_then(|p| p.lookup_lit(data)))
+    }
+    pub fn intern_lit(&mut self, data: Literal) -> LitId {
+        if let Some(id) = self.lookup_lit(&data) {
+            return id;
+        }
+        let id = LitId(self.lit_len());
+        self.lits.push(data.clone());
+        self.lit_map.insert(data, id);
+        id
+    }
+    #[inline]
+    pub fn get_lit(&self, id: LitId) -> &Literal {
+        if id.0 < self.lit_base {
+            self.parent.as_deref().unwrap().get_lit(id)
+        } else {
+            &self.lits[(id.0 - self.lit_base) as usize]
+        }
     }
 
     // ---------------------------------------------------------------- Expressions
@@ -320,7 +408,7 @@ impl Arena {
             },
             ExprData::Const(_, lvls) => ExprMeta {
                 loose_bvar_range: 0,
-                flags: if lvls.iter().any(|&l| self.get_level_meta(l).has_param) { FLAG_HAS_LEVEL_PARAM } else { 0 },
+                flags: if self.get_level_list(*lvls).iter().any(|&l| self.get_level_meta(l).has_param) { FLAG_HAS_LEVEL_PARAM } else { 0 },
             },
             ExprData::App(f, a) => {
                 let (mf, ma) = (self.get_expr_meta(*f), self.get_expr_meta(*a));
@@ -375,10 +463,11 @@ impl Arena {
     #[inline]
     pub fn prop(&mut self) -> ExprId { self.sort(Self::LEVEL_ZERO) }
     #[inline]
-    pub fn const_(&mut self, name: NameId, levels: impl Into<Box<[LevelId]>>) -> ExprId {
-        self.intern_expr(ExprData::Const(name, levels.into()))
+    pub fn const_(&mut self, name: NameId, levels: impl AsRef<[LevelId]>) -> ExprId {
+        let lvls = self.intern_level_list(levels.as_ref());
+        self.intern_expr(ExprData::Const(name, lvls))
     }
-    pub fn const_path(&mut self, path: &str, levels: impl Into<Box<[LevelId]>>) -> ExprId {
+    pub fn const_path(&mut self, path: &str, levels: impl AsRef<[LevelId]>) -> ExprId {
         let n = self.name_from_path(path);
         self.const_(n, levels)
     }
@@ -408,8 +497,8 @@ impl Arena {
         self.intern_expr(ExprData::Pi { name, binder_info, ty, body })
     }
     #[inline]
-    pub fn let_(&mut self, name: NameId, ty: ExprId, val: ExprId, body: ExprId) -> ExprId {
-        self.intern_expr(ExprData::Let { name, ty, val, body })
+    pub fn let_(&mut self, _name: NameId, ty: ExprId, val: ExprId, body: ExprId) -> ExprId {
+        self.intern_expr(ExprData::Let { ty, val, body })
     }
     #[inline]
     pub fn proj(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> ExprId {
@@ -417,9 +506,15 @@ impl Arena {
     }
     #[inline]
     pub fn lit_nat(&mut self, n: u128) -> ExprId { self.lit_nat_big(crate::nat::Nat::from_u128(n)) }
-    pub fn lit_nat_big(&mut self, n: crate::nat::Nat) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Nat(n))) }
+    pub fn lit_nat_big(&mut self, n: crate::nat::Nat) -> ExprId {
+        let lid = self.intern_lit(Literal::Nat(n));
+        self.intern_expr(ExprData::Lit(lid))
+    }
     #[inline]
-    pub fn lit_str(&mut self, s: &str) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Str(s.into()))) }
+    pub fn lit_str(&mut self, s: &str) -> ExprId {
+        let lid = self.intern_lit(Literal::Str(s.into()));
+        self.intern_expr(ExprData::Lit(lid))
+    }
 
     /// Reclaim temporary expressions/levels/names interned during single-declaration type-checking.
     /// Release spare capacity and pack the hash-consing table (load up to 7/8) before the arena
@@ -428,6 +523,8 @@ impl Arena {
         self.names.shrink_to_fit();
         self.levels.shrink_to_fit();
         self.level_meta.shrink_to_fit();
+        self.level_lists.shrink_to_fit();
+        self.lits.shrink_to_fit();
         self.exprs.shrink_to_fit();
         self.expr_meta.shrink_to_fit();
         let mut cap = 1024usize;
@@ -440,11 +537,8 @@ impl Arena {
             self.expr_table = packed;
         }
     }
-    pub fn truncate_to(&mut self, n_len: u32, l_len: u32, e_len: u32) {
+    pub fn truncate_to(&mut self, n_len: u32, l_len: u32, ll_len: u32, lit_len: u32, e_len: u32) {
         debug_assert!(self.parent.is_none());
-        for d in self.names.drain(n_len as usize..) { self.name_map.remove(&d); }
-        for d in self.levels.drain(l_len as usize..) { self.level_map.remove(&d); }
-        self.level_meta.truncate(l_len as usize);
         for id in (e_len..self.expr_len()).rev() {
             match *self.own_expr(id) {
                 // small bound variables live in `bvar_cache`, not in the table
@@ -456,5 +550,86 @@ impl Arena {
         }
         self.exprs.truncate(e_len as usize);
         self.expr_meta.truncate(e_len as usize);
+        for d in self.names.drain(n_len as usize..) { self.name_map.remove(&d); }
+        for d in self.levels.drain(l_len as usize..) { self.level_map.remove(&d); }
+        self.level_meta.truncate(l_len as usize);
+        for d in self.level_lists.drain(ll_len as usize..) { self.level_list_map.remove(&d); }
+        for d in self.lits.drain(lit_len as usize..) { self.lit_map.remove(&d); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expr_data_size_at_most_16_bytes() {
+        assert!(
+            core::mem::size_of::<ExprData>() <= 16,
+            "ExprData is {} bytes, expected <= 16",
+            core::mem::size_of::<ExprData>()
+        );
+    }
+
+    #[test]
+    fn level_lists_and_lits_child_and_truncate() {
+        let mut a = Arena::new();
+        let l0 = a.lvl_zero();
+        let l1 = a.lvl_nat(1);
+        let l2 = a.lvl_nat(2);
+
+        let ll_empty = a.intern_level_list(&[]);
+        assert_eq!(ll_empty, Arena::EMPTY_LEVELS);
+        assert_eq!(a.get_level_list(ll_empty), &[]);
+
+        let ll1 = a.intern_level_list(&[l1, l2]);
+        let ll1_dup = a.intern_level_list(&[l1, l2]);
+        assert_eq!(ll1, ll1_dup);
+        assert_eq!(a.get_level_list(ll1), &[l1, l2]);
+
+        let lit_n = a.lit_nat(42);
+        let lit_n_dup = a.lit_nat(42);
+        let lit_s = a.lit_str("hello");
+        assert_eq!(lit_n, lit_n_dup);
+        assert_ne!(lit_n, lit_s);
+
+        // Snapshot before temporary allocations
+        let snap = (a.name_len(), a.level_len(), a.level_list_len(), a.lit_len(), a.expr_len());
+        let tmp_name = a.name_from_path("Tmp.Const");
+        let tmp_ll = a.intern_level_list(&[l0, l1, l2]);
+        let tmp_const = a.const_(tmp_name, [l0, l1, l2]);
+        let tmp_lit = a.lit_str("temporary");
+        assert!(tmp_ll.0 >= snap.2);
+        assert!(tmp_const.0 >= snap.4);
+        assert!(tmp_lit.0 >= snap.4);
+
+        a.truncate_to(snap.0, snap.1, snap.2, snap.3, snap.4);
+        assert_eq!((a.name_len(), a.level_len(), a.level_list_len(), a.lit_len(), a.expr_len()), snap);
+
+        // Re-interning after truncation must succeed cleanly
+        let tmp_ll_again = a.intern_level_list(&[l0, l1, l2]);
+        assert_eq!(tmp_ll_again, tmp_ll);
+        assert_eq!(a.get_level_list(tmp_ll_again), &[l0, l1, l2]);
+        let tmp_lit_again = a.lit_str("temporary");
+        assert_eq!(a.get_lit(match *a.get_expr(tmp_lit_again) {
+            ExprData::Lit(id) => id,
+            _ => unreachable!(),
+        }), &Literal::Str("temporary".into()));
+
+        // Child arena shares parent level lists and literals without mutating parent
+        let parent = Arc::new(a);
+        let mut child = Arena::child(Arc::clone(&parent));
+        assert_eq!(child.intern_level_list(&[l1, l2]), ll1);
+        assert_eq!(child.lit_nat(42), lit_n);
+        assert_eq!(child.lit_str("hello"), lit_s);
+
+        let child_ll = child.intern_level_list(&[l2, l0]);
+        assert!(child_ll.0 >= parent.level_list_len());
+        assert_eq!(child.get_level_list(child_ll), &[l2, l0]);
+        assert_eq!(child.get_level_list(ll1), &[l1, l2]);
+
+        let child_lit = child.lit_nat(9999);
+        assert!(child_lit.0 >= parent.expr_len());
+        assert_eq!(child.lit_nat(9999), child_lit);
     }
 }

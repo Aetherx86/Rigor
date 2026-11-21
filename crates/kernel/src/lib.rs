@@ -13,7 +13,10 @@ pub mod level;
 pub mod nat;
 pub mod reduce;
 
-pub use arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelData, LevelId, Literal, NameId};
+pub use arena::{
+    Arena, BinderInfo, ExprData, ExprId, FVarId, LevelData, LevelId, LevelListId, LitId, Literal,
+    NameId,
+};
 pub use check::TypeChecker;
 pub use env::{
     ConstructorInfo, Declaration, Environment, FrozenEnv, InductiveInfo, QuotKind, RecursorInfo,

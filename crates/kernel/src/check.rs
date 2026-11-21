@@ -129,13 +129,14 @@ impl<'a> TypeChecker<'a> {
                 let next = self.arena.lvl_succ(u);
                 Ok(self.arena.sort(next))
             }
-            ExprData::Const(name, lvls) => {
-                let name = *name;
+            ExprData::Const(name, lvls_id) => {
+                let (name, lvls_id) = (*name, *lvls_id);
                 let decl = self
                     .decls
                     .get(&name)
                     .ok_or(KernelError::UnknownConstant(name))?;
                 let params = decl.level_params();
+                let lvls = self.arena.get_level_list(lvls_id);
                 if lvls.len() != params.len() {
                     return Err(KernelError::LevelParamCountMismatch {
                         constant: name,
@@ -151,7 +152,7 @@ impl<'a> TypeChecker<'a> {
                     let l0 = lvls[0];
                     return Ok(self.inst_levels_cached(ty, params, &[l0]));
                 }
-                let lvls = lvls.clone();
+                let lvls: Box<[LevelId]> = lvls.into();
                 Ok(instantiate_level_params(self.arena, ty, params, &lvls))
             }
             ExprData::App(f, a) => {
@@ -198,8 +199,8 @@ impl<'a> TypeChecker<'a> {
                 let abs_body_ty = abstract_fvars(self.arena, body_ty, &[fv]);
                 Ok(self.arena.pi(name, binder_info, ty, abs_body_ty))
             }
-            ExprData::Let { name, ty, val, body } => {
-                let (name, ty, val, body) = (*name, *ty, *val, *body);
+            ExprData::Let { ty, val, body } => {
+                let (ty, val, body) = (*ty, *val, *body);
                 let _u = self.infer_sort(ty)?;
                 let val_ty = if self.infer_only { ty } else { self.infer_type(val)? };
                 if !self.infer_only && !self.is_def_eq(val_ty, ty)? {
@@ -208,7 +209,7 @@ impl<'a> TypeChecker<'a> {
                         got: val_ty,
                     });
                 }
-                let fv = self.push_local(name, BinderInfo::Default, ty, Some(val));
+                let fv = self.push_local(Arena::ANONYMOUS, BinderInfo::Default, ty, Some(val));
                 let fv_expr = self.arena.fvar(fv);
                 let body_inst = instantiate1(self.arena, body, fv_expr);
                 let body_ty = self.infer_type(body_inst);
@@ -217,22 +218,24 @@ impl<'a> TypeChecker<'a> {
                 let abs = abstract_fvars(self.arena, body_ty, &[fv]);
                 Ok(instantiate1(self.arena, abs, val))
             }
-            ExprData::Lit(crate::arena::Literal::Nat(_)) => {
-                let nat_name = self.arena.name_from_path("Nat");
-                if self.decls.contains_key(&nat_name) {
-                    Ok(self.arena.const_(nat_name, []))
-                } else {
-                    Err(KernelError::UnknownConstant(nat_name))
+            ExprData::Lit(lid) => match self.arena.get_lit(*lid) {
+                crate::arena::Literal::Nat(_) => {
+                    let nat_name = self.arena.name_from_path("Nat");
+                    if self.decls.contains_key(&nat_name) {
+                        Ok(self.arena.const_(nat_name, []))
+                    } else {
+                        Err(KernelError::UnknownConstant(nat_name))
+                    }
                 }
-            }
-            ExprData::Lit(crate::arena::Literal::Str(_)) => {
-                let str_name = self.arena.name_from_path("String");
-                if self.decls.contains_key(&str_name) {
-                    Ok(self.arena.const_(str_name, []))
-                } else {
-                    Err(KernelError::UnknownConstant(str_name))
+                crate::arena::Literal::Str(_) => {
+                    let str_name = self.arena.name_from_path("String");
+                    if self.decls.contains_key(&str_name) {
+                        Ok(self.arena.const_(str_name, []))
+                    } else {
+                        Err(KernelError::UnknownConstant(str_name))
+                    }
                 }
-            }
+            },
             ExprData::Proj { struct_name, idx, expr } => {
                 let (s, i, x) = (*struct_name, *idx, *expr);
                 self.infer_proj(s, i, x)
@@ -260,8 +263,10 @@ impl<'a> TypeChecker<'a> {
         let expr_ty = self.infer_type(expr)?;
         let expr_ty_whnf = self.whnf(expr_ty);
         let (head, args) = self.app_spine(expr_ty_whnf);
-        let lvls = match self.arena.get_expr(head) {
-            ExprData::Const(n, ls) if *n == struct_name && args.len() == ind.num_params as usize => ls.clone(),
+        let lvls: Box<[LevelId]> = match *self.arena.get_expr(head) {
+            ExprData::Const(n, ls) if n == struct_name && args.len() == ind.num_params as usize => {
+                self.arena.get_level_list(ls).into()
+            }
             _ => return Err(err("expression type does not match structure")),
         };
 
