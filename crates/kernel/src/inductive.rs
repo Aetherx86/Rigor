@@ -475,7 +475,11 @@ pub fn check_inductive_block(
                 let (mut ok, mut pushed) = (true, 0);
                 for f in &c0.fields {
                     let in_prop = tc.infer_sort(f.ty).map(|l| level_is_zero(tc.arena, l)).unwrap_or(false);
-                    let in_idx = c0.result_indices.iter().any(|&ix| expr_mentions_fvar(tc.arena, ix, f.fv));
+                    // The field must *be* one of the result indices (as in Lean's kernel). Merely
+                    // occurring inside an index (`P (f n)`) does not determine it, since `f` need not be
+                    // injective, and large elimination would then contradict proof irrelevance.
+                    let fv_e = tc.arena.fvar(f.fv);
+                    let in_idx = c0.result_indices.contains(&fv_e);
                     if !in_prop && !in_idx { ok = false; break; }
                     tc.push_existing_local(f.fv, f.name, f.bi, f.ty);
                     pushed += 1;

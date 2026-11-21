@@ -455,3 +455,68 @@ fn rejects_proof_irrelevance_in_type_and_ill_typed_recursor_apps() {
         Err(KernelError::TypeMismatch { .. })
     ));
 }
+
+/// A field that only occurs *inside* a result index (`P (f n)`) is not determined by the index:
+/// `f` need not be injective. Allowing large elimination there lets `P.rec` extract `n` from a
+/// proof, and since any two proofs of `P (f 1)` and `P (f 2)` with `f 1 = f 2` are equal by proof
+/// irrelevance, it would prove `1 = 2`. Lean only allows large elimination when the index *is*
+/// the field. This is exactly the shape of `Int.NonNeg.mk (n : Nat) : Int.NonNeg (Int.ofNat n)`,
+/// whose real Lean recursor has no universe parameter.
+#[test]
+fn rejects_large_elimination_when_a_field_only_occurs_inside_an_index() {
+    let mut env = Environment::new();
+    setup_false_bool_nat(&mut env);
+    let prop = env.arena.prop();
+    let l1 = env.arena.lvl_nat(1);
+    let type0 = env.arena.sort(l1);
+    let bool_c = env.arena.const_path("Bool", []);
+    let nat_c = env.arena.const_path("Nat", []);
+    let b0 = env.arena.bvar(0);
+
+    // axiom f : Nat -> Bool (not injective in general)
+    let f_n = env.arena.name_from_path("f");
+    let f_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat_c, bool_c);
+    env.add_decl(Declaration::Axiom { name: f_n, level_params: Box::new([]), ty: f_ty }).unwrap();
+    let f_c = env.arena.const_(f_n, []);
+
+    // inductive P : Bool -> Prop | mk (n : Nat) : P (f n)
+    let p_n = env.arena.name_from_path("P");
+    let mk_n = env.arena.name_from_path("P.mk");
+    let p_c = env.arena.const_(p_n, []);
+    let p_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, bool_c, prop);
+    let f_n_app = env.arena.app(f_c, b0);
+    let ret = env.arena.app(p_c, f_n_app);
+    let mk_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat_c, ret);
+    env.add_inductive(InductiveSpec {
+        level_params: Box::new([]),
+        num_params: 0,
+        types: vec![InductiveTypeSpec { name: p_n, ty: p_ty, ctors: vec![(mk_n, mk_ty)] }],
+    })
+    .unwrap();
+
+    // P.rec must eliminate only into Prop: it has no universe parameter.
+    let rec_n = env.arena.name_from_path("P.rec");
+    let rec_large = env.arena.const_(rec_n, [l1]);
+    let bad = env.arena.name_from_path("bad_nested_index_large_elim");
+    assert!(matches!(
+        env.add_decl(Declaration::Definition { name: bad, level_params: Box::new([]), ty: type0, val: rec_large, hint: ReducibilityHint::Regular(0) }),
+        Err(KernelError::LevelParamCountMismatch { .. })
+    ));
+
+    // Control: when the index is the field itself (`Q n`), large elimination stays allowed.
+    let q_n = env.arena.name_from_path("Q");
+    let qmk_n = env.arena.name_from_path("Q.mk");
+    let q_c = env.arena.const_(q_n, []);
+    let q_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat_c, prop);
+    let q_ret = env.arena.app(q_c, b0);
+    let qmk_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat_c, q_ret);
+    env.add_inductive(InductiveSpec {
+        level_params: Box::new([]),
+        num_params: 0,
+        types: vec![InductiveTypeSpec { name: q_n, ty: q_ty, ctors: vec![(qmk_n, qmk_ty)] }],
+    })
+    .unwrap();
+    let qrec_n = env.arena.name_from_path("Q.rec");
+    assert_eq!(env.get(qrec_n).expect("Q.rec exists").level_params().len(), 1, "Q.rec eliminates into any Sort");
+    assert_eq!(env.get(rec_n).expect("P.rec exists").level_params().len(), 0, "P.rec eliminates only into Prop");
+}

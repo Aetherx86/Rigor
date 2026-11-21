@@ -147,7 +147,7 @@ impl<'a> TypeChecker<'a> {
                             if len <= major_idx {
                                 break;
                             }
-                            let mut major = self.whnf(spine[len - 1 - major_idx]);
+                            let mut major = self.whnf_lit_ctor(spine[len - 1 - major_idx]);
                             if let ExprData::Lit(Literal::Nat(k)) = *self.arena.get_expr(major) {
                                 major = self.expand_nat_lit(k);
                             }
@@ -253,7 +253,7 @@ impl<'a> TypeChecker<'a> {
             Declaration::Inductive(i) if i.ctors.len() == 1 && i.num_indices == 0 => i,
             _ => return None,
         };
-        let val = self.whnf(expr);
+        let val = self.whnf_lit_ctor(expr);
         let (vhead, vargs) = self.app_spine(val);
         if let ExprData::Const(cname, _) = self.arena.get_expr(vhead) {
             let pos = ind.num_params as usize + idx as usize;
@@ -294,6 +294,36 @@ impl<'a> TypeChecker<'a> {
             let pred = self.arena.lit_nat(k - 1);
             self.arena.app(succ, pred)
         }
+    }
+
+    /// Lean 4 kernel string literal expansion: `"ab"` is definitionally
+    /// `String.ofList [Char.ofNat 97, Char.ofNat 98]`. Used only when a recursor, a projection or a
+    /// definitional-equality check needs the structure of the literal.
+    fn expand_str_lit(&mut self, s: &str) -> ExprId {
+        let l0 = self.arena.lvl_nat(0);
+        let char_t = self.arena.const_path("Char", []);
+        let of_nat = self.arena.const_path("Char.ofNat", []);
+        let nil = self.arena.const_path("List.nil", [l0]);
+        let cons = self.arena.const_path("List.cons", [l0]);
+        let mut list = self.arena.app(nil, char_t);
+        for c in s.chars().rev() {
+            let code = self.arena.lit_nat(c as u128);
+            let ch = self.arena.app(of_nat, code);
+            list = self.arena.app_n(cons, &[char_t, ch, list]);
+        }
+        let of_list = self.arena.const_path("String.ofList", []);
+        self.arena.app(of_list, list)
+    }
+
+    /// WHNF that also opens a string literal into its constructor form.
+    fn whnf_lit_ctor(&mut self, e: ExprId) -> ExprId {
+        let w = self.whnf(e);
+        if let ExprData::Lit(Literal::Str(s)) = self.arena.get_expr(w) {
+            let s = s.clone();
+            let ex = self.expand_str_lit(&s);
+            return self.whnf(ex);
+        }
+        w
     }
 
     /// Lean 4 kernel `reduce_nat`: O(1) machine evaluation of closed `Nat` literal primitives.
@@ -401,6 +431,8 @@ impl<'a> TypeChecker<'a> {
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
                 (ExprData::Lit(Literal::Nat(k)), _) => { let k = *k; a = self.expand_nat_lit(k); continue; }
                 (_, ExprData::Lit(Literal::Nat(k))) => { let k = *k; b = self.expand_nat_lit(k); continue; }
+                (ExprData::Lit(Literal::Str(sv)), _) => { let sv = sv.clone(); let ex = self.expand_str_lit(&sv); a = self.whnf_no_delta(ex); continue; }
+                (_, ExprData::Lit(Literal::Str(sv))) => { let sv = sv.clone(); let ex = self.expand_str_lit(&sv); b = self.whnf_no_delta(ex); continue; }
                 (ExprData::Pi { name, binder_info, ty: t1, body: b1 }, ExprData::Pi { ty: t2, body: b2, .. }) => {
                     let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
                     if !self.is_def_eq(t1, t2)? { return Ok(false); }
