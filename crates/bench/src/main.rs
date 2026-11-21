@@ -72,7 +72,15 @@ fn run_check_file(path: &str) {
     let bytes = meta.len() as f64;
     let t0 = Instant::now();
     let mut env = Environment::new();
-    let stats = rigor_parser::parse_file(path, &mut env).expect("kernel rejected export file");
+    // RIGOR_THREADS=n (default: all cores); RIGOR_THREADS=1 with RIGOR_SEQUENTIAL=1 checks while parsing.
+    let threads = std::env::var("RIGOR_THREADS").ok().and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let stats = if std::env::var_os("RIGOR_SEQUENTIAL").is_some() {
+        rigor_parser::parse_file(path, &mut env)
+    } else {
+        rigor_parser::parse_file_parallel(path, &mut env, threads)
+    }
+    .unwrap_or_else(|e| panic!("kernel rejected export file: {e}"));
     let elapsed = t0.elapsed();
     let secs = elapsed.as_secs_f64();
     let mib = bytes / (1024.0 * 1024.0);

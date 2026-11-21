@@ -31,6 +31,8 @@ pub enum ParseError {
     UnknownExprId { line: usize, id: usize },
     InvalidUtf8 { line: usize },
     Kernel { line: usize, err: KernelError },
+    /// A declaration admitted during parsing failed its deferred (parallel) type check.
+    DeferredKernel { name: String, err: KernelError },
 }
 
 impl fmt::Display for ParseError {
@@ -43,6 +45,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownExprId { line, id } => write!(f, "line {line}: undefined expr id {id}"),
             ParseError::InvalidUtf8 { line } => write!(f, "line {line}: invalid UTF-8 in #ELS literal"),
             ParseError::Kernel { line, err } => write!(f, "line {line}: kernel rejected declaration: {err}"),
+            ParseError::DeferredKernel { name, err } => write!(f, "kernel rejected declaration {name}: {err}"),
         }
     }
 }
@@ -739,6 +742,24 @@ pub fn parse_and_check<R: BufRead>(
     env: &mut Environment,
 ) -> Result<ParseStats, ParseError> {
     StreamParser::new().parse_reader(reader, env)
+}
+
+/// Parse a `lean4export` file, admitting axioms, definitions, theorems and opaques without
+/// checking them, then type-check all of them on `threads` threads. Inductives and quotients are
+/// checked while parsing. Accepts exactly the files `parse_file` accepts.
+pub fn parse_file_parallel(
+    path: impl AsRef<Path>,
+    env: &mut Environment,
+    threads: usize,
+) -> Result<ParseStats, ParseError> {
+    env.set_deferred_checking(true);
+    let file = File::open(path)?;
+    let reader = BufReader::with_capacity(1 << 20, file);
+    let parsed = parse_and_check(reader, env);
+    env.set_deferred_checking(false);
+    let stats = parsed?;
+    env.check_deferred(threads).map_err(|(name, err)| ParseError::DeferredKernel { name: env.arena.format_name(name), err })?;
+    Ok(stats)
 }
 
 /// Parse and verify an in-memory `lean4export` string into a fresh `Environment`.

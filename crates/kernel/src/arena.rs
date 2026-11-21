@@ -94,8 +94,11 @@ pub struct Arena {
     level_map: FxHashMap<LevelData, LevelId>,
     exprs: Vec<ExprData>,
     expr_meta: Vec<ExprMeta>,
-    expr_map: FxHashMap<ExprData, ExprId>,
-    app_map: FxHashMap<(ExprId, ExprId), ExprId>,
+    /// Hash-consing index over this arena's own expressions: open addressing with linear probing,
+    /// storing only `u32` ids (equality is checked against `exprs`), so each expression is
+    /// stored once rather than again as a hash-map key.
+    expr_table: Vec<u32>,
+    expr_table_len: usize,
     bvar_cache: [u32; 32],
 }
 
@@ -120,8 +123,8 @@ impl Arena {
             level_map: FxHashMap::default(),
             exprs: Vec::with_capacity(1024),
             expr_meta: Vec::with_capacity(1024),
-            expr_map: FxHashMap::default(),
-            app_map: FxHashMap::default(),
+            expr_table: Vec::new(),
+            expr_table_len: 0,
             bvar_cache: [u32::MAX; 32],
         };
         let n0 = a.intern_name_raw(NameData::Anonymous);
@@ -144,8 +147,8 @@ impl Arena {
             level_map: FxHashMap::default(),
             exprs: Vec::new(),
             expr_meta: Vec::new(),
-            expr_map: FxHashMap::default(),
-            app_map: FxHashMap::default(),
+            expr_table: Vec::new(),
+            expr_table_len: 0,
             bvar_cache: [u32::MAX; 32],
         }
     }
@@ -225,16 +228,72 @@ impl Arena {
 
     // ---------------------------------------------------------------- Expressions
     #[inline]
-    fn lookup_app(&self, key: (ExprId, ExprId)) -> Option<ExprId> {
-        self.app_map.get(&key).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_app(key)))
-    }
-    #[inline]
     fn lookup_bvar(&self, idx: usize) -> Option<ExprId> {
         let v = self.bvar_cache[idx];
         if v != u32::MAX { Some(ExprId(v)) } else { self.parent.as_deref().and_then(|p| p.lookup_bvar(idx)) }
     }
-    fn lookup_expr(&self, data: &ExprData) -> Option<ExprId> {
-        self.expr_map.get(data).copied().or_else(|| self.parent.as_deref().and_then(|p| p.lookup_expr(data)))
+    #[inline]
+    fn expr_hash(data: &ExprData) -> u64 {
+        use core::hash::{Hash, Hasher};
+        let mut h = crate::hash::FxHasher::default();
+        data.hash(&mut h);
+        h.finish()
+    }
+    /// Data of an expression owned by this arena (not the parent).
+    #[inline]
+    fn own_expr(&self, id: u32) -> &ExprData { &self.exprs[(id - self.expr_base) as usize] }
+    fn table_find(&self, data: &ExprData, h: u64) -> Option<ExprId> {
+        if self.expr_table.is_empty() { return None; }
+        let mask = self.expr_table.len() - 1;
+        let mut i = h as usize & mask;
+        loop {
+            let s = self.expr_table[i];
+            if s == u32::MAX { return None; }
+            if self.own_expr(s) == data { return Some(ExprId(s)); }
+            i = (i + 1) & mask;
+        }
+    }
+    fn table_place(table: &mut [u32], id: u32, h: u64) {
+        let mask = table.len() - 1;
+        let mut i = h as usize & mask;
+        while table[i] != u32::MAX { i = (i + 1) & mask; }
+        table[i] = id;
+    }
+    fn table_insert(&mut self, id: u32, h: u64) {
+        if (self.expr_table_len + 1) * 4 > self.expr_table.len() * 3 {
+            let cap = (self.expr_table.len() * 2).max(1024);
+            let mut grown = vec![u32::MAX; cap];
+            for &s in self.expr_table.iter().filter(|&&s| s != u32::MAX) {
+                Self::table_place(&mut grown, s, Self::expr_hash(self.own_expr(s)));
+            }
+            self.expr_table = grown;
+        }
+        Self::table_place(&mut self.expr_table, id, h);
+        self.expr_table_len += 1;
+    }
+    /// Remove `id` with backward-shift deletion (keeps every probe chain intact).
+    fn table_remove(&mut self, id: u32) {
+        let mask = self.expr_table.len() - 1;
+        let mut i = Self::expr_hash(self.own_expr(id)) as usize & mask;
+        while self.expr_table[i] != id { i = (i + 1) & mask; }
+        let mut j = i;
+        loop {
+            j = (j + 1) & mask;
+            let s = self.expr_table[j];
+            if s == u32::MAX { break; }
+            let k = Self::expr_hash(self.own_expr(s)) as usize & mask;
+            // move `s` back into the hole at `i` unless its home slot lies cyclically in (i, j]
+            let in_range = if i <= j { i < k && k <= j } else { i < k || k <= j };
+            if !in_range {
+                self.expr_table[i] = s;
+                i = j;
+            }
+        }
+        self.expr_table[i] = u32::MAX;
+        self.expr_table_len -= 1;
+    }
+    fn lookup_expr_h(&self, data: &ExprData, h: u64) -> Option<ExprId> {
+        self.table_find(data, h).or_else(|| self.parent.as_deref().and_then(|p| p.lookup_expr_h(data, h)))
     }
     pub fn intern_expr(&mut self, data: ExprData) -> ExprId {
         match data {
@@ -242,12 +301,13 @@ impl Arena {
             ExprData::BVar(idx) if (idx as usize) < 32 => return self.bvar(idx),
             _ => {}
         }
-        if let Some(id) = self.lookup_expr(&data) { return id; }
+        let h = Self::expr_hash(&data);
+        if let Some(id) = self.lookup_expr_h(&data, h) { return id; }
         let meta = self.compute_expr_meta(&data);
         let id = ExprId(self.expr_len());
-        self.exprs.push(data.clone());
+        self.exprs.push(data);
         self.expr_meta.push(meta);
-        self.expr_map.insert(data, id);
+        self.table_insert(id.0, h);
         id
     }
     fn compute_expr_meta(&self, data: &ExprData) -> ExprMeta {
@@ -324,13 +384,15 @@ impl Arena {
     }
     #[inline]
     pub fn app(&mut self, f: ExprId, a: ExprId) -> ExprId {
-        if let Some(id) = self.lookup_app((f, a)) { return id; }
+        let data = ExprData::App(f, a);
+        let h = Self::expr_hash(&data);
+        if let Some(id) = self.lookup_expr_h(&data, h) { return id; }
         let (mf, ma) = (self.get_expr_meta(f), self.get_expr_meta(a));
         let meta = ExprMeta { loose_bvar_range: mf.loose_bvar_range.max(ma.loose_bvar_range), flags: mf.flags | ma.flags };
         let id = ExprId(self.expr_len());
-        self.exprs.push(ExprData::App(f, a));
+        self.exprs.push(data);
         self.expr_meta.push(meta);
-        self.app_map.insert((f, a), id);
+        self.table_insert(id.0, h);
         id
     }
     pub fn app_n(&mut self, mut f: ExprId, args: &[ExprId]) -> ExprId {
@@ -360,18 +422,39 @@ impl Arena {
     pub fn lit_str(&mut self, s: &str) -> ExprId { self.intern_expr(ExprData::Lit(Literal::Str(s.into()))) }
 
     /// Reclaim temporary expressions/levels/names interned during single-declaration type-checking.
+    /// Release spare capacity and pack the hash-consing table (load up to 7/8) before the arena
+    /// is frozen and shared read-only with checker threads.
+    pub fn shrink_for_sharing(&mut self) {
+        self.names.shrink_to_fit();
+        self.levels.shrink_to_fit();
+        self.level_meta.shrink_to_fit();
+        self.exprs.shrink_to_fit();
+        self.expr_meta.shrink_to_fit();
+        let mut cap = 1024usize;
+        while cap * 7 < self.expr_table_len * 8 + 8 { cap *= 2; }
+        if cap < self.expr_table.len() {
+            let mut packed = vec![u32::MAX; cap];
+            for &s in self.expr_table.iter().filter(|&&s| s != u32::MAX) {
+                Self::table_place(&mut packed, s, Self::expr_hash(self.own_expr(s)));
+            }
+            self.expr_table = packed;
+        }
+    }
     pub fn truncate_to(&mut self, n_len: u32, l_len: u32, e_len: u32) {
         debug_assert!(self.parent.is_none());
         for d in self.names.drain(n_len as usize..) { self.name_map.remove(&d); }
         for d in self.levels.drain(l_len as usize..) { self.level_map.remove(&d); }
         self.level_meta.truncate(l_len as usize);
-        for d in self.exprs.drain(e_len as usize..) {
-            match d {
-                ExprData::App(f, a) => { self.app_map.remove(&(f, a)); }
-                ExprData::BVar(i) if (i as usize) < 32 => { self.bvar_cache[i as usize] = u32::MAX; }
-                other => { self.expr_map.remove(&other); }
+        for id in (e_len..self.expr_len()).rev() {
+            match *self.own_expr(id) {
+                // small bound variables live in `bvar_cache`, not in the table
+                ExprData::BVar(i) if (i as usize) < 32 => {
+                    if self.bvar_cache[i as usize] == id { self.bvar_cache[i as usize] = u32::MAX; }
+                }
+                _ => self.table_remove(id),
             }
         }
+        self.exprs.truncate(e_len as usize);
         self.expr_meta.truncate(e_len as usize);
     }
 }

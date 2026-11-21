@@ -110,10 +110,14 @@ impl Declaration {
 pub struct Environment {
     pub arena: Arena,
     decls: FxHashMap<NameId, Declaration>,
+    /// Deferred checking (see [`Environment::set_deferred_checking`]): admitted but not yet
+    /// type-checked axioms, definitions, theorems and opaques, in admission order.
+    defer: bool,
+    deferred: Vec<NameId>,
 }
 
 impl Environment {
-    pub fn new() -> Self { Self { arena: Arena::new(), decls: FxHashMap::default() } }
+    pub fn new() -> Self { Self { arena: Arena::new(), decls: FxHashMap::default(), defer: false, deferred: Vec::new() } }
     #[inline]
     pub fn get(&self, name: NameId) -> Option<&Declaration> { self.decls.get(&name) }
     #[inline]
@@ -153,6 +157,21 @@ impl Environment {
         if self.decls.contains_key(&name) { return Err(KernelError::DuplicateDeclaration(name)); }
         if let Declaration::Definition { val, hint: hint @ ReducibilityHint::Regular(0), .. } = &mut decl {
             *hint = ReducibilityHint::Regular(self.compute_height(*val));
+        }
+        if self.defer && matches!(decl, Declaration::Axiom { .. } | Declaration::Definition { .. } | Declaration::Theorem { .. } | Declaration::Opaque { .. }) {
+            // Admit now, type-check later in `check_deferred`. Requiring every referenced constant
+            // to exist already rules out self-reference and forward references, so the later
+            // check sees exactly the environment a sequential check would have seen.
+            let (ty, val) = match &decl {
+                Declaration::Axiom { ty, .. } => (*ty, None),
+                Declaration::Definition { ty, val, .. } | Declaration::Theorem { ty, val, .. } | Declaration::Opaque { ty, val, .. } => (*ty, Some(*val)),
+                _ => unreachable!(),
+            };
+            self.require_known_consts(ty)?;
+            if let Some(v) = val { self.require_known_consts(v)?; }
+            self.decls.insert(name, decl);
+            self.deferred.push(name);
+            return Ok(());
         }
         let (nl, ll, el) = (self.arena.name_len(), self.arena.level_len(), self.arena.expr_len());
         let res = {
@@ -277,6 +296,75 @@ impl Environment {
             inserted.push(n);
         }
         Ok(())
+    }
+
+    /// Defer type-checking of axioms, definitions, theorems and opaques until
+    /// [`Environment::check_deferred`], which checks them in parallel. Inductives and quotients
+    /// are still checked immediately. The environment must not be trusted until
+    /// `check_deferred` has returned `Ok`.
+    pub fn set_deferred_checking(&mut self, on: bool) { self.defer = on; }
+
+    /// Number of admitted declarations still waiting for `check_deferred`.
+    pub fn deferred_len(&self) -> usize { self.deferred.len() }
+
+    fn require_known_consts(&self, e: ExprId) -> Result<(), KernelError> {
+        let mut stack = vec![e];
+        let mut seen = FxHashSet::default();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) { continue; }
+            match self.arena.get_expr(x) {
+                ExprData::Const(n, _) => if !self.decls.contains_key(n) { return Err(KernelError::UnknownConstant(*n)); },
+                ExprData::App(f, a) => { stack.push(*f); stack.push(*a); }
+                ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => { stack.push(*ty); stack.push(*body); }
+                ExprData::Let { ty, val, body, .. } => { stack.push(*ty); stack.push(*val); stack.push(*body); }
+                ExprData::Proj { struct_name, expr, .. } => {
+                    if !self.decls.contains_key(struct_name) { return Err(KernelError::UnknownConstant(*struct_name)); }
+                    stack.push(*expr);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Type-check every deferred declaration on `threads` worker threads (each declaration in its
+    /// own scratch arena over the shared, read-only environment). On failure returns the
+    /// earliest failing declaration in admission order; the environment is then unusable.
+    pub fn check_deferred(&mut self, threads: usize) -> Result<(), (NameId, KernelError)> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pending = std::mem::take(&mut self.deferred);
+        if pending.is_empty() { return Ok(()); }
+        self.arena.shrink_for_sharing();
+        let arena = Arc::new(std::mem::replace(&mut self.arena, Arena::new()));
+        let decls = &self.decls;
+        let next = AtomicUsize::new(0);
+        let first_err: std::sync::Mutex<Option<(usize, NameId, KernelError)>> = std::sync::Mutex::new(None);
+        let n_threads = threads.max(1).min(pending.len());
+        std::thread::scope(|sc| {
+            for _ in 0..n_threads {
+                let (arena, pending, next, first_err) = (&arena, &pending, &next, &first_err);
+                std::thread::Builder::new()
+                    .stack_size(1 << 30)
+                    .spawn_scoped(sc, move || loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= pending.len() { break; }
+                        if let Some((j, _, _)) = *first_err.lock().unwrap() { if j < i { break; } }
+                        let decl = &decls[&pending[i]];
+                        let mut scratch = Arena::child(Arc::clone(arena));
+                        let res = TypeChecker::new(decls, &mut scratch).check_decl(decl);
+                        if let Err(e) = res {
+                            let mut g = first_err.lock().unwrap();
+                            if g.as_ref().is_none_or(|(j, _, _)| i < *j) { *g = Some((i, pending[i], e)); }
+                        }
+                    })
+                    .expect("spawn checker thread");
+            }
+        });
+        self.arena = Arc::try_unwrap(arena).unwrap_or_else(|_| unreachable!("worker arenas are dropped"));
+        match first_err.into_inner().unwrap() {
+            Some((_, name, e)) => Err((name, e)),
+            None => Ok(()),
+        }
     }
 
     /// Freeze this environment into an immutable, lock-free shareable snapshot for parallel checking.
