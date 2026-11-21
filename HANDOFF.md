@@ -47,6 +47,7 @@ B. [owner: agy-mut] Mutation-testing harness in ~/rigor/tools/mutation/ only (se
 C. [owner: coordinator] Verification of A and B, Worklog.md, BENCHMARKS.md, commits.
 D. [next, unassigned] Per-thread scratch memory: profile which TypeChecker caches dominate for the
    heaviest declarations and bound them.
+E. [owner: agy-mut] Read-only TCB SLOC reduction analysis in ~/rigor/tools/tcb/PLAN.md (target < 2,500 SLOC from 3,155 SLOC; no edits to crates/).
 
 ## Continuity rule (owner's instruction, 2026-11-22)
 The process must not stop. Every agent (Claude coordinator = A, Gemini/Antigravity workers = B) appends to
@@ -79,8 +80,10 @@ agent must be able to continue from this file alone.
 - 2026-11-22 06:16 KST: Task B round 2 done (agy-mut): added inductive_mutation and level_arity_mismatch (7 operators total); seed=2 ran 700 mutants on Init.Core (697 rejected, 3 accepted: Std.Trichotomous/Std.IdempotentOp/Std.Symm Prop->Type 0, all valid 1-ctor Prop-field structures whose only downstream uses remain well-typed via imax 1 0 = 0; harmless) and 350 mutants on Init.Prelude (350 rejected, 0 accepted); total 1050 mutants, 1047 rejected, 3 harmless accepted, 0 soundness bugs (see tools/mutation/REPORT.md).
 - 2026-11-22 06:15 KST: Task A done (gem): shrank ExprData from 24 to 16 bytes (interned Const level lists via LevelListId and literals via LitId, dropped unused Let binder name, updated Arena::child, Arena::truncate_to, Arena::shrink_for_sharing, and all kernel call sites; added size_of::<ExprData>() <= 16 and child/truncate tests). cargo test -q --workspace: 25/25 passed, 0 warnings. Full Init CHECK_OK (58,546 decls, 6,311,599 arena_exprs): parallel 12.58 s real (12.31 s check; host shared with Task B), 442,548,224 B (422.0 MiB) peak RSS; sequential 31.34 s real (31.33 s check), 359,776,256 B (343.1 MiB) peak RSS.
 - 2026-11-22 06:55 KST (coordinator): verified Task A: 25/25 tests, forbid(unsafe) intact. Quiet-machine full Init: parallel 7.78 s / 445 MB, sequential 23.89 s / 377 MB; leanchecker --fresh Init 28.67 s / 547 MB. GOAL MET (faster and smaller in both modes). Committed. Task B round 2 (agy-mut): 1,050 mutants, 3 accepted, all harmless Prop->Type 0 changes of single-proof-field structures (verified reasoning).
+- 2026-11-22 06:41 KST: Task E done (agy-mut, read-only): analysed crates/kernel/src/*.rs (3,155 SLOC) and wrote ~/rigor/tools/tcb/PLAN.md identifying 753 SLOC of core low-risk savings (773 SLOC with optional Lam/Pi binder-field drop; projected 2,402 SLOC, < 2,500 target) across dead/test-only code, non-TCB moves (FrozenEnv, Nat::from_dec, format_name), and deduplication (inductive.rs -145, arena.rs Table<T> -120, nat.rs -99, reduce.rs -90, DAG visitor -65).
 - 2026-11-22 06:40 KST (A): machine rebooted at 06:35, /tmp wiped (exports and /tmp/lean4-tools gone; the Std check was killed at line 10M of 10.1M with no rejection so far). Rebuilding lean4export in ~/rigor-data. NEXT: regenerate exports to ~/rigor-data/exports, re-run Std check; gem: review ~/ChronosVault (3 new commits 1ba83cb..45c39c7 by another tool); agy-mut: Task E (TCB reduction plan, read-only) was interrupted, redo.
 - 2026-11-22 06:45 KST (A): lean4export rebuilt in ~/rigor-data; exports regenerated in ~/rigor-data/exports (Init 6,495,289 lines, Std 10,123,003). Std check restarted (log ~/rigor-data/std_trace.log, result ~/rigor-data/std_check.log). gem: ChronosVault review; agy-mut: Task E.
+- 2026-11-22 06:42 KST (gem): ChronosVault review (~/ChronosVault, commits 1ba83cb, 8e75bce, 45c39c7) done. Working tree clean; no files changed. All 7 checks PASS: test:core (23/23), build:wasm, typecheck, eslint src, build, npm test (27/27), test:browser (17/17, 0 console errors). Security checks clean (no share/key/entropy/mnemonic logging, Share 3B client-sealed with heir passphrase, Testnet4-only enforced, no emoji/AI mentions/secrets). Noted concerns: proactive rotation overwrites local Share 1 before server rotateVault succeeds and leaves existing Share 3B stale until heir is re-registered; GET /api/vault/activity exposes cosine similarities unauthenticated; offline verifier HTML reads iterations without bounds check.
 
 ## TAKEOVER (A is out of usage, 2026-11-22 07:00 KST): gem becomes coordinator
 gem: after finishing your current ChronosVault review, act as coordinator (the role A had). Do these in order,
@@ -102,3 +105,17 @@ appending to this Log after each step:
 4. ChronosVault (~/ChronosVault): commit your verified fixes there the same way if you made any; record the
    review outcome in ~/ChronosVault/Worklog.md.
 Never weaken a kernel check to make something pass. Keep the continuity rule above.
+
+## CYCLE (owner's instruction): perpetual hand-back between Claude and Gemini until everything is done
+- Agents: Claude coordinator = `claude-lead` (herdr pane w2:p1); Gemini coordinator/worker = `gem` (w2:p3);
+  Gemini worker = `agy-mut` (w2:p2).
+- Whoever holds the coordinator role works through the TAKEOVER list and the Log's NEXT items. When it has
+  finished its current batch, OR is close to a usage/rate/context limit, it MUST:
+  1. append to the Log: what was done, what is half-done (files, commands), and the exact next step;
+  2. hand the role to the other side WITHOUT waiting:
+     - gem -> Claude:  `herdr agent prompt claude-lead "Your turn: read the Log and TAKEOVER/CYCLE sections in ~/rigor/HANDOFF.md and continue as coordinator."`
+     - Claude -> gem:  `herdr agent prompt gem "Your turn: read the Log and TAKEOVER/CYCLE sections in ~/rigor/HANDOFF.md and continue as coordinator."`
+  3. If the hand-off prompt fails because the other agent is busy, wait (`herdr agent wait <name> --timeout 600000`) and retry;
+     if the other agent is rate-limited or gone, keep working yourself and log it.
+- Stop the cycle only when every item in TAKEOVER and every NEXT in the Log is done and verified; then write
+  "ALL DONE" with a final summary at the end of the Log.
