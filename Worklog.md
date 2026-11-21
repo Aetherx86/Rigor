@@ -64,6 +64,34 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
     * Verified 100% of real `Init.Prelude` (2,121 decls: 92.86 ms / 19.55 MB RSS vs `leanchecker` 660 ms / 61.58 MB — 7.11x faster, 3.15x less RAM), `Init.Core` (3,913 decls: 101.03 ms / 24.48 MB vs 500 ms / 67.34 MB — 4.95x faster, 2.75x less RAM), `Init.Data.Nat.Basic` (4,718 decls: 132.29 ms / 26.61 MB vs 550 ms / 70.27 MB — 4.16x faster, 2.64x less RAM), and `Init.Data.List.Basic` (5,314 decls: 168.83 ms / 32.50 MB vs 620 ms / 72.33 MB — 3.67x faster, 2.23x less RAM).
   - TCB size audit: `crates/kernel/src/*.rs` strictly < 2,500 SLOC (`#![forbid(unsafe_code)]`, zero external deps).
 
+- **Phase 5: Full `Init` verification** (in progress, 2026-11-22)
+  - Target: all of Lean 4 v4.36.0-rc1 `Init` (`lake env lean4export Init` run in `/tmp/lean4-tools/lean4export`
+    -> `/tmp/rigor_real/Init.ndjson`, 6,495,289 lines, 332 MiB). Check with
+    `RIGOR_TRACE=1000 ./target/release/rigor-bench --check /tmp/rigor_real/Init.ndjson` (stderr reports every
+    declaration slower than 1000 ms and progress every 100k lines; run it with `timeout` and watch the stderr).
+  - Fixed so far (each was found by the full-`Init` run):
+    1. SOUNDNESS: large elimination from a 1-constructor Prop inductive was allowed when a non-proof field only
+       occurred *inside* a result index (`P (f n)`), which proves False (extract different `n` from
+       proof-irrelevant-equal proofs). Now the field must *be* an index, as in Lean (`Int.NonNeg.rec` has no
+       universe parameter in Lean). Regression test `rejects_large_elimination_when_a_field_only_occurs_inside_an_index`.
+    2. String literals expand to `String.ofList [Char.ofNat ..]` for recursors, projections and def-eq
+       (`String.toByteArray_empty`).
+    3. `Nat` literals are arbitrary precision (`crates/kernel/src/nat.rs`, dependency-free, unit tested) and all of
+       Lean's accelerated ops are evaluated (add sub mul div mod gcd beq ble pow land lor xor shiftLeft shiftRight
+       log2; pow/shift capped at 2^24 bits). u128 overflow used to fall back to unary unfolding.
+    4. Def-eq failure cache (`def_neq_cache`); `reduce_nat` skips terms with free variables (as Lean); proof
+       irrelevance is checked before structural comparison (Lean's order).
+    5. `--check` runs on a 4 GiB-stack thread.
+  - Result now: the run passes the first ~2.26M of 6.5M lines (~35%) and then hangs on `BitVec.reverse_replicate`
+    (line 2,264,328; `zero => rfl` case). Diagnosis: whnf unfolds `Nat.add/mul/pow/sub` structurally (via
+    `Nat.brecOn`, `*.match_1`, `*._f`) and counts a literal down from 2^32 one step at a time. Lean avoids this
+    path; most likely its lazy-delta ordering (unfold the side with the greater height first, compare arguments
+    of same-head applications before unfolding, `is_def_eq_offset` for succ/literal) or its `whnf` cache.
+    NEXT: dump the exact def-eq pair at the top of that check (instrument `is_def_eq` depth <= 3 behind an env
+    var), compare with Lean's `lazy_delta_reduction` in src/kernel/type_checker.cpp, fix, then continue the run.
+  - Init.Prelude (95 ms, 19.8 MB RSS) and Init.Core (96 ms, 24.7 MB RSS) still verify fully after these changes.
+  - TCB: kernel is now 2,815 SLOC (nat.rs adds 253), over the 2,500 target; trimming is open work.
+
 ## Progress log
 - 2026-11-22 01:30 KST: initialized `~/Rigor` workspace and started Phase 1 implementation.
 - 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `Aetherx86/Rigor` (commit `b41a1c2`).
@@ -71,3 +99,4 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
 - 2026-11-22 02:04 KST: completed Phase 3 (streaming `lean4export` parser for all 22 directives + v3 `#IND`/`#CTOR`/`#REC` + `#INDM`, kernel `#QUOT` + `#ELN` reduction, 18/18 tests green, 0 warnings, 778k decls/s streaming parse+verify, TCB < 2,500 SLOC, commit `2e473b1`).
 - 2026-11-22 02:19 KST: completed Phase 4 (head-to-head benchmark harness + Peak RSS script, Ackermann & primality reflection stress tests, `/usr/bin/sample` profile-guided spine-machine & arena optimizations up to 8.81x faster / -23.7% RSS, 19/19 tests green, TCB 2,484 SLOC, `BENCHMARKS.md`, commit `cb2ddff`).
 - 2026-11-22 04:07 KST: verified real Lean 4 v4.36.0 `Init.Prelude`, `Init.Core`, `Init.Data.Nat.Basic`, `Init.Data.List.Basic` via NDJSON `lean4export`, nested inductives, `to_ctor_when_structure`, `u128` `reduce_nat`, and `Arena::truncate_to` — beating `leanchecker --fresh` by 3.67x-7.11x wall time and 2.23x-3.15x lower Peak RSS while keeping TCB < 2,500 SLOC.
+- 2026-11-22 04:50 KST: Phase 5 started (full Init). Fixed unsound nested-index large elimination, string literal expansion, bignum Nat + all accelerated ops, failure cache, fvar guard in reduce_nat, proof-irrelevance order, big-stack checker. Blocked at BitVec.reverse_replicate (see Phase 5 NEXT).

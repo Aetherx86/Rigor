@@ -357,6 +357,12 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             }
         };
+        // As in Lean's `reduce_nat`: only closed terms can evaluate to literals, so never whnf an
+        // argument that mentions a free variable (that would unfold open arithmetic for nothing).
+        let arity = if op == "succ" || op == "log2" { 1 } else { 2 };
+        if len < arity || spine[len - arity..].iter().any(|&x| self.arena.get_expr_meta(x).has_fvar()) {
+            return None;
+        }
         if op == "succ" || op == "log2" {
             let a = as_nat(self, spine[len - 1])?;
             let r = if op == "succ" { a.add(&Nat::from_u128(1)) } else { a.log2() };
@@ -482,6 +488,15 @@ impl<'a> TypeChecker<'a> {
                 _ => {}
             }
 
+            // Proof irrelevance before any structural comparison or unfolding, as in Lean's
+            // `is_def_eq_core`: comparing two proofs' internals can force huge computations.
+            if !checked_proof {
+                checked_proof = true;
+                if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
+                    return self.is_def_eq(ta, tb);
+                }
+            }
+
             let (ha, args_a) = self.app_spine(a);
             let (hb, args_b) = self.app_spine(b);
             if args_a.len() == args_b.len() && self.heads_equal(ha, hb) {
@@ -490,13 +505,6 @@ impl<'a> TypeChecker<'a> {
                     if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
                 }
                 if all_eq { return Ok(true); }
-            }
-
-            if !checked_proof {
-                checked_proof = true;
-                if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
-                    return self.is_def_eq(ta, tb);
-                }
             }
 
             match (self.delta_info(ha), self.delta_info(hb)) {
