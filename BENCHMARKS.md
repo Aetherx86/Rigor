@@ -25,8 +25,8 @@ This document records reproducible performance, Peak RSS memory, and CPU profili
 
 - **Hardware:** Apple M4 (10 CPU cores, 16 GiB RAM, macOS)
 - **Toolchain:** Rust `rustc` / `cargo` (`--release`), `/usr/bin/time -l` (OS-level maximum resident set size), `/usr/bin/sample` (CPU call-stack profiler)
-- **Kernel TCB Footprint:** `crates/kernel/src/*.rs` = **2,484 SLOC** (`#![forbid(unsafe_code)]`, zero third-party crates)
-- **Correctness Gate:** 19/19 unit, inductive, `lean4export`, regression, and soundness torture tests passing with 0 warnings.
+- **Kernel TCB Footprint:** `crates/kernel/src/*.rs` = **3,155 SLOC** excluding tests, comments and blank lines (`#![forbid(unsafe_code)]`, zero third-party crates); above the 2,500 target since arbitrary-precision `Nat`, parallel checking and the compact arena were added
+- **Correctness Gate:** 25/25 unit, inductive, `lean4export`, regression, and soundness torture tests passing with 0 warnings; all of Lean 4 `Init` accepted; mutation harness in `tools/mutation/`.
 
 ---
 
