@@ -177,19 +177,9 @@ impl<'a> TypeChecker<'a> {
                                 let rule = &rec.rules[0];
                                 if let Some(Declaration::Constructor(c)) = self.decls.get(&rule.ctor_name) {
                                     if let Ok(major_ty) = self.infer_type_only(major) {
-                                        let mut ctor_ty = if c.level_params.is_empty() {
-                                            c.ty
-                                        } else {
-                                            let ls = self.arena.get_level_list(lvls_id);
-                                            let start = ls.len() - c.level_params.len();
-                                            if c.level_params.len() == 1 {
-                                                let l0 = ls[start];
-                                                self.inst_levels_cached(c.ty, &c.level_params, &[l0])
-                                            } else {
-                                                let ind_lvls: Box<[LevelId]> = ls[start..].into();
-                                                self.inst_levels_cached(c.ty, &c.level_params, &ind_lvls)
-                                            }
-                                        };
+                                        let ls = self.arena.get_level_list(lvls_id);
+                                        let ind_lvls: Box<[LevelId]> = ls[ls.len() - c.level_params.len()..].into();
+                                        let mut ctor_ty = self.inst_levels_cached(c.ty, &c.level_params, &ind_lvls);
                                         let mut ok = true;
                                         for i in 0..rec.num_params as usize {
                                             ctor_ty = self.whnf(ctor_ty);
@@ -348,17 +338,25 @@ impl<'a> TypeChecker<'a> {
         self.arena.app(of_list, list)
     }
 
+    /// The constructor form of `e` if it is a string literal.
+    fn str_lit_ctor(&mut self, e: ExprId) -> Option<ExprId> {
+        let ExprData::Lit(lid) = *self.arena.get_expr(e) else { return None };
+        let Literal::Str(s) = self.arena.get_lit(lid) else { return None };
+        let s = s.clone();
+        Some(self.expand_str_lit(&s))
+    }
+
     /// WHNF that also opens a string literal into its constructor form.
     fn whnf_lit_ctor(&mut self, e: ExprId) -> ExprId {
         let w = self.whnf(e);
-        if let ExprData::Lit(lid) = *self.arena.get_expr(w) {
-            if let Literal::Str(s) = self.arena.get_lit(lid) {
-                let s = s.clone();
-                let ex = self.expand_str_lit(&s);
-                return self.whnf(ex);
-            }
-        }
-        w
+        match self.str_lit_ctor(w) { Some(ex) => self.whnf(ex), None => w }
+    }
+
+    /// Is `n` the two-component name `ns.last`?
+    fn name_is(&self, n: NameId, ns: &str, last: &str) -> bool {
+        use crate::arena::NameData::Str;
+        matches!(self.arena.get_name(n), Str(p, s) if s.as_ref() == last
+            && matches!(self.arena.get_name(*p), Str(g, q) if *g == Arena::ANONYMOUS && q.as_ref() == ns))
     }
 
     /// Returns true if `e` is `eagerReduce _ _` (Lean's `is_eager_reduce`).
@@ -374,27 +372,13 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn is_bool_true(&self, e: ExprId) -> bool {
-        let ExprData::Const(name, lvls) = *self.arena.get_expr(e) else { return false };
-        if lvls != Arena::EMPTY_LEVELS { return false; }
-        let crate::arena::NameData::Str(p, s) = self.arena.get_name(name) else { return false };
-        if s.as_ref() != "true" { return false; }
-        matches!(
-            self.arena.get_name(*p),
-            crate::arena::NameData::Str(g, ps) if *g == Arena::ANONYMOUS && ps.as_ref() == "Bool"
-        )
+        matches!(*self.arena.get_expr(e), ExprData::Const(n, Arena::EMPTY_LEVELS) if self.name_is(n, "Bool", "true"))
     }
 
     fn is_nat_zero(&self, e: ExprId) -> bool {
         match *self.arena.get_expr(e) {
             ExprData::Lit(lid) => matches!(self.arena.get_lit(lid), Literal::Nat(n) if n.is_zero()),
-            ExprData::Const(name, lvls) if lvls == Arena::EMPTY_LEVELS => {
-                let crate::arena::NameData::Str(p, s) = self.arena.get_name(name) else { return false };
-                if s.as_ref() != "zero" { return false; }
-                matches!(
-                    self.arena.get_name(*p),
-                    crate::arena::NameData::Str(g, ps) if *g == Arena::ANONYMOUS && ps.as_ref() == "Nat"
-                )
-            }
+            ExprData::Const(n, Arena::EMPTY_LEVELS) => self.name_is(n, "Nat", "zero"),
             _ => false,
         }
     }
@@ -409,18 +393,7 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             },
             ExprData::App(f, a) => {
-                let ExprData::Const(name, lvls) = *self.arena.get_expr(f) else { return None };
-                if lvls != Arena::EMPTY_LEVELS { return None; }
-                let crate::arena::NameData::Str(p, s) = self.arena.get_name(name) else { return None };
-                if s.as_ref() != "succ" { return None; }
-                if matches!(
-                    self.arena.get_name(*p),
-                    crate::arena::NameData::Str(g, ps) if *g == Arena::ANONYMOUS && ps.as_ref() == "Nat"
-                ) {
-                    Some(a)
-                } else {
-                    None
-                }
+                matches!(*self.arena.get_expr(f), ExprData::Const(n, Arena::EMPTY_LEVELS) if self.name_is(n, "Nat", "succ")).then_some(a)
             }
             _ => None,
         }
@@ -453,33 +426,17 @@ impl<'a> TypeChecker<'a> {
         use crate::nat::{Nat, MAX_BITS};
         let len = spine.len();
         if len == 0 { return None; }
-        let crate::arena::NameData::Str(parent, seg) = self.arena.get_name(name) else { return None };
-        let crate::arena::NameData::Str(gp, pseg) = self.arena.get_name(*parent) else { return None };
-        if *gp != crate::arena::Arena::ANONYMOUS || pseg.as_ref() != "Nat" { return None; }
         // The operations Lean's kernel evaluates on literals (GMP there, `Nat` here).
-        let op: &'static str = match seg.as_ref() {
-            "succ" if allow_delta => "succ", "log2" => "log2",
-            "add" => "add", "sub" => "sub", "mul" => "mul", "pow" => "pow", "div" => "div", "mod" => "mod",
-            "gcd" => "gcd", "beq" => "beq", "ble" => "ble", "land" => "land", "lor" => "lor", "xor" => "xor",
-            "shiftLeft" => "shiftLeft", "shiftRight" => "shiftRight",
-            _ => return None,
-        };
+        const OPS: [&str; 16] = ["succ", "log2", "add", "sub", "mul", "pow", "div", "mod", "gcd", "beq", "ble",
+            "land", "lor", "xor", "shiftLeft", "shiftRight"];
+        let op = *OPS.iter().find(|&&o| self.name_is(name, "Nat", o))?;
+        if op == "succ" && !allow_delta { return None; }
         let as_nat = |tc: &mut Self, e: ExprId| -> Option<Nat> {
             let w = tc.whnf(e);
-            match *tc.arena.get_expr(w) {
-                ExprData::Lit(lid) => match tc.arena.get_lit(lid) {
-                    Literal::Nat(n) => Some(n.clone()),
-                    _ => None,
-                },
-                ExprData::Const(cn, _) => match tc.arena.get_name(cn) {
-                    crate::arena::NameData::Str(p, s) if s.as_ref() == "zero" => match tc.arena.get_name(*p) {
-                        crate::arena::NameData::Str(g, ps) if *g == crate::arena::Arena::ANONYMOUS && ps.as_ref() == "Nat" => Some(Nat::zero()),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
+            if let ExprData::Lit(lid) = *tc.arena.get_expr(w) {
+                if let Literal::Nat(n) = tc.arena.get_lit(lid) { return Some(n.clone()); }
             }
+            tc.is_nat_zero(w).then(Nat::zero)
         };
         // Match Lean's `whnf` vs `lazy_delta_reduction`: in `whnf` (`allow_delta == true`),
         // always try `reduce_nat` even when an argument syntactically mentions an opaque fvar
@@ -567,13 +524,11 @@ impl<'a> TypeChecker<'a> {
         if a == b { return Ok(true); }
         // Lean's reflection fast path (e.g. `decide` / `decide +kernel`): when comparing a closed
         // (or `eagerReduce`) term against `Bool.true`, reduce it directly via `whnf`.
-        if self.is_bool_true(b) && (self.eager_reduce || !self.has_opaque_fvar(a)) {
-            let w = self.whnf(a);
-            if self.is_bool_true(w) { return Ok(true); }
-        }
-        if self.is_bool_true(a) && (self.eager_reduce || !self.has_opaque_fvar(b)) {
-            let w = self.whnf(b);
-            if self.is_bool_true(w) { return Ok(true); }
+        for (t, s) in [(a, b), (b, a)] {
+            if self.is_bool_true(s) && (self.eager_reduce || !self.has_opaque_fvar(t)) {
+                let w = self.whnf(t);
+                if self.is_bool_true(w) { return Ok(true); }
+            }
         }
         a = self.whnf_no_delta(a);
         b = self.whnf_no_delta(b);
@@ -589,24 +544,11 @@ impl<'a> TypeChecker<'a> {
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
                 (ExprData::Pi { ty: t1, body: b1, .. }, ExprData::Pi { ty: t2, body: b2, .. }) => {
                     let (t1, b1, t2, b2) = (*t1, *b1, *t2, *b2);
-                    if !self.is_def_eq(t1, t2)? { return Ok(false); }
-                    let fv = self.push_local(t1, None);
-                    let fve = self.arena.fvar(fv);
-                    let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
-                    let res = self.is_def_eq(ib1, ib2);
-                    self.pop_local();
-                    return res;
+                    return Ok(self.is_def_eq(t1, t2)? && self.bodies_def_eq(t1, b1, b2)?);
                 }
                 (ExprData::Lam { ty: t1, body: b1, .. }, ExprData::Lam { ty: t2, body: b2, .. }) => {
                     let (t1, b1, t2, b2) = (*t1, *b1, *t2, *b2);
-                    if self.is_def_eq(t1, t2)? {
-                        let fv = self.push_local(t1, None);
-                        let fve = self.arena.fvar(fv);
-                        let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
-                        let res = self.is_def_eq(ib1, ib2)?;
-                        self.pop_local();
-                        if res { return Ok(true); }
-                    }
+                    if self.is_def_eq(t1, t2)? && self.bodies_def_eq(t1, b1, b2)? { return Ok(true); }
                     if !checked_proof {
                         if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
                             return self.is_def_eq(ta, tb);
@@ -665,11 +607,7 @@ impl<'a> TypeChecker<'a> {
                             }))
                         && self.heads_equal(ha, hb)
                     {
-                        let mut all_eq = true;
-                        for (&xa, &xb) in args_a.iter().zip(&args_b) {
-                            if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
-                        }
-                        if all_eq { return Ok(true); }
+                        if self.args_def_eq(&args_a, &args_b)? { return Ok(true); }
                     }
                     if pa >= pb { a = self.unfold_delta_app(va, ppa, la, &args_a); }
                     if pb >= pa { b = self.unfold_delta_app(vb, ppb, lb, &args_b); }
@@ -689,12 +627,8 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 (None, None) => {
-                    if args_a.len() == args_b.len() && self.heads_equal(ha, hb) {
-                        let mut all_eq = true;
-                        for (&xa, &xb) in args_a.iter().zip(&args_b) {
-                            if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
-                        }
-                        if all_eq { return Ok(true); }
+                    if args_a.len() == args_b.len() && self.heads_equal(ha, hb) && self.args_def_eq(&args_a, &args_b)? {
+                        return Ok(true);
                     }
                     let a2 = self.try_unfold_proj_app(a);
                     let b2 = self.try_unfold_proj_app(b);
@@ -706,26 +640,29 @@ impl<'a> TypeChecker<'a> {
                     if self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)? {
                         return Ok(true);
                     }
-                    if let ExprData::Lit(lid) = *self.arena.get_expr(a) {
-                        if let Literal::Str(sv) = self.arena.get_lit(lid) {
-                            let sv = sv.clone();
-                            let ex = self.expand_str_lit(&sv);
-                            a = self.whnf_no_delta(ex);
-                            continue;
-                        }
-                    }
-                    if let ExprData::Lit(lid) = *self.arena.get_expr(b) {
-                        if let Literal::Str(sv) = self.arena.get_lit(lid) {
-                            let sv = sv.clone();
-                            let ex = self.expand_str_lit(&sv);
-                            b = self.whnf_no_delta(ex);
-                            continue;
-                        }
-                    }
+                    if let Some(ex) = self.str_lit_ctor(a) { a = self.whnf_no_delta(ex); continue; }
+                    if let Some(ex) = self.str_lit_ctor(b) { b = self.whnf_no_delta(ex); continue; }
                     return Ok(self.try_unit_like(a, b)?);
                 }
             }
         }
+    }
+
+    /// Bodies of two binders with the same domain `ty`, opened with one fresh local.
+    fn bodies_def_eq(&mut self, ty: ExprId, b1: ExprId, b2: ExprId) -> Result<bool, KernelError> {
+        let fv = self.push_local(ty, None);
+        let fve = self.arena.fvar(fv);
+        let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
+        let res = self.is_def_eq(ib1, ib2);
+        self.pop_local();
+        res
+    }
+
+    fn args_def_eq(&mut self, xs: &[ExprId], ys: &[ExprId]) -> Result<bool, KernelError> {
+        for (&x, &y) in xs.iter().zip(ys) {
+            if !self.is_def_eq(x, y)? { return Ok(false); }
+        }
+        Ok(true)
     }
 
     fn try_fun_eta(&mut self, ty: ExprId, body: ExprId, other: ExprId) -> Result<bool, KernelError> {
