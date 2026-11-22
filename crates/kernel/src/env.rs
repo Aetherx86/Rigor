@@ -55,42 +55,26 @@ pub enum Declaration {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum QuotKind { Type, Ctor, Lift, Ind }
 
+/// The same field of whichever declaration kind `$d` is.
+macro_rules! decl_field {
+    ($d:expr, $f:ident) => {
+        match $d {
+            Declaration::Axiom { $f, .. } | Declaration::Definition { $f, .. } | Declaration::Theorem { $f, .. }
+            | Declaration::Opaque { $f, .. } | Declaration::Quot { $f, .. } => $f,
+            Declaration::Inductive(i) => &i.$f,
+            Declaration::Constructor(c) => &c.$f,
+            Declaration::Recursor(r) => &r.$f,
+        }
+    };
+}
+
 impl Declaration {
     #[inline]
-    pub fn name(&self) -> NameId {
-        match self {
-            Declaration::Axiom { name, .. } | Declaration::Definition { name, .. }
-            | Declaration::Theorem { name, .. } | Declaration::Opaque { name, .. }
-            | Declaration::Quot { name, .. } => *name,
-            Declaration::Inductive(i) => i.name,
-            Declaration::Constructor(c) => c.name,
-            Declaration::Recursor(r) => r.name,
-        }
-    }
-
+    pub fn name(&self) -> NameId { *decl_field!(self, name) }
     #[inline]
-    pub fn level_params(&self) -> &[NameId] {
-        match self {
-            Declaration::Axiom { level_params, .. } | Declaration::Definition { level_params, .. }
-            | Declaration::Theorem { level_params, .. } | Declaration::Opaque { level_params, .. }
-            | Declaration::Quot { level_params, .. } => level_params,
-            Declaration::Inductive(i) => &i.level_params,
-            Declaration::Constructor(c) => &c.level_params,
-            Declaration::Recursor(r) => &r.level_params,
-        }
-    }
-
+    pub fn level_params(&self) -> &[NameId] { decl_field!(self, level_params) }
     #[inline]
-    pub fn ty(&self) -> ExprId {
-        match self {
-            Declaration::Axiom { ty, .. } | Declaration::Definition { ty, .. }
-            | Declaration::Theorem { ty, .. } | Declaration::Opaque { ty, .. }
-            | Declaration::Quot { ty, .. } => *ty,
-            Declaration::Inductive(i) => i.ty,
-            Declaration::Constructor(c) => c.ty,
-            Declaration::Recursor(r) => r.ty,
-        }
-    }
+    pub fn ty(&self) -> ExprId { *decl_field!(self, ty) }
 
     #[inline]
     pub fn delta_value(&self) -> Option<(ExprId, u64)> {
