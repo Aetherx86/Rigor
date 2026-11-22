@@ -214,3 +214,4 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
 - 2026-11-22 (A, hourly check): compute_expr_meta via join/bound helpers: 2,661 -> 2,645; tests, Init + Std CHECK_OK, mutation round 7 (28) all rejected. Gemini quota still out.
   Round 7 note: the 1 accepted mutant (#22, BitVec.DivModState.Poised Prop -> Type 0) is also accepted by the previous commit 7765f98 with the same seed, so not a regression; harmless class as in round 2 (a structure only used as a theorem hypothesis, whose Pi still lands in Prop).
 - 2026-11-22 (A, hourly check): Declaration name/level_params/ty via decl_field! macro: 2,645 -> 2,629; tests, Init + Std CHECK_OK. Gemini quota still out. ~130 lines to < 2,500.
+- 2026-11-23 (A, hourly check): single beta loop in whnf_spine_with: 2,629 -> 2,619; tests, Init 8.3 s + Std 11.6 s CHECK_OK. Gemini quota still out. ~120 lines to < 2,500.
