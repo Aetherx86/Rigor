@@ -61,15 +61,6 @@ fn lvls_eq(arena: &mut Arena, a: &[LevelId], b: &[LevelId]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| level_eq(arena, x, y))
 }
 
-/// Instantiate the leading Pi binders of `e` (after whnf) with `args`.
-fn inst_pis(tc: &mut TypeChecker<'_>, mut e: ExprId, args: &[ExprId]) -> ExprId {
-    for &a in args {
-        e = tc.whnf(e);
-        if let ExprData::Pi { body, .. } = *tc.arena.get_expr(e) { e = instantiate1(tc.arena, body, a); }
-    }
-    e
-}
-
 /// Open up to `max` leading Pi binders of `e` as new locals; returns them and the (whnf) rest.
 fn open_pis(tc: &mut TypeChecker<'_>, mut e: ExprId, max: usize) -> (Vec<Binder>, ExprId) {
     let mut bs = Vec::new();
@@ -181,7 +172,7 @@ pub fn check_inductive_block(
                 let mut tc = TypeChecker::new(&work_decls, arena);
                 let (p_fvs, _) = open_pis(&mut tc, all_types[0].ty, spec.num_params as usize);
                 let p_fve: Vec<ExprId> = p_fvs.iter().map(|b| tc.arena.fvar(b.fv)).collect();
-                let mut cur = inst_pis(&mut tc, orig_cty, &p_fve);
+                let mut cur = tc.inst_pis(orig_cty, &p_fve).0;
                 let mut fields = Vec::new();
                 let mut new_aux_to_add: Vec<(InductiveTypeSpec, ParsedInd, NestedAux)> = Vec::new();
                 loop {
@@ -225,7 +216,7 @@ pub fn check_inductive_block(
                                                 let aux_app = tc.arena.app_n(aux_head, &p_fve);
                                                 // Build auxiliary type: instantiate `ji.ty` with `jlvls` & `args[..jnp]`, wrap `p_fvs`.
                                                 let jty = instantiate_level_params(tc.arena, ji.ty, &ji.level_params, &jlvls);
-                                                let jty = inst_pis(&mut tc, jty, &args[..jnp]);
+                                                let jty = tc.inst_pis(jty, &args[..jnp]).0;
                                                 let mut j_indices = Vec::new();
                                                 let mut jc = jty;
                                                 let j_res_lvl = loop {
@@ -247,7 +238,7 @@ pub fn check_inductive_block(
                                                 for (k, &orig_cn) in ji.ctors.iter().enumerate() {
                                                     let Some(Declaration::Constructor(oc)) = decls.get(&orig_cn) else { continue };
                                                     let octy = instantiate_level_params(tc.arena, oc.ty, &oc.level_params, &jlvls);
-                                                    let octy = inst_pis(&mut tc, octy, &args[..jnp]);
+                                                    let octy = tc.inst_pis(octy, &args[..jnp]).0;
                                                     let octy = replace_expr(tc.arena, octy, orig_app, aux_app);
                                                     let aux_cn = tc.arena.name_num(an, k as u64);
                                                     let aux_cty = wrap(tc.arena, &p_fvs, octy, true);
@@ -314,7 +305,7 @@ pub fn check_inductive_block(
     let (param_fvs, _) = open_pis(&mut tc, all_types[0].ty, spec.num_params as usize);
     let param_fve: Vec<ExprId> = param_fvs.iter().map(|p| tc.arena.fvar(p.fv)).collect();
     for p in &mut parsed_inds {
-        let c = inst_pis(&mut tc, p.ty, &param_fve);
+        let c = tc.inst_pis(p.ty, &param_fve).0;
         p.indices = open_pis(&mut tc, c, usize::MAX).0;
         for _ in &p.indices { tc.pop_local(); }
     }

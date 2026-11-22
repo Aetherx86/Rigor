@@ -224,14 +224,9 @@ impl<'a> TypeChecker<'a> {
             _ => return Err(err("expression type does not match structure")),
         };
 
-        let mut cur = instantiate_level_params(self.arena, ctor.ty, &ctor.level_params, &lvls);
-        for &p_arg in &args {
-            cur = self.whnf(cur);
-            match self.arena.get_expr(cur) {
-                ExprData::Pi { body, .. } => cur = instantiate1(self.arena, *body, p_arg),
-                _ => unreachable!("constructor parameter telescope mismatch"),
-            }
-        }
+        let ctor_ty = instantiate_level_params(self.arena, ctor.ty, &ctor.level_params, &lvls);
+        let (mut cur, complete) = self.inst_pis(ctor_ty, &args);
+        assert!(complete, "constructor parameter telescope mismatch");
         for field_i in 0..=idx {
             cur = self.whnf(cur);
             match self.arena.get_expr(cur) {
@@ -278,6 +273,20 @@ impl<'a> TypeChecker<'a> {
             return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
         }
         Ok(())
+    }
+
+    /// Instantiate the leading Pi binders of `e` (after whnf) with `args`; the flag is false if
+    /// `e` had fewer binders than arguments (the missing ones are skipped).
+    pub(crate) fn inst_pis(&mut self, mut e: ExprId, args: &[ExprId]) -> (ExprId, bool) {
+        let mut complete = true;
+        for &a in args {
+            e = self.whnf(e);
+            match *self.arena.get_expr(e) {
+                ExprData::Pi { body, .. } => e = instantiate1(self.arena, body, a),
+                _ => complete = false,
+            }
+        }
+        (e, complete)
     }
 
     /// Run `f` on `body` opened with a new local of type `ty` (and value `val`), then drop the local.

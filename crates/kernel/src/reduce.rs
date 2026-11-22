@@ -179,17 +179,9 @@ impl<'a> TypeChecker<'a> {
                                     if let Ok(major_ty) = self.infer_type_only(major) {
                                         let ls = self.arena.get_level_list(lvls_id);
                                         let ind_lvls: Box<[LevelId]> = ls[ls.len() - c.level_params.len()..].into();
-                                        let mut ctor_ty = self.inst_levels_cached(c.ty, &c.level_params, &ind_lvls);
-                                        let mut ok = true;
-                                        for i in 0..rec.num_params as usize {
-                                            ctor_ty = self.whnf(ctor_ty);
-                                            if let ExprData::Pi { body, .. } = self.arena.get_expr(ctor_ty) {
-                                                ctor_ty = instantiate1(self.arena, *body, spine[len - 1 - i]);
-                                            } else {
-                                                ok = false;
-                                                break;
-                                            }
-                                        }
+                                        let ctor_ty = self.inst_levels_cached(c.ty, &c.level_params, &ind_lvls);
+                                        let params: Vec<ExprId> = (0..rec.num_params as usize).map(|i| spine[len - 1 - i]).collect();
+                                        let (ctor_ty, ok) = self.inst_pis(ctor_ty, &params);
                                         if ok && self.is_def_eq(major_ty, ctor_ty).unwrap_or(false) {
                                             cur = self.inst_levels_list(rule.rhs, &rec.level_params, lvls_id);
                                             spine.drain(len - 1 - major_idx..len - prefix_end);
