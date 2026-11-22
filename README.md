@@ -1,28 +1,64 @@
 # Rigor
 
-A mathematically sound, high-performance dependent type theory proof kernel (Calculus of Inductive Constructions, Lean 4 `lean4export`-compatible) written in pure, safe Rust.
+An independent proof checker for Lean 4, written in safe Rust. Rigor reads the `lean4export`
+NDJSON export of a Lean library and re-checks every declaration with its own small kernel
+(the Calculus of Inductive Constructions as Lean implements it). A proof is trusted only when
+this second kernel agrees with Lean's.
 
-## Design Principles
+Live demo: <https://aetherx86.github.io/rigor/> runs the same kernel, compiled to WebAssembly, on
+Lean's `Init.Prelude` in the browser, and shows it rejecting a tampered proof.
 
-1. **Small Trusted Computing Base (De Bruijn Criterion):** The entire proof kernel lives in `crates/kernel` with `#![forbid(unsafe_code)]`, zero third-party dependencies, and a target budget under 2,500 lines of auditable Rust.
-2. **Logical Soundness:** Predicative universe hierarchy (`Prop : Type 0 : Type 1 ...`) with impredicative `Prop` (`imax`), universe polymorphism, strict positivity checking, predicative inductive universe bounds, Subsingleton large-elimination guards (including on `Proj`), quotient primitives (`Quot`, `Quot.mk`, `Quot.lift`, `Quot.ind`), and definitional equality (beta, delta, iota, K-like, zeta, quotient, `Nat` literals, proof irrelevance in `Prop`, function and structure eta).
-3. **Performance Architecture:**
-   - **Flat Hash-Consed DAG Arenas:** `Name`, `Level`, and `Expr` are interned in contiguous `u32`-indexed arenas with $O(1)$ structural equality and precomputed `loose_bvar_range` / flag metadata.
-   - **Two-Tier Lock-Free Scratch Arenas:** Global declarations live in an immutable `Arc<Arena>`; worker threads type-check independent declarations in parallel using isolated thread-local scratch arenas with zero locking and $O(1)$ teardown.
-   - **Spine-Based WHNF & DAG Memoization:** Arguments are accumulated on an explicit spine to perform batched multi-substitution, paired with height-ordered delta unfolding and per-check WHNF/DefEq/type caches.
+## Results
 
-## Workspace Layout
+Lean v4.36.0-rc1 exports on an Apple M4 MacBook Air (10 cores), peak memory from `/usr/bin/time -l`:
 
-- `crates/kernel`: The Trusted Computing Base (`#![forbid(unsafe_code)]`, zero third-party deps, < 2,500 SLOC): arena, universe levels, expressions, environment, inductive validator, reducer/def-eq, bidirectional type checker.
-- `crates/parser`: Streaming zero-copy-token `lean4export` format parser supporting all 22 directives (`#NS`, `#NI`, `#US`, `#UM`, `#UIM`, `#UP`, `#EV`, `#ES`, `#EC`, `#EA`, `#EL`, `#EP`, `#EZ`, `#EJ`, `#ELN`, `#ELS`, `#AX`, `#DEF`, `#THM`, `#OPAQ`, `#QUOT`, `#IND`), plus mutual `#INDM` and v3 `#IND`/`#CTOR`/`#REC`.
-- `crates/bench`: Micro-benchmarks and head-to-head `lean4checker` harness.
+| Library | Declarations | `leanchecker --fresh` | Rigor, parallel | Rigor, one thread |
+| :--- | ---: | ---: | ---: | ---: |
+| `Init` | 58,546 | 28.7 s, 547 MB | 7.8 s, 478 MB | 25.1 s, 404 MB |
+| `Std` | 96,626 | 44.2 s, 928 MB | 11.9 s, 696 MB | 44.9 s, 567 MB |
 
-## Build, Test, and Benchmark
+Rigor's times include parsing the NDJSON export (332 MiB for `Init`, 532 MiB for `Std`);
+`leanchecker` reads compiled `.olean` files. Details and history: [BENCHMARKS.md](BENCHMARKS.md).
+
+## What the kernel checks
+
+- Universe levels with impredicative `Prop`, universe polymorphism and parameter checks.
+- Inductive types, including mutual and nested ones: strict positivity, universe bounds,
+  large-elimination rules (a field must be one of the result indices, as in Lean), and
+  recursors that Rigor generates itself rather than reading from the export.
+- Definitional equality: beta, delta (height-ordered, lazy), zeta, iota, K-like reduction,
+  quotients, projections, proof irrelevance, eta for functions and structures, unit-like types,
+  `Nat` literals with Lean's arithmetic extensions (big integers), string literals, the
+  `Bool.true` reflection fast path and `eagerReduce`, following Lean's `type_checker.cpp`.
+
+## Design
+
+- `crates/kernel` is the trusted part: about 2,900 lines with `#![forbid(unsafe_code)]` and no
+  third-party crates. Expressions are hash-consed into 16-byte nodes in an arena; worker threads
+  check independent declarations in parallel against a shared read-only arena.
+- `crates/parser` reads `lean4export` 3.x NDJSON (and the older text format) and admits
+  declarations through the kernel.
+- `crates/bench` is the command-line checker (`rigor-bench --check <file>`).
+- `web/` builds the browser demo (`wasm-bindgen`, single-threaded).
+- `tools/mutation/` corrupts exports on purpose and re-checks them. Over four rounds and 1,482
+  mutants (swapped proofs, universe changes, broken definitions, altered inductive types), every
+  mutant that changes meaning was rejected; the few accepted ones are provably harmless and are
+  explained in `tools/mutation/REPORT.md`.
+
+## Usage
 
 ```sh
 cargo test --workspace
-cargo run --release -p rigor-bench
-./crates/bench/run_head_to_head.sh /tmp/rigor_bench
+cargo build --release -p rigor-bench
+./target/release/rigor-bench --check Init.ndjson          # parallel, all cores
+RIGOR_SEQUENTIAL=1 ./target/release/rigor-bench --check Init.ndjson
+RIGOR_THREADS=4 ./target/release/rigor-bench --check Init.ndjson
+RIGOR_TRACE=1000 ./target/release/rigor-bench --check Std.ndjson   # report declarations over 1 s
 ```
 
-See [BENCHMARKS.md](BENCHMARKS.md) for detailed throughput, Peak RSS, computational stress test, and profiling results.
+Exports come from [lean4export](https://github.com/leanprover/lean4export):
+`lake env lean4export Init > Init.ndjson`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
