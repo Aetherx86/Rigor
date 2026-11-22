@@ -94,24 +94,15 @@ impl<'a> TypeChecker<'a> {
                     spine.push(a);
                     cur = f;
                 }
-                ExprData::Lam { body, .. } if !spine.is_empty() => {
-                    let mut body = *body;
-                    let first = spine.pop().unwrap();
-                    if spine.is_empty() {
-                        cur = instantiate1(self.arena, body, first);
-                    } else {
-                        let mut args = Vec::with_capacity(spine.len() + 1);
-                        args.push(first);
-                        while !spine.is_empty() {
-                            if let ExprData::Lam { body: next, .. } = self.arena.get_expr(body) {
-                                body = *next;
-                                args.push(spine.pop().unwrap());
-                            } else {
-                                break;
-                            }
-                        }
-                        cur = instantiate_rev(self.arena, body, &args);
+                ExprData::Lam { .. } if !spine.is_empty() => {
+                    // beta-reduce as many leading lambdas as there are arguments, in one substitution
+                    let (mut body, mut args) = (cur, Vec::new());
+                    while let (ExprData::Lam { body: next, .. }, Some(&a)) = (self.arena.get_expr(body), spine.last()) {
+                        body = *next;
+                        args.push(a);
+                        spine.pop();
                     }
+                    cur = instantiate_rev(self.arena, body, &args);
                 }
                 ExprData::Let { val, body, .. } => {
                     let (val, body) = (*val, *body);
