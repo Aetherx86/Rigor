@@ -201,3 +201,9 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
   main and v0.1.0. NEXT (A, or gem after its quota resets ~2026-11-28): ~284 more lines to < 2,500:
   hash.rs (56), nat.rs (208), level.rs (137), inductive.rs recursor builders (major_ty built twice,
   motive/minor loops), reduce.rs K-rule block; then MEMORY.md plan. Keep each step verified.
+- 2026-11-22 19:20 KST (A, hourly check; Gemini quota still out): ecd6b31 hash.rs + nat.rs compaction
+  with a new 20,000-case randomized Nat test against u128 (-> 2,671); then structure()/major_type helpers
+  (2,670). All verified: tests, Init 7.8 s / 477 MB, Std 11.0 s / 689 MB. ~171 lines left to < 2,500.
+  Remaining duplication is small; what is left is mostly long match arms in reduce.rs (whnf_spine_with
+  K/iota block) and inductive.rs nested-inductive discovery. Next: extract the K-rule and iota steps of
+  whnf_spine_with into methods, flatten the nested-aux discovery in inductive.rs; mutation round after.
