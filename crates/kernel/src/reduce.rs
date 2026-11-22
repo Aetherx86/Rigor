@@ -151,13 +151,13 @@ impl<'a> TypeChecker<'a> {
                             if len <= major_idx {
                                 break;
                             }
-                            let mut major = self.whnf_lit_ctor(spine[len - 1 - major_idx]);
-                            if let ExprData::Lit(lid) = *self.arena.get_expr(major) {
-                                if let Literal::Nat(k) = self.arena.get_lit(lid) {
-                                    let k = k.clone();
-                                    major = self.expand_nat_lit(&k);
-                                }
-                            }
+                            // As in Lean's `inductive_reduce_rec`: for K-like recursors (e.g. `Eq.rec`) first
+                            // try to replace the major premise by the constructor using its type alone
+                            // (`to_cnstr_when_K`), and only then reduce it. Reducing first would unfold the
+                            // proof itself, which can be arbitrarily expensive (e.g. `Nat.eq_of_beq_eq_true`
+                            // on 13-digit numbers in `decide +kernel` proofs).
+                            let raw_major = spine[len - 1 - major_idx];
+                            let major = raw_major;
                             if rec.k && rec.rules.len() == 1 && rec.rules[0].num_fields == 0 {
                                 let rule = &rec.rules[0];
                                 if let Some(Declaration::Constructor(c)) = self.decls.get(&rule.ctor_name) {
@@ -191,6 +191,13 @@ impl<'a> TypeChecker<'a> {
                                             continue;
                                         }
                                     }
+                                }
+                            }
+                            let mut major = self.whnf_lit_ctor(raw_major);
+                            if let ExprData::Lit(lid) = *self.arena.get_expr(major) {
+                                if let Literal::Nat(k) = self.arena.get_lit(lid) {
+                                    let k = k.clone();
+                                    major = self.expand_nat_lit(&k);
                                 }
                             }
                             let (mut mhead, mut margs) = self.app_spine(major);

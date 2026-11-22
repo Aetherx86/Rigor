@@ -84,6 +84,7 @@ agent must be able to continue from this file alone.
 - 2026-11-22 06:40 KST (A): machine rebooted at 06:35, /tmp wiped (exports and /tmp/lean4-tools gone; the Std check was killed at line 10M of 10.1M with no rejection so far). Rebuilding lean4export in ~/rigor-data. NEXT: regenerate exports to ~/rigor-data/exports, re-run Std check; gem: review ~/ChronosVault (3 new commits 1ba83cb..45c39c7 by another tool); agy-mut: Task E (TCB reduction plan, read-only) was interrupted, redo.
 - 2026-11-22 06:45 KST (A): lean4export rebuilt in ~/rigor-data; exports regenerated in ~/rigor-data/exports (Init 6,495,289 lines, Std 10,123,003). Std check restarted (log ~/rigor-data/std_trace.log, result ~/rigor-data/std_check.log). gem: ChronosVault review; agy-mut: Task E.
 - 2026-11-22 06:42 KST (gem): ChronosVault review (~/ChronosVault, commits 1ba83cb, 8e75bce, 45c39c7) done. Working tree clean; no files changed. All 7 checks PASS: test:core (23/23), build:wasm, typecheck, eslint src, build, npm test (27/27), test:browser (17/17, 0 console errors). Security checks clean (no share/key/entropy/mnemonic logging, Share 3B client-sealed with heir passphrase, Testnet4-only enforced, no emoji/AI mentions/secrets). Noted concerns: proactive rotation overwrites local Share 1 before server rotateVault succeeds and leaves existing Share 3B stale until heir is re-registered; GET /api/vault/activity exposes cosine similarities unauthenticated; offline verifier HTML reads iterations without bounds check.
+- 2026-11-22 06:44 KST (gem, coordinator): Step 4 done — recorded ChronosVault review outcome in ~/ChronosVault/Worklog.md, committed (a50785c) and pushed to origin/main. Checking running Std check (PID 8125, ~5 min elapsed, 261% CPU, 3.16 GB RSS).
 
 ## TAKEOVER (A is out of usage, 2026-11-22 07:00 KST): gem becomes coordinator
 gem: after finishing your current ChronosVault review, act as coordinator (the role A had). Do these in order,
@@ -119,3 +120,32 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
      if the other agent is rate-limited or gone, keep working yourself and log it.
 - Stop the cycle only when every item in TAKEOVER and every NEXT in the Log is done and verified; then write
   "ALL DONE" with a final summary at the end of the Log.
+- 2026-11-22 09:05 KST (A): Std check hung near its end (passed line 10M of 10.1M, killed by timeout, exit 143); gem is debugging it (a Nat.rec countdown loop; editing crates/kernel/src/reduce.rs, uncommitted). agy-mut finished Task E (tools/tcb/PLAN.md: 753 SLOC of low-risk savings, 3,155 -> 2,402) and was restarted with --dangerously-skip-permissions; next for agy-mut: Task B round 3 (Init.ndjson mutants, tools only). PLAN.md implementation waits until gem has finished in reduce.rs.
+
+- 2026-11-22 11:28 KST (agy-mut): Task B round 3 in progress: upgraded ~/rigor/tools/mutation/mutate.py for 6.5M-line Init.ndjson (mmap-backed LazyExprStore, O(log N) candidate selection, streaming binary mutant emission, and sound two-stage `--truncate` mode that truncates right after the mutated decl + direct dependents and automatically re-verifies any Stage-1 accept against the full un-truncated file); smoke-tested on Init.Prelude (21 mutants in 0.77s). Next: running Round 3 on ~/rigor-data/exports/Init.ndjson (seed=3, per-op=20, 140 mutants total), then reviewing every accepted mutant and appending Round 3 to ~/rigor/tools/mutation/REPORT.md.
+- 2026-11-22 10:45 KST (A, coordinator turn): Std investigation.
+  * The Std hang is in `_private.Std.Time.Time.Unit.Basic.0.Std.Time.Nanosecond.Offset.ofHours._proof_1`
+    (Std.ndjson line 2,035,582; source Std/Time/Time/Unit/Basic.lean:84, `by decide +kernel` over Rat with
+    3600000000000). A cut file ending at that declaration is ~/rigor-data/exports/std_head.ndjson (sequential
+    check hangs at its last line; use `RIGOR_SEQUENTIAL=1 timeout 120 ...`).
+  * leanchecker --fresh Std (measured by gem): 44.18 s, 927.5 MB peak RSS.
+  * First cause found and fixed (committed): K-like recursors (Eq.rec) reduced the major premise before trying
+    `to_cnstr_when_K`, so the proof `Nat.eq_of_beq_eq_true` was unfolded over 13-digit numbers. Now the K
+    replacement is tried on the unreduced major first, as in Lean's inductive_reduce_rec. Tests 25/25, Init OK.
+  * Still hangs after that: now `Nat.sub` is unfolded structurally via `Nat.brecOn` (counting down) inside
+    Rat/Int comparisons (`Rat.mk'`, `Int.instLTInt`, `Int.instLEInt` appear just before). Lean avoids this.
+    Lean source with the relevant code: ~/rigor-data/lean-src/type_checker.cpp. Leads:
+    (1) Lean's `is_def_eq_core` reflection fast path (line ~1134): if `t` has no fvars (or eager mode) and `s`
+        is `Bool.true`, `whnf(t)` and compare; Rigor has no such path.
+    (2) `eagerReduce` mode (lines 169-180, 1056): an app argument `eagerReduce _ _` turns on eager mode in which
+        reduce_nat and the reflection path also apply to terms WITH free variables.
+    (3) Lean's whnf calls reduce_nat with NO free-variable guard (lines 725-735); the guard is only in
+        lazy_delta_reduction (1056). Rigor's `has_opaque_fvar` guard sits inside whnf's try_reduce_nat; consider
+        matching Lean exactly (guard only in def-eq lazy delta, plus eager mode).
+    (4) Lean's lazy_delta_reduction tries reduce_nat on both sides before unfolding (1056-1062).
+    Plan: implement (1)-(4) to match Lean, add regression tests, re-run std_head, then full Std and Init.
+  * gem's earlier debug instrumentation (countdown detector) is in `git stash` ("gem debug instrumentation").
+  * Task E plan (agy-mut) is in tools/tcb/PLAN.md: 753 SLOC of low-risk savings (3,155 -> 2,402). Implement
+    after Std passes, one item at a time with tests + full Init check.
+  NEXT (gem, coordinator): leads (1)-(4) above until std_head and full Std pass; record Std time/RSS vs
+  leanchecker 44.18 s / 927.5 MB; then Task E; hand back to claude-lead per CYCLE when done or near a limit.
