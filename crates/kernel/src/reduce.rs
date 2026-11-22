@@ -194,22 +194,8 @@ impl<'a> TypeChecker<'a> {
                             if rec.rules.len() == 1 && rec.all.len() == 1 && rec.num_indices == 0
                                 && !matches!(self.arena.get_expr(mhead), ExprData::Const(cn, _) if *cn == rec.rules[0].ctor_name || *cn == name)
                             {
-                                if let Some(ind) = self.structure(rec.all[0]) {
-                                    if !ind.is_prop {
-                                        if let Ok(mty) = self.infer_type_only(major) {
-                                            let mty_w = self.whnf(mty);
-                                            let (th, ta) = self.app_spine(mty_w);
-                                            if let ExprData::Const(tn, tls) = *self.arena.get_expr(th) {
-                                                if tn == ind.name && ta.len() == ind.num_params as usize {
-                                                    mhead = self.arena.intern_expr(ExprData::Const(ind.ctors[0], tls));
-                                                    margs = ta;
-                                                    for fi in 0..rec.rules[0].num_fields {
-                                                        margs.push(self.arena.proj(ind.name, fi, major));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                if let Some((h, a)) = self.structure_ctor_form(rec.all[0], major, rec.rules[0].num_fields) {
+                                    (mhead, margs) = (h, a);
                                 }
                             }
                             if let ExprData::Const(cname, _) = self.arena.get_expr(mhead) {
@@ -683,6 +669,18 @@ impl<'a> TypeChecker<'a> {
             if !self.is_def_eq(args[c.num_params as usize + fi as usize], rhs)? { return Ok(false); }
         }
         Ok(true)
+    }
+
+    /// `S.mk params (x.0) ... (x.n-1)` for `x : S params` when `S` is a non-Prop structure.
+    fn structure_ctor_form(&mut self, s: NameId, x: ExprId, num_fields: u32) -> Option<(ExprId, Vec<ExprId>)> {
+        let ind = self.structure(s).filter(|i| !i.is_prop)?;
+        let ty = self.infer_type_only(x).ok()?;
+        let ty = self.whnf(ty);
+        let (head, mut args) = self.app_spine(ty);
+        let ExprData::Const(tn, tls) = *self.arena.get_expr(head) else { return None };
+        if tn != ind.name || args.len() != ind.num_params as usize { return None; }
+        args.extend((0..num_fields).map(|fi| self.arena.proj(ind.name, fi, x)));
+        Some((self.arena.intern_expr(ExprData::Const(ind.ctors[0], tls)), args))
     }
 
     /// `name` as a structure: a non-recursive, non-mutual inductive with one constructor and no indices.
