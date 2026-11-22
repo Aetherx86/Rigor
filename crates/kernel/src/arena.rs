@@ -322,37 +322,22 @@ impl Arena {
         id
     }
     fn compute_expr_meta(&self, data: &ExprData) -> ExprMeta {
-        match data {
+        let m = |e: ExprId| self.get_expr_meta(e);
+        let lp = |l: LevelId| if self.get_level_meta(l).has_param { FLAG_HAS_LEVEL_PARAM } else { 0 };
+        let join = |a: ExprMeta, b: ExprMeta| ExprMeta { loose_bvar_range: a.loose_bvar_range.max(b.loose_bvar_range), flags: a.flags | b.flags };
+        // a binder's body: its bound variable is no longer loose
+        let bound = |b: ExprMeta| ExprMeta { loose_bvar_range: b.loose_bvar_range.saturating_sub(1), ..b };
+        let leaf = |flags: u8| ExprMeta { loose_bvar_range: 0, flags };
+        match *data {
             ExprData::BVar(idx) => ExprMeta { loose_bvar_range: idx.saturating_add(1), flags: 0 },
-            ExprData::FVar(_) => ExprMeta { loose_bvar_range: 0, flags: FLAG_HAS_FVAR },
-            ExprData::Sort(l) => ExprMeta {
-                loose_bvar_range: 0,
-                flags: if self.get_level_meta(*l).has_param { FLAG_HAS_LEVEL_PARAM } else { 0 },
-            },
-            ExprData::Const(_, lvls) => ExprMeta {
-                loose_bvar_range: 0,
-                flags: if self.get_level_list(*lvls).iter().any(|&l| self.get_level_meta(l).has_param) { FLAG_HAS_LEVEL_PARAM } else { 0 },
-            },
-            ExprData::App(f, a) => {
-                let (mf, ma) = (self.get_expr_meta(*f), self.get_expr_meta(*a));
-                ExprMeta { loose_bvar_range: mf.loose_bvar_range.max(ma.loose_bvar_range), flags: mf.flags | ma.flags }
-            }
-            ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
-                let (mt, mb) = (self.get_expr_meta(*ty), self.get_expr_meta(*body));
-                ExprMeta {
-                    loose_bvar_range: mt.loose_bvar_range.max(mb.loose_bvar_range.saturating_sub(1)),
-                    flags: mt.flags | mb.flags,
-                }
-            }
-            ExprData::Let { ty, val, body, .. } => {
-                let (mt, mv, mb) = (self.get_expr_meta(*ty), self.get_expr_meta(*val), self.get_expr_meta(*body));
-                ExprMeta {
-                    loose_bvar_range: mt.loose_bvar_range.max(mv.loose_bvar_range).max(mb.loose_bvar_range.saturating_sub(1)),
-                    flags: mt.flags | mv.flags | mb.flags,
-                }
-            }
-            ExprData::Lit(_) => ExprMeta { loose_bvar_range: 0, flags: 0 },
-            ExprData::Proj { expr, .. } => self.get_expr_meta(*expr),
+            ExprData::FVar(_) => leaf(FLAG_HAS_FVAR),
+            ExprData::Sort(l) => leaf(lp(l)),
+            ExprData::Const(_, ls) => leaf(self.get_level_list(ls).iter().fold(0, |f, &l| f | lp(l))),
+            ExprData::App(f, a) => join(m(f), m(a)),
+            ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => join(m(ty), bound(m(body))),
+            ExprData::Let { ty, val, body } => join(join(m(ty), m(val)), bound(m(body))),
+            ExprData::Lit(_) => leaf(0),
+            ExprData::Proj { expr, .. } => m(expr),
         }
     }
     #[inline]
