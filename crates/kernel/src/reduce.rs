@@ -285,21 +285,10 @@ impl<'a> TypeChecker<'a> {
 
     #[inline]
     fn expand_nat_lit(&mut self, k: &crate::nat::Nat) -> ExprId {
-        if k.is_zero() {
-            if let Some(z) = self.nat_zero { z } else {
-                let z = self.arena.const_path("Nat.zero", []);
-                self.nat_zero = Some(z);
-                z
-            }
-        } else {
-            let succ = if let Some(s) = self.nat_succ { s } else {
-                let s = self.arena.const_path("Nat.succ", []);
-                self.nat_succ = Some(s);
-                s
-            };
-            let pred = self.arena.lit_nat_big(k.sub(&crate::nat::Nat::from_u128(1)));
-            self.arena.app(succ, pred)
-        }
+        if k.is_zero() { return *self.nat_zero.get_or_insert_with(|| self.arena.const_path("Nat.zero", [])); }
+        let succ = *self.nat_succ.get_or_insert_with(|| self.arena.const_path("Nat.succ", []));
+        let pred = self.arena.lit_nat_big(k.sub(&crate::nat::Nat::from_u128(1)));
+        self.arena.app(succ, pred)
     }
 
     /// Lean 4 kernel string literal expansion: `"ab"` is definitionally
