@@ -132,71 +132,52 @@ where
     res
 }
 
-pub fn expr_mentions_any_const(arena: &Arena, e: ExprId, targets: &[NameId]) -> bool {
-    let mut visited = FxHashSet::default();
-    mentions_rec(arena, e, targets, &mut visited)
+/// Replace every occurrence of the closed term `from` by `to` (nested inductive lowering).
+pub(crate) fn replace_expr(arena: &mut Arena, e: ExprId, from: ExprId, to: ExprId) -> ExprId {
+    let (mut cache, mut steps) = (None, 0u32);
+    map_children(arena, e, 0, &mut steps, &mut cache, &mut |_, node, _| (node == from).then_some(to))
 }
 
-fn mentions_rec(arena: &Arena, e: ExprId, targets: &[NameId], visited: &mut FxHashSet<ExprId>) -> bool {
-    if !visited.insert(e) { return false; }
-    match arena.get_expr(e) {
-        ExprData::Const(name, _) => targets.contains(name),
-        ExprData::App(f, a) => mentions_rec(arena, *f, targets, visited) || mentions_rec(arena, *a, targets, visited),
-        ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
-            mentions_rec(arena, *ty, targets, visited) || mentions_rec(arena, *body, targets, visited)
+/// Whether `hit` holds for some subexpression of `e` (each shared node visited once); subtrees for
+/// which `skip` holds are not entered.
+pub(crate) fn any_subexpr(arena: &Arena, e: ExprId, skip: impl Fn(&Arena, ExprId) -> bool, mut hit: impl FnMut(&ExprData) -> bool) -> bool {
+    let (mut seen, mut stack) = (FxHashSet::default(), vec![e]);
+    while let Some(e) = stack.pop() {
+        if skip(arena, e) || !seen.insert(e) { continue; }
+        let d = arena.get_expr(e);
+        if hit(d) { return true; }
+        match *d {
+            ExprData::App(f, a) => stack.extend([f, a]),
+            ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => stack.extend([ty, body]),
+            ExprData::Let { ty, val, body } => stack.extend([ty, val, body]),
+            ExprData::Proj { expr, .. } => stack.push(expr),
+            ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Sort(_) | ExprData::Const(..) | ExprData::Lit(_) => {}
         }
-        ExprData::Let { ty, val, body, .. } => {
-            mentions_rec(arena, *ty, targets, visited) || mentions_rec(arena, *val, targets, visited) || mentions_rec(arena, *body, targets, visited)
-        }
-        ExprData::Proj { struct_name, expr, .. } => targets.contains(struct_name) || mentions_rec(arena, *expr, targets, visited),
-        ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Sort(_) | ExprData::Lit(_) => false,
     }
+    false
+}
+
+pub fn expr_mentions_any_const(arena: &Arena, e: ExprId, targets: &[NameId]) -> bool {
+    any_subexpr(arena, e, |_, _| false, |d| match d {
+        ExprData::Const(n, _) | ExprData::Proj { struct_name: n, .. } => targets.contains(n),
+        _ => false,
+    })
 }
 
 pub fn expr_mentions_fvar(arena: &Arena, e: ExprId, fvar: FVarId) -> bool {
-    if !arena.get_expr_meta(e).has_fvar() { return false; }
-    let mut visited = FxHashSet::default();
-    mentions_fvar_rec(arena, e, fvar, &mut visited)
-}
-
-fn mentions_fvar_rec(arena: &Arena, e: ExprId, fvar: FVarId, visited: &mut FxHashSet<ExprId>) -> bool {
-    if !arena.get_expr_meta(e).has_fvar() || !visited.insert(e) { return false; }
-    match arena.get_expr(e) {
-        ExprData::FVar(id) => *id == fvar,
-        ExprData::App(f, a) => mentions_fvar_rec(arena, *f, fvar, visited) || mentions_fvar_rec(arena, *a, fvar, visited),
-        ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
-            mentions_fvar_rec(arena, *ty, fvar, visited) || mentions_fvar_rec(arena, *body, fvar, visited)
-        }
-        ExprData::Let { ty, val, body, .. } => {
-            mentions_fvar_rec(arena, *ty, fvar, visited) || mentions_fvar_rec(arena, *val, fvar, visited) || mentions_fvar_rec(arena, *body, fvar, visited)
-        }
-        ExprData::Proj { expr, .. } => mentions_fvar_rec(arena, *expr, fvar, visited),
-        ExprData::BVar(_) | ExprData::Sort(_) | ExprData::Const(_, _) | ExprData::Lit(_) => false,
-    }
+    any_subexpr(arena, e, |a, x| !a.get_expr_meta(x).has_fvar(), |d| matches!(d, ExprData::FVar(id) if *id == fvar))
 }
 
 pub fn expr_check_level_params(arena: &Arena, e: ExprId, allowed: &[NameId]) -> Result<(), KernelError> {
-    if !arena.get_expr_meta(e).has_level_param() { return Ok(()); }
-    let mut visited = FxHashSet::default();
-    check_lvl_rec(arena, e, allowed, &mut visited)
-}
-
-fn check_lvl_rec(arena: &Arena, e: ExprId, allowed: &[NameId], visited: &mut FxHashSet<ExprId>) -> Result<(), KernelError> {
-    if !arena.get_expr_meta(e).has_level_param() || !visited.insert(e) { return Ok(()); }
-    match arena.get_expr(e) {
-        ExprData::Sort(l) => level_check_params(arena, *l, allowed),
-        ExprData::Const(_, lvls) => {
-            for &l in arena.get_level_list(*lvls) { level_check_params(arena, l, allowed)?; }
-            Ok(())
-        }
-        ExprData::App(f, a) => { check_lvl_rec(arena, *f, allowed, visited)?; check_lvl_rec(arena, *a, allowed, visited) }
-        ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
-            check_lvl_rec(arena, *ty, allowed, visited)?; check_lvl_rec(arena, *body, allowed, visited)
-        }
-        ExprData::Let { ty, val, body, .. } => {
-            check_lvl_rec(arena, *ty, allowed, visited)?; check_lvl_rec(arena, *val, allowed, visited)?; check_lvl_rec(arena, *body, allowed, visited)
-        }
-        ExprData::Proj { expr, .. } => check_lvl_rec(arena, *expr, allowed, visited),
-        ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Lit(_) => Ok(()),
-    }
+    let mut err = None;
+    any_subexpr(arena, e, |a, x| !a.get_expr_meta(x).has_level_param(), |d| {
+        let r = match d {
+            ExprData::Sort(l) => level_check_params(arena, *l, allowed),
+            ExprData::Const(_, ls) => arena.get_level_list(*ls).iter().try_for_each(|&l| level_check_params(arena, l, allowed)),
+            _ => Ok(()),
+        };
+        err = r.err();
+        err.is_some()
+    });
+    err.map_or(Ok(()), Err)
 }

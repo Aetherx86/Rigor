@@ -7,7 +7,7 @@ use crate::env::{ConstructorInfo, Declaration, InductiveInfo, RecursorInfo, Recu
 use crate::error::KernelError;
 use crate::expr::{
     abstract_fvars, expr_check_level_params, expr_mentions_any_const, expr_mentions_fvar,
-    instantiate1, instantiate_level_params,
+    instantiate1, instantiate_level_params, replace_expr,
 };
 use crate::hash::FxHashMap;
 use crate::level::{level_eq, level_is_zero, level_leq};
@@ -49,18 +49,10 @@ struct NestedAux {
     ctors: Vec<(NameId, NameId, ExprId)>, // (aux_ctor_name, orig_ctor_name, orig_ctor_app)
 }
 
-fn wrap_pis(arena: &mut Arena, binders: &[Binder], mut body: ExprId) -> ExprId {
+fn wrap(arena: &mut Arena, binders: &[Binder], mut body: ExprId, pi: bool) -> ExprId {
     for b in binders.iter().rev() {
         let abs = abstract_fvars(arena, body, &[b.fv]);
-        body = arena.pi(b.name, b.bi, b.ty, abs);
-    }
-    body
-}
-
-fn wrap_lams(arena: &mut Arena, binders: &[Binder], mut body: ExprId) -> ExprId {
-    for b in binders.iter().rev() {
-        let abs = abstract_fvars(arena, body, &[b.fv]);
-        body = arena.lam(b.name, b.bi, b.ty, abs);
+        body = if pi { arena.pi(b.name, b.bi, b.ty, abs) } else { arena.lam(b.name, b.bi, b.ty, abs) };
     }
     body
 }
@@ -69,39 +61,35 @@ fn lvls_eq(arena: &mut Arena, a: &[LevelId], b: &[LevelId]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| level_eq(arena, x, y))
 }
 
-/// Replace `from` with `to` structurally inside `e` (used for nested inductive lowering & restoration).
-fn replace_expr(arena: &mut Arena, e: ExprId, from: ExprId, to: ExprId) -> ExprId {
-    if e == from { return to; }
-    match arena.get_expr(e) {
-        ExprData::App(f, a) => {
-            let (f, a) = (*f, *a);
-            let (f2, a2) = (replace_expr(arena, f, from, to), replace_expr(arena, a, from, to));
-            if f2 == f && a2 == a { e } else { arena.app(f2, a2) }
-        }
-        ExprData::Lam { name, binder_info, ty, body } => {
-            let (n, bi, t, b) = (*name, *binder_info, *ty, *body);
-            let (t2, b2) = (replace_expr(arena, t, from, to), replace_expr(arena, b, from, to));
-            if t2 == t && b2 == b { e } else { arena.lam(n, bi, t2, b2) }
-        }
-        ExprData::Pi { name, binder_info, ty, body } => {
-            let (n, bi, t, b) = (*name, *binder_info, *ty, *body);
-            let (t2, b2) = (replace_expr(arena, t, from, to), replace_expr(arena, b, from, to));
-            if t2 == t && b2 == b { e } else { arena.pi(n, bi, t2, b2) }
-        }
-        ExprData::Let { ty, val, body } => {
-            let (t, v, b) = (*ty, *val, *body);
-            let t2 = replace_expr(arena, t, from, to);
-            let v2 = replace_expr(arena, v, from, to);
-            let b2 = replace_expr(arena, b, from, to);
-            if t2 == t && v2 == v && b2 == b { e } else { arena.let_(Arena::ANONYMOUS, t2, v2, b2) }
-        }
-        ExprData::Proj { struct_name, idx, expr } => {
-            let (s, i, x) = (*struct_name, *idx, *expr);
-            let x2 = replace_expr(arena, x, from, to);
-            if x2 == x { e } else { arena.proj(s, i, x2) }
-        }
-        _ => e,
+/// Instantiate the leading Pi binders of `e` (after whnf) with `args`.
+fn inst_pis(tc: &mut TypeChecker<'_>, mut e: ExprId, args: &[ExprId]) -> ExprId {
+    for &a in args {
+        e = tc.whnf(e);
+        if let ExprData::Pi { body, .. } = *tc.arena.get_expr(e) { e = instantiate1(tc.arena, body, a); }
     }
+    e
+}
+
+/// Open up to `max` leading Pi binders of `e` as new locals; returns them and the (whnf) rest.
+fn open_pis(tc: &mut TypeChecker<'_>, mut e: ExprId, max: usize) -> (Vec<Binder>, ExprId) {
+    let mut bs = Vec::new();
+    while bs.len() < max {
+        e = tc.whnf(e);
+        let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(e) else { break };
+        let fv = tc.push_local(ty, None);
+        let fve = tc.arena.fvar(fv);
+        bs.push(Binder { name, bi: binder_info, ty, fv });
+        e = instantiate1(tc.arena, body, fve);
+    }
+    (bs, e)
+}
+
+fn ind_info(spec: &InductiveSpec, p: &ParsedInd, all: Box<[NameId]>, is_rec: bool, can_elim_large: bool) -> Declaration {
+    Declaration::Inductive(InductiveInfo {
+        name: p.name, level_params: spec.level_params.clone(), ty: p.ty,
+        num_params: spec.num_params, num_indices: p.indices.len() as u32,
+        all, ctors: p.ctor_names.clone().into(), is_rec, is_prop: p.is_prop, can_elim_large,
+    })
 }
 
 /// Validate a (possibly mutual or nested) inductive block and generate Inductive, Constructor,
@@ -159,39 +147,21 @@ pub fn check_inductive_block(
                     cur = instantiate1(tc.arena, body, fve);
                 }
             }
-            let mut indices = Vec::new();
-            loop {
-                cur = tc.whnf(cur);
-                match *tc.arena.get_expr(cur) {
-                    ExprData::Pi { name, binder_info, ty, body } => {
-                        let fv = tc.push_local(ty, None);
-                        let fve = tc.arena.fvar(fv);
-                        indices.push(Binder { name, bi: binder_info, ty, fv });
-                        cur = instantiate1(tc.arena, body, fve);
-                    }
-                    ExprData::Sort(res_lvl) => {
-                        for _ in &indices { tc.pop_local(); }
-                        parsed_inds.push(ParsedInd {
-                            name: t.name, ty: t.ty, indices, res_lvl,
-                            is_prop: level_is_zero(tc.arena, res_lvl),
-                            ctor_names: t.ctors.iter().map(|(c, _)| *c).collect(),
-                        });
-                        break;
-                    }
-                    _ => return Err(KernelError::InvalidInductive("inductive type must end in Sort".into())),
-                }
-            }
+            let (indices, cur) = open_pis(&mut tc, cur, usize::MAX);
+            let ExprData::Sort(res_lvl) = *tc.arena.get_expr(cur) else {
+                return Err(KernelError::InvalidInductive("inductive type must end in Sort".into()));
+            };
+            for _ in &indices { tc.pop_local(); }
+            parsed_inds.push(ParsedInd {
+                name: t.name, ty: t.ty, indices, res_lvl, is_prop: level_is_zero(tc.arena, res_lvl),
+                ctor_names: t.ctors.iter().map(|(c, _)| *c).collect(),
+            });
         }
         for _ in &hdr_params { tc.pop_local(); }
     }
 
     for p in &parsed_inds {
-        work_decls.insert(p.name, Declaration::Inductive(InductiveInfo {
-            name: p.name, level_params: spec.level_params.clone(), ty: p.ty,
-            num_params: spec.num_params, num_indices: p.indices.len() as u32,
-            all: orig_names.clone().into(), ctors: p.ctor_names.clone().into(),
-            is_rec: false, is_prop: p.is_prop, can_elim_large: !p.is_prop,
-        }));
+        work_decls.insert(p.name, ind_info(spec, p, orig_names.clone().into(), false, !p.is_prop));
     }
 
     // 2. Discover & expand any nested inductives (e.g., `Array Syntax`, `List Syntax`) into
@@ -204,25 +174,9 @@ pub fn check_inductive_block(
             let ctors_snapshot = all_types[ti].ctors.clone();
             for (ci, &(_, orig_cty)) in ctors_snapshot.iter().enumerate() {
                 let mut tc = TypeChecker::new(&work_decls, arena);
-                let mut p_fvs = Vec::with_capacity(spec.num_params as usize);
-                let mut c = all_types[0].ty;
-                for _ in 0..spec.num_params {
-                    c = tc.whnf(c);
-                    if let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(c) {
-                        let fv = tc.push_local(ty, None);
-                        let fve = tc.arena.fvar(fv);
-                        p_fvs.push(Binder { name, bi: binder_info, ty, fv });
-                        c = instantiate1(tc.arena, body, fve);
-                    }
-                }
+                let (p_fvs, _) = open_pis(&mut tc, all_types[0].ty, spec.num_params as usize);
                 let p_fve: Vec<ExprId> = p_fvs.iter().map(|b| tc.arena.fvar(b.fv)).collect();
-                let mut cur = orig_cty;
-                for &pf in &p_fve {
-                    cur = tc.whnf(cur);
-                    if let ExprData::Pi { body, .. } = *tc.arena.get_expr(cur) {
-                        cur = instantiate1(tc.arena, body, pf);
-                    }
-                }
+                let mut cur = inst_pis(&mut tc, orig_cty, &p_fve);
                 let mut fields = Vec::new();
                 let mut new_aux_to_add: Vec<(InductiveTypeSpec, ParsedInd, NestedAux)> = Vec::new();
                 loop {
@@ -265,13 +219,8 @@ pub fn check_inductive_block(
                                                 let aux_head = tc.arena.const_(an, &param_lvls);
                                                 let aux_app = tc.arena.app_n(aux_head, &p_fve);
                                                 // Build auxiliary type: instantiate `ji.ty` with `jlvls` & `args[..jnp]`, wrap `p_fvs`.
-                                                let mut jty = instantiate_level_params(tc.arena, ji.ty, &ji.level_params, &jlvls);
-                                                for &pa in &args[..jnp] {
-                                                    jty = tc.whnf(jty);
-                                                    if let ExprData::Pi { body: jb, .. } = *tc.arena.get_expr(jty) {
-                                                        jty = instantiate1(tc.arena, jb, pa);
-                                                    }
-                                                }
+                                                let jty = instantiate_level_params(tc.arena, ji.ty, &ji.level_params, &jlvls);
+                                                let jty = inst_pis(&mut tc, jty, &args[..jnp]);
                                                 let mut j_indices = Vec::new();
                                                 let mut jc = jty;
                                                 let j_res_lvl = loop {
@@ -287,21 +236,16 @@ pub fn check_inductive_block(
                                                         _ => break Arena::LEVEL_ZERO,
                                                     }
                                                 };
-                                                let aux_ty = wrap_pis(tc.arena, &p_fvs, jty);
+                                                let aux_ty = wrap(tc.arena, &p_fvs, jty, true);
                                                 let mut aux_ctors = Vec::new();
                                                 let mut aux_ctor_map = Vec::new();
                                                 for (k, &orig_cn) in ji.ctors.iter().enumerate() {
                                                     let Some(Declaration::Constructor(oc)) = decls.get(&orig_cn) else { continue };
-                                                    let mut octy = instantiate_level_params(tc.arena, oc.ty, &oc.level_params, &jlvls);
-                                                    for &pa in &args[..jnp] {
-                                                        octy = tc.whnf(octy);
-                                                        if let ExprData::Pi { body: cb, .. } = *tc.arena.get_expr(octy) {
-                                                            octy = instantiate1(tc.arena, cb, pa);
-                                                        }
-                                                    }
+                                                    let octy = instantiate_level_params(tc.arena, oc.ty, &oc.level_params, &jlvls);
+                                                    let octy = inst_pis(&mut tc, octy, &args[..jnp]);
                                                     let octy = replace_expr(tc.arena, octy, orig_app, aux_app);
                                                     let aux_cn = tc.arena.name_num(an, k as u64);
-                                                    let aux_cty = wrap_pis(tc.arena, &p_fvs, octy);
+                                                    let aux_cty = wrap(tc.arena, &p_fvs, octy, true);
                                                     let orig_c_head = tc.arena.intern_expr(ExprData::Const(orig_cn, jlvls_id));
                                                     let orig_c_app = tc.arena.app_n(orig_c_head, &args[..jnp]);
                                                     aux_ctors.push((aux_cn, aux_cty));
@@ -332,19 +276,14 @@ pub fn check_inductive_block(
                     cur = instantiate1(tc.arena, body, fve);
                 }
                 if !new_aux_to_add.is_empty() || !nested_aux.is_empty() {
-                    let inner = wrap_pis(tc.arena, &fields, cur);
-                    all_types[ti].ctors[ci].1 = wrap_pis(tc.arena, &p_fvs, inner);
+                    let inner = wrap(tc.arena, &fields, cur, true);
+                    all_types[ti].ctors[ci].1 = wrap(tc.arena, &p_fvs, inner, true);
                 }
                 for _ in &fields { tc.pop_local(); }
                 for _ in &p_fvs { tc.pop_local(); }
                 drop(tc);
                 for (its, pi, aux) in new_aux_to_add {
-                    work_decls.insert(pi.name, Declaration::Inductive(InductiveInfo {
-                        name: pi.name, level_params: spec.level_params.clone(), ty: pi.ty,
-                        num_params: spec.num_params, num_indices: pi.indices.len() as u32,
-                        all: Box::new([pi.name]), ctors: pi.ctor_names.clone().into(),
-                        is_rec: true, is_prop: pi.is_prop, can_elim_large: !pi.is_prop,
-                    }));
+                    work_decls.insert(pi.name, ind_info(spec, &pi, Box::new([pi.name]), true, !pi.is_prop));
                     parsed_inds.push(pi);
                     all_types.push(its);
                     nested_aux.push(aux);
@@ -367,36 +306,11 @@ pub fn check_inductive_block(
 
     // 3. Validate all constructors (original + expanded nested) for universe bounds and strict positivity.
     let mut tc = TypeChecker::new(&work_decls, arena);
-    let mut param_fvs = Vec::with_capacity(spec.num_params as usize);
-    let mut cur = all_types[0].ty;
-    for _ in 0..spec.num_params {
-        cur = tc.whnf(cur);
-        if let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(cur) {
-            let fv = tc.push_local(ty, None);
-            let fve = tc.arena.fvar(fv);
-            param_fvs.push(Binder { name, bi: binder_info, ty, fv });
-            cur = instantiate1(tc.arena, body, fve);
-        }
-    }
+    let (param_fvs, _) = open_pis(&mut tc, all_types[0].ty, spec.num_params as usize);
     let param_fve: Vec<ExprId> = param_fvs.iter().map(|p| tc.arena.fvar(p.fv)).collect();
     for p in &mut parsed_inds {
-        let mut c = p.ty;
-        for &pf in &param_fve {
-            c = tc.whnf(c);
-            if let ExprData::Pi { body, .. } = *tc.arena.get_expr(c) {
-                c = instantiate1(tc.arena, body, pf);
-            }
-        }
-        p.indices.clear();
-        loop {
-            c = tc.whnf(c);
-            if let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(c) {
-                let fv = tc.push_local(ty, None);
-                let fve = tc.arena.fvar(fv);
-                p.indices.push(Binder { name, bi: binder_info, ty, fv });
-                c = instantiate1(tc.arena, body, fve);
-            } else { break; }
-        }
+        let c = inst_pis(&mut tc, p.ty, &param_fve);
+        p.indices = open_pis(&mut tc, c, usize::MAX).0;
         for _ in &p.indices { tc.pop_local(); }
     }
 
@@ -515,14 +429,9 @@ pub fn check_inductive_block(
         motive_u = tc.arena.name_num(motive_u, suffix);
     }
     for ti in 0..orig_n {
-        let ind = &parsed_inds[ti];
-        out.push(Declaration::Inductive(InductiveInfo {
-            name: ind.name, level_params: spec.level_params.clone(), ty: ind.ty,
-            num_params: spec.num_params, num_indices: ind.indices.len() as u32,
-            all: orig_all_box.clone(), ctors: ind.ctor_names.clone().into(),
-            is_rec, is_prop: ind.is_prop, can_elim_large: can_elim[ti],
-        }));
+        out.push(ind_info(spec, &parsed_inds[ti], orig_all_box.clone(), is_rec, can_elim[ti]));
     }
+
     let mut ctor_idx = vec![0usize; orig_n];
     for c in parsed_ctors.iter().filter(|c| c.ind_idx < orig_n) {
         let ci = ctor_idx[c.ind_idx];
@@ -549,7 +458,7 @@ pub fn check_inductive_block(
         let major_ty = { let p = tc.arena.app_n(ind_c, &param_fve); tc.arena.app_n(p, &idx_e) };
         let t_n = tc.arena.name_from_path("t");
         let mty = tc.arena.pi(t_n, BinderInfo::Default, major_ty, motive_sort);
-        let mty = wrap_pis(tc.arena, &ind.indices, mty);
+        let mty = wrap(tc.arena, &ind.indices, mty, true);
         let mty = restore(tc.arena, mty);
         let base = tc.arena.name_from_path("motive");
         let mname = if parsed_inds.len() == 1 { base } else { tc.arena.name_num(base, ti as u64 + 1) };
@@ -569,11 +478,11 @@ pub fn check_inductive_block(
             let f_app = tc.arena.app_n(field_e[rf.field_idx], &eb_e);
             let ih_ret = tc.arena.app_n(motive_fve[rf.target_ind], &rf.target_indices);
             let ih_ret = tc.arena.app(ih_ret, f_app);
-            let ih_ty = wrap_pis(tc.arena, &rf.extra, ih_ret);
+            let ih_ty = wrap(tc.arena, &rf.extra, ih_ret, true);
             let ih_n = tc.arena.name_from_path("ih");
             mty = tc.arena.pi(ih_n, BinderInfo::Default, ih_ty, mty);
         }
-        let mty = wrap_pis(tc.arena, &c.fields, mty);
+        let mty = wrap(tc.arena, &c.fields, mty, true);
         let mty = restore(tc.arena, mty);
         minor_fvs.push(Binder { name: c.name, bi: BinderInfo::Default, ty: mty, fv: tc.fresh_fvar() });
     }
@@ -590,11 +499,11 @@ pub fn check_inductive_block(
         let t_n = tc.arena.name_from_path("t");
         let abs_m = abstract_fvars(tc.arena, ret, &[major_fv]);
         let mut rec_ty = tc.arena.pi(t_n, BinderInfo::Default, major_ty, abs_m);
-        rec_ty = wrap_pis(tc.arena, &ind.indices, rec_ty);
+        rec_ty = wrap(tc.arena, &ind.indices, rec_ty, true);
         rec_ty = restore(tc.arena, rec_ty);
-        rec_ty = wrap_pis(tc.arena, &minor_fvs, rec_ty);
-        rec_ty = wrap_pis(tc.arena, &motive_fvs, rec_ty);
-        rec_ty = wrap_pis(tc.arena, &param_fvs, rec_ty);
+        rec_ty = wrap(tc.arena, &minor_fvs, rec_ty, true);
+        rec_ty = wrap(tc.arena, &motive_fvs, rec_ty, true);
+        rec_ty = wrap(tc.arena, &param_fvs, rec_ty, true);
 
         let mut rules = Vec::new();
         for (mi, c) in parsed_ctors.iter().enumerate().filter(|(_, c)| c.ind_idx == ti) {
@@ -609,14 +518,14 @@ pub fn check_inductive_block(
                 ih = tc.arena.app_n(ih, &minor_fve);
                 ih = tc.arena.app_n(ih, &rf.target_indices);
                 ih = tc.arena.app(ih, f_app);
-                ih = wrap_lams(tc.arena, &rf.extra, ih);
+                ih = wrap(tc.arena, &rf.extra, ih, false);
                 rhs = tc.arena.app(rhs, ih);
             }
-            rhs = wrap_lams(tc.arena, &c.fields, rhs);
+            rhs = wrap(tc.arena, &c.fields, rhs, false);
             rhs = restore(tc.arena, rhs);
-            rhs = wrap_lams(tc.arena, &minor_fvs, rhs);
-            rhs = wrap_lams(tc.arena, &motive_fvs, rhs);
-            rhs = wrap_lams(tc.arena, &param_fvs, rhs);
+            rhs = wrap(tc.arena, &minor_fvs, rhs, false);
+            rhs = wrap(tc.arena, &motive_fvs, rhs, false);
+            rhs = wrap(tc.arena, &param_fvs, rhs, false);
             let real_ctor = nested_aux.iter()
                 .flat_map(|a| a.ctors.iter())
                 .find(|(ac, _, _)| *ac == c.name)
