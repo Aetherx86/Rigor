@@ -46,18 +46,33 @@ impl<'a> TypeChecker<'a> {
         if let Some(&cached) = self.whnf_cache.get(&e) {
             return cached;
         }
-        let cur = self.whnf_spine(e, true);
+        let cur = self.whnf_spine(e, true, false);
         self.whnf_cache.insert(e, cur);
         cur
     }
 
-    /// Reduce `e` to weak head normal form without delta unfolding.
+    /// Reduce `e` to weak head normal form without delta unfolding and without unfolding
+    /// definitions inside projection targets (Lean's `whnf_core(e, false, true)`).
     #[inline]
     pub(crate) fn whnf_no_delta(&mut self, e: ExprId) -> ExprId {
-        self.whnf_spine(e, false)
+        self.whnf_spine(e, false, true)
     }
 
-    fn whnf_spine(&mut self, e: ExprId, allow_delta: bool) -> ExprId {
+    /// If `e` is a projection application `s.i a1 ... an`, try reducing the projection using full
+    /// WHNF on `s` (Lean's `try_unfold_proj_app`).
+    fn try_unfold_proj_app(&mut self, e: ExprId) -> Option<ExprId> {
+        let mut h = e;
+        while let ExprData::App(f, _) = *self.arena.get_expr(h) {
+            h = f;
+        }
+        if !matches!(self.arena.get_expr(h), ExprData::Proj { .. }) {
+            return None;
+        }
+        let res = self.whnf_spine(e, false, false);
+        (res != e).then_some(res)
+    }
+
+    fn whnf_spine(&mut self, e: ExprId, allow_delta: bool, cheap_proj: bool) -> ExprId {
         match self.arena.get_expr(e) {
             ExprData::Sort(_) | ExprData::Pi { .. } | ExprData::Lam { .. } | ExprData::Lit(_) | ExprData::BVar(_) => {
                 return e;
@@ -65,13 +80,13 @@ impl<'a> TypeChecker<'a> {
             ExprData::Const(_, _) if !allow_delta => return e,
             _ => {}
         }
-        self.whnf_spine_with(e, Vec::new(), allow_delta)
+        self.whnf_spine_with(e, Vec::new(), allow_delta, cheap_proj)
     }
 
     /// Unified spine abstract machine: keeps arguments on `spine` across beta, zeta,
     /// local FVar, Proj, Quot.lift, Recursor iota/K, and delta steps without interning
     /// intermediate `App` nodes into the arena.
-    fn whnf_spine_with(&mut self, mut cur: ExprId, mut spine: Vec<ExprId>, allow_delta: bool) -> ExprId {
+    fn whnf_spine_with(&mut self, mut cur: ExprId, mut spine: Vec<ExprId>, allow_delta: bool, cheap_proj: bool) -> ExprId {
         loop {
             match self.arena.get_expr(cur) {
                 ExprData::App(f, a) => {
@@ -108,7 +123,7 @@ impl<'a> TypeChecker<'a> {
                 },
                 ExprData::Proj { struct_name, idx, expr } => {
                     let (sn, idx, expr) = (*struct_name, *idx, *expr);
-                    if let Some(v) = self.reduce_proj_head(sn, idx, expr) {
+                    if let Some(v) = self.reduce_proj_head(sn, idx, expr, cheap_proj) {
                         cur = v;
                     } else {
                         break;
@@ -266,12 +281,12 @@ impl<'a> TypeChecker<'a> {
         cur
     }
 
-    fn reduce_proj_head(&mut self, struct_name: NameId, idx: u32, expr: ExprId) -> Option<ExprId> {
+    fn reduce_proj_head(&mut self, struct_name: NameId, idx: u32, expr: ExprId, cheap_proj: bool) -> Option<ExprId> {
         let ind = match self.decls.get(&struct_name)? {
             Declaration::Inductive(i) if i.ctors.len() == 1 && i.num_indices == 0 => i,
             _ => return None,
         };
-        let val = self.whnf_lit_ctor(expr);
+        let val = if cheap_proj { self.whnf_no_delta(expr) } else { self.whnf_lit_ctor(expr) };
         let (vhead, vargs) = self.app_spine(val);
         if let ExprData::Const(cname, _) = self.arena.get_expr(vhead) {
             let pos = ind.num_params as usize + idx as usize;
@@ -346,7 +361,72 @@ impl<'a> TypeChecker<'a> {
         w
     }
 
-    /// Lean 4 kernel `reduce_nat`: O(1) machine evaluation of closed `Nat` literal primitives.
+    /// Returns true if `e` is `eagerReduce _ _` (Lean's `is_eager_reduce`).
+    #[inline]
+    pub(crate) fn is_eager_reduce(&self, e: ExprId) -> bool {
+        let ExprData::App(f1, _) = *self.arena.get_expr(e) else { return false };
+        let ExprData::App(head, _) = *self.arena.get_expr(f1) else { return false };
+        let ExprData::Const(name, _) = *self.arena.get_expr(head) else { return false };
+        matches!(
+            self.arena.get_name(name),
+            crate::arena::NameData::Str(p, s) if *p == Arena::ANONYMOUS && s.as_ref() == "eagerReduce"
+        )
+    }
+
+    fn is_bool_true(&self, e: ExprId) -> bool {
+        let ExprData::Const(name, lvls) = *self.arena.get_expr(e) else { return false };
+        if lvls != Arena::EMPTY_LEVELS { return false; }
+        let crate::arena::NameData::Str(p, s) = self.arena.get_name(name) else { return false };
+        if s.as_ref() != "true" { return false; }
+        matches!(
+            self.arena.get_name(*p),
+            crate::arena::NameData::Str(g, ps) if *g == Arena::ANONYMOUS && ps.as_ref() == "Bool"
+        )
+    }
+
+    fn is_nat_zero(&self, e: ExprId) -> bool {
+        match *self.arena.get_expr(e) {
+            ExprData::Lit(lid) => matches!(self.arena.get_lit(lid), Literal::Nat(n) if n.is_zero()),
+            ExprData::Const(name, lvls) if lvls == Arena::EMPTY_LEVELS => {
+                let crate::arena::NameData::Str(p, s) = self.arena.get_name(name) else { return false };
+                if s.as_ref() != "zero" { return false; }
+                matches!(
+                    self.arena.get_name(*p),
+                    crate::arena::NameData::Str(g, ps) if *g == Arena::ANONYMOUS && ps.as_ref() == "Nat"
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn nat_pred(&mut self, e: ExprId) -> Option<ExprId> {
+        match *self.arena.get_expr(e) {
+            ExprData::Lit(lid) => match self.arena.get_lit(lid) {
+                Literal::Nat(n) if !n.is_zero() => {
+                    let pred = n.sub(&crate::nat::Nat::from_u128(1));
+                    Some(self.arena.lit_nat_big(pred))
+                }
+                _ => None,
+            },
+            ExprData::App(f, a) => {
+                let ExprData::Const(name, lvls) = *self.arena.get_expr(f) else { return None };
+                if lvls != Arena::EMPTY_LEVELS { return None; }
+                let crate::arena::NameData::Str(p, s) = self.arena.get_name(name) else { return None };
+                if s.as_ref() != "succ" { return None; }
+                if matches!(
+                    self.arena.get_name(*p),
+                    crate::arena::NameData::Str(g, ps) if *g == Arena::ANONYMOUS && ps.as_ref() == "Nat"
+                ) {
+                    Some(a)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Lean 4 kernel `reduce_nat`: O(1) machine evaluation of `Nat` literal primitives.
     /// Does `e` mention a local without a `let` value?
     fn has_opaque_fvar(&self, e: ExprId) -> bool {
         if !self.arena.get_expr_meta(e).has_fvar() { return false; }
@@ -376,7 +456,7 @@ impl<'a> TypeChecker<'a> {
         let crate::arena::NameData::Str(parent, seg) = self.arena.get_name(name) else { return None };
         let crate::arena::NameData::Str(gp, pseg) = self.arena.get_name(*parent) else { return None };
         if *gp != crate::arena::Arena::ANONYMOUS || pseg.as_ref() != "Nat" { return None; }
-        // The binary operations Lean's kernel evaluates on literals (GMP there, `Nat` here).
+        // The operations Lean's kernel evaluates on literals (GMP there, `Nat` here).
         let op: &'static str = match seg.as_ref() {
             "succ" if allow_succ => "succ", "log2" => "log2",
             "add" => "add", "sub" => "sub", "mul" => "mul", "pow" => "pow", "div" => "div", "mod" => "mod",
@@ -401,11 +481,8 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             }
         };
-        // As in Lean's `reduce_nat`: only closed terms can evaluate to literals, so never whnf an
-        // argument that mentions a free variable without a value (that would unfold open
-        // arithmetic for nothing). `let`-bound variables count as closed: Lean substitutes them.
         let arity = if op == "succ" || op == "log2" { 1 } else { 2 };
-        if len < arity || spine[len - arity..].iter().any(|&x| self.has_opaque_fvar(x)) {
+        if len < arity || (!self.eager_reduce && spine[len - arity..].iter().any(|&x| self.has_opaque_fvar(x))) {
             return None;
         }
         if op == "succ" || op == "log2" {
@@ -454,7 +531,7 @@ impl<'a> TypeChecker<'a> {
     fn unfold_delta_app(&mut self, val: ExprId, params: &[NameId], lvls_id: LevelListId, args: &[ExprId]) -> ExprId {
         let inst = self.inst_levels_list(val, params, lvls_id);
         let spine: Vec<ExprId> = args.iter().rev().copied().collect();
-        self.whnf_spine_with(inst, spine, false)
+        self.whnf_spine_with(inst, spine, false, true)
     }
 
     fn is_proof(&mut self, e: ExprId) -> Result<Option<ExprId>, KernelError> {
@@ -481,6 +558,17 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn is_def_eq_core(&mut self, mut a: ExprId, mut b: ExprId) -> Result<bool, KernelError> {
+        if a == b { return Ok(true); }
+        // Lean's reflection fast path (e.g. `decide` / `decide +kernel`): when comparing a closed
+        // (or `eagerReduce`) term against `Bool.true`, reduce it directly via `whnf`.
+        if self.is_bool_true(b) && (self.eager_reduce || !self.has_opaque_fvar(a)) {
+            let w = self.whnf(a);
+            if self.is_bool_true(w) { return Ok(true); }
+        }
+        if self.is_bool_true(a) && (self.eager_reduce || !self.has_opaque_fvar(b)) {
+            let w = self.whnf(b);
+            if self.is_bool_true(w) { return Ok(true); }
+        }
         a = self.whnf_no_delta(a);
         b = self.whnf_no_delta(b);
         let mut checked_proof = false;
@@ -493,20 +581,6 @@ impl<'a> TypeChecker<'a> {
                     return Ok(level_eq(self.arena, u, v));
                 }
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
-                (ExprData::Lit(lid), _) => {
-                    match self.arena.get_lit(*lid).clone() {
-                        Literal::Nat(k) => a = self.expand_nat_lit(&k),
-                        Literal::Str(sv) => { let ex = self.expand_str_lit(&sv); a = self.whnf_no_delta(ex); }
-                    }
-                    continue;
-                }
-                (_, ExprData::Lit(lid)) => {
-                    match self.arena.get_lit(*lid).clone() {
-                        Literal::Nat(k) => b = self.expand_nat_lit(&k),
-                        Literal::Str(sv) => { let ex = self.expand_str_lit(&sv); b = self.whnf_no_delta(ex); }
-                    }
-                    continue;
-                }
                 (ExprData::Pi { name, binder_info, ty: t1, body: b1 }, ExprData::Pi { ty: t2, body: b2, .. }) => {
                     let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
                     if !self.is_def_eq(t1, t2)? { return Ok(false); }
@@ -554,24 +628,96 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
+            // Lean's `is_def_eq_offset`: match `Nat` literals against `Nat.zero`/`Nat.succ`
+            // without eagerly expanding literals before delta/Nat-primitive reduction.
+            if self.is_nat_zero(a) && self.is_nat_zero(b) {
+                return Ok(true);
+            }
+            if let (Some(pa), Some(pb)) = (self.nat_pred(a), self.nat_pred(b)) {
+                return self.is_def_eq(pa, pb);
+            }
+
             let (ha, args_a) = self.app_spine(a);
             let (hb, args_b) = self.app_spine(b);
-            if args_a.len() == args_b.len() && self.heads_equal(ha, hb) {
-                let mut all_eq = true;
-                for (&xa, &xb) in args_a.iter().zip(&args_b) {
-                    if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
-                }
-                if all_eq { return Ok(true); }
+            if args_a.is_empty() && args_b.is_empty() && self.heads_equal(ha, hb) {
+                return Ok(true);
             }
 
             match (self.delta_info(ha), self.delta_info(hb)) {
                 (Some((va, pa, ppa, la)), Some((vb, pb, ppb, lb))) => {
+                    // Try congruence (`is_def_eq_args`) before unfolding when both sides share a
+                    // head. Skip for `Abbrev`s with differing `Lam` arguments (e.g. `casesOn` /
+                    // `dite`), which must unfold directly so recursors reduce on concrete
+                    // scrutinees rather than comparing lambda branches under an opaque fvar.
+                    if pa == pb
+                        && args_a.len() == args_b.len()
+                        && (pa < u64::MAX
+                            || !args_a.iter().zip(&args_b).any(|(&xa, &xb)| {
+                                xa != xb
+                                    && (matches!(self.arena.get_expr(xa), ExprData::Lam { .. })
+                                        || matches!(self.arena.get_expr(xb), ExprData::Lam { .. }))
+                            }))
+                        && self.heads_equal(ha, hb)
+                    {
+                        let mut all_eq = true;
+                        for (&xa, &xb) in args_a.iter().zip(&args_b) {
+                            if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
+                        }
+                        if all_eq { return Ok(true); }
+                    }
                     if pa >= pb { a = self.unfold_delta_app(va, ppa, la, &args_a); }
                     if pb >= pa { b = self.unfold_delta_app(vb, ppb, lb, &args_b); }
                 }
-                (Some((va, _, ppa, la)), None) => a = self.unfold_delta_app(va, ppa, la, &args_a),
-                (None, Some((vb, _, ppb, lb))) => b = self.unfold_delta_app(vb, ppb, lb, &args_b),
-                (None, None) => return Ok(self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)? || self.try_unit_like(a, b)?),
+                (Some((va, _, ppa, la)), None) => {
+                    if let Some(b2) = self.try_unfold_proj_app(b) {
+                        b = self.whnf_no_delta(b2);
+                    } else {
+                        a = self.unfold_delta_app(va, ppa, la, &args_a);
+                    }
+                }
+                (None, Some((vb, _, ppb, lb))) => {
+                    if let Some(a2) = self.try_unfold_proj_app(a) {
+                        a = self.whnf_no_delta(a2);
+                    } else {
+                        b = self.unfold_delta_app(vb, ppb, lb, &args_b);
+                    }
+                }
+                (None, None) => {
+                    if args_a.len() == args_b.len() && self.heads_equal(ha, hb) {
+                        let mut all_eq = true;
+                        for (&xa, &xb) in args_a.iter().zip(&args_b) {
+                            if !self.is_def_eq(xa, xb)? { all_eq = false; break; }
+                        }
+                        if all_eq { return Ok(true); }
+                    }
+                    let a2 = self.try_unfold_proj_app(a);
+                    let b2 = self.try_unfold_proj_app(b);
+                    if a2.is_some() || b2.is_some() {
+                        if let Some(x) = a2 { a = self.whnf_no_delta(x); }
+                        if let Some(x) = b2 { b = self.whnf_no_delta(x); }
+                        continue;
+                    }
+                    if self.try_struct_eta(a, b)? || self.try_struct_eta(b, a)? {
+                        return Ok(true);
+                    }
+                    if let ExprData::Lit(lid) = *self.arena.get_expr(a) {
+                        if let Literal::Str(sv) = self.arena.get_lit(lid) {
+                            let sv = sv.clone();
+                            let ex = self.expand_str_lit(&sv);
+                            a = self.whnf_no_delta(ex);
+                            continue;
+                        }
+                    }
+                    if let ExprData::Lit(lid) = *self.arena.get_expr(b) {
+                        if let Literal::Str(sv) = self.arena.get_lit(lid) {
+                            let sv = sv.clone();
+                            let ex = self.expand_str_lit(&sv);
+                            b = self.whnf_no_delta(ex);
+                            continue;
+                        }
+                    }
+                    return Ok(self.try_unit_like(a, b)?);
+                }
             }
         }
     }

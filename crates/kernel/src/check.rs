@@ -32,6 +32,10 @@ pub struct TypeChecker<'a> {
     /// never treated as checked because it was only inferred.
     pub(crate) infer_only: bool,
     pub(crate) infer_only_cache: FxHashMap<ExprId, ExprId>,
+    /// Lean's `m_eager_reduce` mode: activated while checking the argument type of an
+    /// `eagerReduce _ _` application, enabling `reduce_nat` and the `Bool.true` reflection fast
+    /// path even on terms containing free variables.
+    pub(crate) eager_reduce: bool,
     pub(crate) def_eq_cache: FxHashSet<(ExprId, ExprId)>,
     /// Pairs already shown not definitionally equal (Lean's failure cache); without it, nested
     /// structure eta and delta unfolding re-explore the same failing comparisons exponentially.
@@ -52,6 +56,7 @@ impl<'a> TypeChecker<'a> {
             infer_cache: FxHashMap::default(),
             infer_only: false,
             infer_only_cache: FxHashMap::default(),
+            eager_reduce: false,
             def_eq_cache: FxHashSet::default(),
             def_neq_cache: FxHashSet::default(),
             inst_lvl1_cache: FxHashMap::default(),
@@ -167,7 +172,16 @@ impl<'a> TypeChecker<'a> {
                     return Ok(instantiate1(self.arena, body, a));
                 }
                 let a_ty = self.infer_type(a)?;
-                if !self.is_def_eq(a_ty, dom)? {
+                let eq = if self.is_eager_reduce(a) {
+                    let prev = self.eager_reduce;
+                    self.eager_reduce = true;
+                    let r = self.is_def_eq(a_ty, dom);
+                    self.eager_reduce = prev;
+                    r?
+                } else {
+                    self.is_def_eq(a_ty, dom)?
+                };
+                if !eq {
                     return Err(KernelError::TypeMismatch {
                         expected: dom,
                         got: a_ty,

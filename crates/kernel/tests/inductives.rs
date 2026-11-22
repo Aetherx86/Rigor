@@ -469,3 +469,280 @@ fn spine_machine_regression_overapplied_recursor_quot_and_lam_proof_irrelevance(
     assert!(tc.is_def_eq(lam_proof_1, lam_proof_2).unwrap(), "distinct Lam proofs of P → P must be def-eq");
     let _ = zero;
 }
+
+#[test]
+fn lazy_delta_abbrev_reflection_and_eager_reduce_regressions() {
+    let mut env = Environment::new();
+    add_nat(&mut env);
+    add_eq(&mut env);
+
+    let l1 = env.arena.lvl_nat(1);
+    let type0 = env.arena.sort(l1);
+    let prop = env.arena.prop();
+    let b0 = env.arena.bvar(0);
+    let b1 = env.arena.bvar(1);
+    let b2 = env.arena.bvar(2);
+    let b3 = env.arena.bvar(3);
+
+    // Bool inductive: true, false : Bool
+    let bool_n = env.arena.name_from_path("Bool");
+    let true_n = env.arena.name_from_path("Bool.true");
+    let false_n = env.arena.name_from_path("Bool.false");
+    let bool_c = env.arena.const_(bool_n, []);
+    env.add_inductive(InductiveSpec {
+        level_params: Box::new([]),
+        num_params: 0,
+        types: vec![InductiveTypeSpec {
+            name: bool_n,
+            ty: type0,
+            ctors: vec![(true_n, bool_c), (false_n, bool_c)],
+        }],
+    })
+    .unwrap();
+
+    let nat = env.arena.const_path("Nat", []);
+    let zero = env.arena.const_path("Nat.zero", []);
+    let succ = env.arena.const_path("Nat.succ", []);
+    let nat_rec1 = env.arena.const_path("Nat.rec", [l1]);
+    let btrue = env.arena.const_path("Bool.true", []);
+    let bfalse = env.arena.const_path("Bool.false", []);
+
+    // Structural Nat.sub (would hang on 12-digit numbers if unfolded structurally).
+    // Nat.sub m n := Nat.rec (λ _, Nat → Nat) (λ x, x) (λ _ ih x, Nat.rec (λ _, Nat) 0 (λ p _, p) (ih x)) n m
+    let n2n = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+    let n2n2n = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, n2n);
+    let nat_sub_n = env.arena.name_from_path("Nat.sub");
+    let nat_sub_val = {
+        let mot_n = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+        let pred_step = {
+            let inner = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, b1);
+            env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, inner)
+        };
+        let ih_x = env.arena.app(b1, b0);
+        let pred_ih_x = env.arena.app_n(nat_rec1, &[mot_n, zero, pred_step, ih_x]);
+        let step = {
+            let l_x = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, pred_ih_x);
+            let l_ih = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, n2n, l_x);
+            env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, l_ih)
+        };
+        let mot = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, n2n);
+        let id_n = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, b0);
+        let body = env.arena.app_n(nat_rec1, &[mot, id_n, step, b0, b1]);
+        let l_n = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, l_n)
+    };
+    env.add_decl(Declaration::Definition {
+        name: nat_sub_n,
+        level_params: Box::new([]),
+        ty: n2n2n,
+        val: nat_sub_val,
+        hint: ReducibilityHint::Regular(0),
+    })
+    .unwrap();
+    let nat_sub = env.arena.const_(nat_sub_n, []);
+
+    // Structural Nat.beq (would hang on 12-digit numbers if unfolded instead of reduced via reduce_nat).
+    let n2b = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, bool_c);
+    let n2n2b = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, n2b);
+    let nat_beq_n = env.arena.name_from_path("Nat.beq");
+    let nat_beq_val = {
+        let mot_b = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, bool_c);
+        // isZero m := Nat.rec (λ _, Bool) true (λ _ _, false) m
+        let is_zero_body = {
+            let step_f = {
+                let inner = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, bool_c, bfalse);
+                env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, inner)
+            };
+            let body = env.arena.app_n(nat_rec1, &[mot_b, btrue, step_f, b0]);
+            env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body)
+        };
+        // step _ ih m := Nat.rec (λ _, Bool) false (λ p _, ih p) m
+        // Under (_:#2, ih:#1, m:#0): inside (λ p _ => ih p), ih is #3, p is #1.
+        let step_beq = {
+            let ih_p = env.arena.app(b3, b1);
+            let inner = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, bool_c, ih_p);
+            let outer = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, inner);
+            let body = env.arena.app_n(nat_rec1, &[mot_b, bfalse, outer, b0]);
+            let l_m = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body);
+            let l_ih = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, n2b, l_m);
+            env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, l_ih)
+        };
+        let mot = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, n2b);
+        let body = env.arena.app_n(nat_rec1, &[mot, is_zero_body, step_beq, b1, b0]);
+        let l_n = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, l_n)
+    };
+    env.add_decl(Declaration::Definition {
+        name: nat_beq_n,
+        level_params: Box::new([]),
+        ty: n2n2b,
+        val: nat_beq_val,
+        hint: ReducibilityHint::Regular(0),
+    })
+    .unwrap();
+    let nat_beq = env.arena.const_(nat_beq_n, []);
+
+    // Abbrev `Nat.casesOn`: (motive : Nat → Type) → (t : Nat) → motive 0 → (∀ n, motive (succ n)) → motive t
+    // Matches Lean's `casesOn` (`ReducibilityHint::Abbrev`) so lazy delta unfolds it rather than
+    // comparing lambda minor arms under a binder.
+    let cases_n = env.arena.name_from_path("Nat.casesOn");
+    let nat_to_type0 = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, type0);
+    let cases_ty = {
+        // motive:#3, t:#2, z:#1, s:#0 => motive t
+        let ret = env.arena.app(b3, b2);
+        // Under motive:#2, t:#1, z:#0: s : ∀ n : Nat, motive (succ n)  (motive is #3 under n:#0)
+        let sn = env.arena.app(succ, b0);
+        let m_sn = env.arena.app(b3, sn);
+        let s_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, m_sn);
+        // Under motive:#1, t:#0: z : motive 0
+        let z_ty = env.arena.app(b1, zero);
+        let p_s = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, s_ty, ret);
+        let p_z = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, z_ty, p_s);
+        let p_t = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, p_z);
+        env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat_to_type0, p_t)
+    };
+    let cases_val = {
+        // λ motive t z s => Nat.rec motive z (λ n _ => s n) t
+        // Under motive:#3, t:#2, z:#1, s:#0: inside (λ n:#1, _:#0 => s n), s is #2, n is #1, motive is #5
+        let sn_step = env.arena.app(b2, b1);
+        let b4 = env.arena.bvar(4);
+        let mn_ih_ty = env.arena.app(b4, b0);
+        let l_ih = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, mn_ih_ty, sn_step);
+        let l_n = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, l_ih);
+        let body = env.arena.app_n(nat_rec1, &[b3, b1, l_n, b2]);
+        // Match cases_ty binder types.
+        let sn = env.arena.app(succ, b0);
+        let m_sn = env.arena.app(b3, sn);
+        let s_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, m_sn);
+        let z_ty = env.arena.app(b1, zero);
+        let l_s = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, s_ty, body);
+        let l_z = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, z_ty, l_s);
+        let l_t = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, l_z);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat_to_type0, l_t)
+    };
+    env.add_decl(Declaration::Definition {
+        name: cases_n,
+        level_params: Box::new([]),
+        ty: cases_ty,
+        val: cases_val,
+        hint: ReducibilityHint::Abbrev,
+    })
+    .unwrap();
+    let cases_on = env.arena.const_(cases_n, []);
+
+    // Helper `constNat : Nat → Nat → Nat := λ _ y => y` (Regular def).
+    let const_nat_n = env.arena.name_from_path("constNat");
+    let const_nat_val = {
+        let inner = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, b0);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, inner)
+    };
+    env.add_decl(Declaration::Definition {
+        name: const_nat_n,
+        level_params: Box::new([]),
+        ty: n2n2n,
+        val: const_nat_val,
+        hint: ReducibilityHint::Regular(0),
+    })
+    .unwrap();
+    let const_nat = env.arena.const_(const_nat_n, []);
+
+    // `eagerReduce.{u} : {α : Sort u} → α → α := λ _ a => a`
+    let u = env.arena.name_from_path("u");
+    let lu = env.arena.lvl_param(u);
+    let su = env.arena.sort(lu);
+    let eager_n = env.arena.name_from_path("eagerReduce");
+    let eager_ty = {
+        let p_a = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, b0, b1);
+        env.arena.pi(Arena::ANONYMOUS, BinderInfo::Implicit, su, p_a)
+    };
+    let eager_val = {
+        let l_a = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, b0, b0);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Implicit, su, l_a)
+    };
+    env.add_decl(Declaration::Definition {
+        name: eager_n,
+        level_params: Box::new([u]),
+        ty: eager_ty,
+        val: eager_val,
+        hint: ReducibilityHint::Regular(0),
+    })
+    .unwrap();
+
+    let big1 = env.arena.lit_nat(1_000_000_000_000);
+    let big2 = env.arena.lit_nat(3_600_000_000_000);
+    let big2_pred = env.arena.lit_nat(3_599_999_999_999);
+    let n0 = env.arena.lit_nat(0);
+    let n1 = env.arena.lit_nat(1);
+    let mot_nat = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, nat);
+
+    // 1. Abbrev `Nat.casesOn` with concrete major `0` and differing 12-digit `Nat.sub` lambda arms.
+    let arm1 = {
+        let body = env.arena.app_n(nat_sub, &[b0, big1]);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body)
+    };
+    let arm2 = {
+        let body = env.arena.app_n(nat_sub, &[b0, big2]);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body)
+    };
+    let case_a = env.arena.app_n(cases_on, &[mot_nat, n0, n0, arm1]);
+    let case_b = env.arena.app_n(cases_on, &[mot_nat, n0, n0, arm2]);
+    let case_c = env.arena.app_n(cases_on, &[mot_nat, n0, n1, arm2]);
+
+    // 2. Reflection fast path (`Bool.true`) + `is_def_eq_offset` (`Nat.succ big2_pred == big2`).
+    let beq_same = env.arena.app_n(nat_beq, &[big2, big2]);
+    let beq_diff = env.arena.app_n(nat_beq, &[big1, big2]);
+    let succ_big2_pred = env.arena.app(succ, big2_pred);
+
+    // 3. `eagerReduce _ _` enables `reduce_nat` / `Bool.true` reflection even when an opaque fvar `x : Nat`
+    //    appears syntactically in the argument (`Nat.beq (constNat x 3_600_000_000_000) 3_600_000_000_000 = true`).
+    let eq1 = env.arena.const_path("Eq", [l1]);
+    let refl1 = env.arena.const_path("Eq.refl", [l1]);
+    let eager0 = env.arena.const_path("eagerReduce", [Arena::LEVEL_ZERO]);
+    let id_prop_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, b0, b1);
+    let id_prop_ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Implicit, prop, id_prop_ty);
+    let id_prop_val = {
+        let l_h = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, b0, b0);
+        env.arena.lam(Arena::ANONYMOUS, BinderInfo::Implicit, prop, l_h)
+    };
+    let id_prop_n = env.arena.name_from_path("idProp");
+    env.add_decl(Declaration::Definition {
+        name: id_prop_n,
+        level_params: Box::new([]),
+        ty: id_prop_ty,
+        val: id_prop_val,
+        hint: ReducibilityHint::Abbrev,
+    })
+    .unwrap();
+    let id_prop = env.arena.const_(id_prop_n, []);
+
+    let thm_n = env.arena.name_from_path("eager_reduce_with_fvar");
+    let (thm_ty, thm_val) = {
+        let cx = env.arena.app_n(const_nat, &[b0, big2]);
+        let lhs = env.arena.app_n(nat_beq, &[cx, big2]);
+        let goal = env.arena.app_n(eq1, &[bool_c, lhs, btrue]);
+        let refl_true = env.arena.app_n(refl1, &[bool_c, btrue]);
+        let eq_tt = env.arena.app_n(eq1, &[bool_c, btrue, btrue]);
+        let eager_arg = env.arena.app_n(eager0, &[eq_tt, refl_true]);
+        let body = env.arena.app_n(id_prop, &[goal, eager_arg]);
+        let ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, goal);
+        let val = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, body);
+        (ty, val)
+    };
+    env.add_decl(Declaration::Theorem {
+        name: thm_n,
+        level_params: Box::new([]),
+        ty: thm_ty,
+        val: thm_val,
+    })
+    .expect("eagerReduce theorem with free variable must verify in O(1)");
+
+    let frozen = env.freeze();
+    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
+    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    assert!(tc.is_def_eq(case_a, case_b).unwrap(), "Abbrev casesOn must unfold without comparing lambda arms");
+    assert!(!tc.is_def_eq(case_a, case_c).unwrap(), "Abbrev casesOn with distinct zero arms must not be equal");
+    assert!(tc.is_def_eq(beq_same, btrue).unwrap(), "Bool.true reflection fast path (rhs)");
+    assert!(tc.is_def_eq(btrue, beq_same).unwrap(), "Bool.true reflection fast path (lhs)");
+    assert!(!tc.is_def_eq(beq_diff, btrue).unwrap(), "Bool.true reflection must reject false");
+    assert!(tc.is_def_eq(succ_big2_pred, big2).unwrap(), "is_def_eq_offset must match succ with Nat lit");
+}
