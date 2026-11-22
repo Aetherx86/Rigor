@@ -1,20 +1,26 @@
 # Rigor Benchmarks & Optimization Report
 
-## 0. Full Lean 4 `Init` library vs `leanchecker --fresh` (2026-11-22)
+## 0. Full Lean 4 `Init` and `Std` libraries vs `leanchecker --fresh` (2026-11-22)
 
-All of Lean 4 v4.36.0-rc1 `Init`: 58,546 declarations (59,978 environment entries), exported with
-`lake env lean4export Init` (6,495,289 NDJSON lines, 331.7 MiB). Same Apple M4 (10 cores), measured with
-`/usr/bin/time -l` on an otherwise idle machine:
+Measured on the same Apple M4 (10 cores) with `/usr/bin/time -l` on an idle machine against Lean 4
+v4.36.0-rc1 exports from `lake env lean4export`:
 
-| Checker | Wall time | Peak RSS |
-| :--- | ---: | ---: |
-| `lake env leanchecker --fresh Init` | 28.67 s | 547 MB |
-| Rigor, parallel (`rigor-bench --check`, 10 threads) | 7.78 s | 445 MB |
-| Rigor, sequential (`RIGOR_SEQUENTIAL=1`) | 23.89 s | 377 MB |
+- **`Init`**: 58,546 declarations (59,978 environment entries), 6,495,289 NDJSON lines, 331.7 MiB.
+- **`Std`**: 96,626 declarations (99,305 environment entries), 10,123,003 NDJSON lines, 532.0 MiB.
 
-Rigor's time includes parsing the 332 MiB JSON export; leanchecker reads compiled `.olean` files. Both
-accept the whole library. Soundness evidence beyond acceptance: `tools/mutation/` (1,300 mutants of
-Init.Prelude and Init.Core; every meaning-changing mutant rejected, see REPORT.md).
+| Library | Checker | Wall time | Peak RSS |
+| :--- | :--- | ---: | ---: |
+| `Init` | `lake env leanchecker --fresh Init` | 28.67 s | 547 MB |
+| `Init` | Rigor, parallel (`rigor-bench --check`, 10 threads) | 8.54 s | 479 MB |
+| `Init` | Rigor, sequential (`RIGOR_SEQUENTIAL=1`) | 25.06 s | 404 MB |
+| `Std` | `lake env leanchecker --fresh Std` | 44.18 s | 928 MB |
+| `Std` | Rigor, parallel (`rigor-bench --check`, 10 threads) | 11.68 s | 695 MB |
+| `Std` | Rigor, sequential (`RIGOR_SEQUENTIAL=1`) | 44.88 s | 567 MB |
+
+Rigor's wall time includes parsing the 332 MiB (`Init`) / 532 MiB (`Std`) NDJSON export; `leanchecker`
+reads compiled `.olean` files. Both accept the full libraries. Soundness evidence beyond acceptance:
+`tools/mutation/` (1,440 mutants across `Init.Prelude`, `Init.Core`, and full `Init`; every
+meaning-changing mutant rejected, see `tools/mutation/REPORT.md`).
 
 The single-module figures in the sections below were measured earlier, before full-library support, and
 are not representative of whole-library performance.
@@ -25,8 +31,8 @@ This document records reproducible performance, Peak RSS memory, and CPU profili
 
 - **Hardware:** Apple M4 (10 CPU cores, 16 GiB RAM, macOS)
 - **Toolchain:** Rust `rustc` / `cargo` (`--release`), `/usr/bin/time -l` (OS-level maximum resident set size), `/usr/bin/sample` (CPU call-stack profiler)
-- **Kernel TCB Footprint:** `crates/kernel/src/*.rs` = **3,155 SLOC** excluding tests, comments and blank lines (`#![forbid(unsafe_code)]`, zero third-party crates); above the 2,500 target since arbitrary-precision `Nat`, parallel checking and the compact arena were added
-- **Correctness Gate:** 25/25 unit, inductive, `lean4export`, regression, and soundness torture tests passing with 0 warnings; all of Lean 4 `Init` accepted; mutation harness in `tools/mutation/`.
+- **Kernel TCB Footprint:** `crates/kernel/src/*.rs` = **3,300 SLOC** excluding tests, comments and blank lines (`#![forbid(unsafe_code)]`, zero third-party crates); above the 2,500 target since arbitrary-precision `Nat`, parallel checking, compact arena, and full `Std` reduction parity were added (`tools/tcb/PLAN.md` targets < 2,500 SLOC)
+- **Correctness Gate:** 26/26 unit, inductive, `lean4export`, regression, and soundness torture tests passing with 0 warnings; all of Lean 4 `Init` and `Std` accepted; mutation harness in `tools/mutation/`.
 
 ---
 

@@ -449,7 +449,7 @@ impl<'a> TypeChecker<'a> {
         false
     }
 
-    fn try_reduce_nat(&mut self, name: NameId, spine: &[ExprId], allow_succ: bool) -> Option<(ExprId, usize)> {
+    fn try_reduce_nat(&mut self, name: NameId, spine: &[ExprId], allow_delta: bool) -> Option<(ExprId, usize)> {
         use crate::nat::{Nat, MAX_BITS};
         let len = spine.len();
         if len == 0 { return None; }
@@ -458,7 +458,7 @@ impl<'a> TypeChecker<'a> {
         if *gp != crate::arena::Arena::ANONYMOUS || pseg.as_ref() != "Nat" { return None; }
         // The operations Lean's kernel evaluates on literals (GMP there, `Nat` here).
         let op: &'static str = match seg.as_ref() {
-            "succ" if allow_succ => "succ", "log2" => "log2",
+            "succ" if allow_delta => "succ", "log2" => "log2",
             "add" => "add", "sub" => "sub", "mul" => "mul", "pow" => "pow", "div" => "div", "mod" => "mod",
             "gcd" => "gcd", "beq" => "beq", "ble" => "ble", "land" => "land", "lor" => "lor", "xor" => "xor",
             "shiftLeft" => "shiftLeft", "shiftRight" => "shiftRight",
@@ -481,8 +481,14 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             }
         };
+        // Match Lean's `whnf` vs `lazy_delta_reduction`: in `whnf` (`allow_delta == true`),
+        // always try `reduce_nat` even when an argument syntactically mentions an opaque fvar
+        // (e.g. `ctorIdx (C x)` drops `x` and reduces to a literal, preventing `Nat.mod` from
+        // unfolding into `Nat.modCore`). In non-delta reduction, skip open args unless eager.
         let arity = if op == "succ" || op == "log2" { 1 } else { 2 };
-        if len < arity || (!self.eager_reduce && spine[len - arity..].iter().any(|&x| self.has_opaque_fvar(x))) {
+        if len < arity
+            || (!allow_delta && !self.eager_reduce && spine[len - arity..].iter().any(|&x| self.has_opaque_fvar(x)))
+        {
             return None;
         }
         if op == "succ" || op == "log2" {

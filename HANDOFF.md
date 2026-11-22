@@ -165,3 +165,16 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
   was likely asleep; re-measure Init/Std timings on an awake, idle machine before recording them.
   NEXT (gem): fix this blocker, then full Std parallel + sequential and leanchecker comparison (44.18 s /
   927.5 MB), then Task E (tools/tcb/PLAN.md) and the MEMORY.md plan. Always run long checks with `timeout`.
+- 2026-11-22 16:40 KST (gem, coordinator turn): Fixed the `_private.Std.Time.Format.0.Std.Time.PlainTime.format._sparseCasesOn_1` blocker!
+  * Root cause: `try_reduce_nat` still had an `has_opaque_fvar` guard even when `allow_delta == true` (`whnf`). In `_sparseCasesOn_1`, `Std.Time.Modifier.ctorIdx (Std.Time.Modifier.G x)` syntactically mentions opaque fvar `x` but reduces to a constant `Nat` literal; the guard prevented `Nat.mod` from reducing in `whnf`, causing `Nat.mod` to unfold into `Nat.modCore` repeated subtraction.
+  * Fix (`crates/kernel/src/reduce.rs`): apply the `has_opaque_fvar` guard in `try_reduce_nat` ONLY when `!allow_delta && !self.eager_reduce` (matching Lean 4's `whnf` vs `lazy_delta_reduction`), plus regression test in `crates/kernel/tests/inductives.rs`.
+  * Verified: `cargo test -q --workspace` 26/26 passed, 0 warnings. Idle-machine results (`/usr/bin/time -l`, sequential runs, no contention):
+    - Full `Init` (58,546 decls / 59,978 env_decls, 6,495,289 lines, 331.7 MiB):
+      * parallel: **8.54 s** wall, **478,887,936 B (478.9 MB / 456.7 MiB)** peak RSS (vs `leanchecker --fresh Init` 28.67 s / 547 MB)
+      * sequential: **25.06 s** wall, **404,422,656 B (404.4 MB / 385.7 MiB)** peak RSS
+    - Full `Std` (96,626 decls / 99,305 env_decls, 10,123,003 lines, 532.0 MiB):
+      * parallel: **11.68 s** wall, **694,927,360 B (694.9 MB / 662.7 MiB)** peak RSS (**3.78x faster, 25.1% less RAM** vs `leanchecker --fresh Std` 44.18 s / 927.5 MB)
+      * sequential: **44.88 s** wall, **566,657,024 B (566.7 MB / 540.4 MiB)** peak RSS
+  * Updated `BENCHMARKS.md` and `Worklog.md`; committing & pushing now.
+  * NEXT: Task E (`tools/tcb/PLAN.md`: reduce `crates/kernel/src/*.rs` from 3,300 SLOC to < 2,500 SLOC, Wave 1 -> Wave 2 -> Wave 3), then `tools/tcb/MEMORY.md` per-thread memory optimizations. Starting Wave 1 now.
+- 2026-11-22 16:35 KST (agy-mut): Silica portal page upgrade done in ~/Documents/aetherx86.github.io/silica/{index.html,sim.js,test.mjs} (no edits to ~/rigor/crates, no commit/push). Ported Kotlin Rule (B/S + legacy S/B notation, rejects counts > 8 and reversed S/B letters), Rle (read/parse/write with MAX_COORDINATE=2^30, MAX_RUN_LENGTH=1,000,000, DEFAULT_MAX_CELLS=10,000,000, 70-char wrapping, header/comments/topology-suffix support), Patterns (GLIDER, GOSPER_GUN, ACORN, DIEHARD, PULSAR, R_PENTOMINO, BLINKER, BLOCK), and active-span Life engine supporting arbitrary B/S rules (including B0 fallback). Updated index.html with strict CSP (`script-src 'self'`, zero inline handlers/scripts), responsive mobile layout, rule input + presets, pattern presets, and RLE import/export panel. Verified: `node ~/Documents/aetherx86.github.io/silica/test.mjs` passed (`all silica checks passed`, 0.40s wall, including Diehard dies at gen 130 and Acorn reaches 633 cells at gen 5206 on 2600x2600) + static HTML/JS/CSP check (`HTML_JS_CSP_OK`, 21/21 IDs matched, 0 inline handlers/scripts).

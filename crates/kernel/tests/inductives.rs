@@ -736,6 +736,33 @@ fn lazy_delta_abbrev_reflection_and_eager_reduce_regressions() {
     })
     .expect("eagerReduce theorem with free variable must verify in O(1)");
 
+    // 4. `whnf` (`allow_delta = true`) must try `reduce_nat` even when an argument syntactically
+    //    mentions an opaque free variable that vanishes upon reduction (as in `ctorIdx (C x)` inside
+    //    `Std.Time.PlainTime.format._sparseCasesOn_1`), without `eagerReduce`.
+    let thm_whnf_n = env.arena.name_from_path("whnf_reduce_nat_with_vanishing_fvar");
+    let (thm_whnf_ty, thm_whnf_val) = {
+        let cx = env.arena.app_n(const_nat, &[b0, big2]);
+        let sub_e = env.arena.app_n(nat_sub, &[cx, big2]);
+        // Putting `sub_e` as the major premise of `Nat.rec` forces `whnf(sub_e)` under opaque `x : Nat`.
+        let step_id = {
+            let inner = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, b0);
+            env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, inner)
+        };
+        let rec_e = env.arena.app_n(nat_rec1, &[mot_nat, n0, step_id, sub_e]);
+        let goal = env.arena.app_n(eq1, &[nat, rec_e, n0]);
+        let refl0 = env.arena.app_n(refl1, &[nat, n0]);
+        let ty = env.arena.pi(Arena::ANONYMOUS, BinderInfo::Default, nat, goal);
+        let val = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, nat, refl0);
+        (ty, val)
+    };
+    env.add_decl(Declaration::Theorem {
+        name: thm_whnf_n,
+        level_params: Box::new([]),
+        ty: thm_whnf_ty,
+        val: thm_whnf_val,
+    })
+    .expect("whnf must reduce Nat.sub on vanishing fvar without unfolding Nat.sub");
+
     let frozen = env.freeze();
     let mut scratch = Arena::child(Arc::clone(&frozen.arena));
     let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
