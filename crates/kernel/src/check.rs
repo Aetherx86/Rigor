@@ -225,29 +225,20 @@ impl<'a> TypeChecker<'a> {
         };
 
         let ctor_ty = instantiate_level_params(self.arena, ctor.ty, &ctor.level_params, &lvls);
-        let (mut cur, complete) = self.inst_pis(ctor_ty, &args);
-        assert!(complete, "constructor parameter telescope mismatch");
-        for field_i in 0..=idx {
-            cur = self.whnf(cur);
-            match self.arena.get_expr(cur) {
-                ExprData::Pi { ty, body, .. } => {
-                    let (ty, body) = (*ty, *body);
-                    if field_i == idx {
-                        if ind.is_prop && !ind.can_elim_large {
-                            let field_sort = self.infer_sort(ty)?;
-                            if !level_is_zero(self.arena, field_sort) {
-                                return Err(err("cannot project non-Prop field out of a non-Subsingleton Prop inductive"));
-                            }
-                        }
-                        return Ok(ty);
-                    }
-                    let prev_proj = self.arena.proj(struct_name, field_i, expr);
-                    cur = instantiate1(self.arena, body, prev_proj);
-                }
-                _ => unreachable!("constructor field telescope mismatch"),
+        // parameters, then the earlier fields as projections of `expr`, then field `idx`'s type
+        let earlier: Vec<ExprId> = (0..idx).map(|i| self.arena.proj(struct_name, i, expr)).collect();
+        let args: Vec<ExprId> = args.into_iter().chain(earlier).collect();
+        let (cur, complete) = self.inst_pis(ctor_ty, &args);
+        let cur = self.whnf(cur);
+        let ExprData::Pi { ty, .. } = *self.arena.get_expr(cur) else { unreachable!("constructor field telescope mismatch") };
+        assert!(complete, "constructor telescope mismatch");
+        if ind.is_prop && !ind.can_elim_large {
+            let field_sort = self.infer_sort(ty)?;
+            if !level_is_zero(self.arena, field_sort) {
+                return Err(err("cannot project non-Prop field out of a non-Subsingleton Prop inductive"));
             }
         }
-        unreachable!()
+        Ok(ty)
     }
 
     /// Check that `decl` is completely well-formed and well-typed in the current environment.
