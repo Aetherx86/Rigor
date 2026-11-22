@@ -139,3 +139,61 @@ RIGOR_THREADS=4 python3 /Users/sushikim/rigor/tools/mutation/mutate.py --input /
 ### Accepted Mutants
 
 None. Every generated mutant was rejected by Rigor.
+
+---
+
+## Round 3: Init.ndjson (seed=3, 20 per operator)
+
+### Command
+
+```sh
+RIGOR_THREADS=4 python3 /Users/sushikim/rigor/tools/mutation/mutate.py --input /Users/sushikim/rigor-data/exports/Init.ndjson --checker /tmp/rigor-bench-round3 --seed 3 --per-op 20 --workers 2 --truncate --report /Users/sushikim/rigor/tools/mutation/REPORT.md --append-report --section-title "Round 3: Init.ndjson (seed=3, 20 per operator)" --json-out /Users/sushikim/rigor/tools/mutation/results_round3_init.json
+```
+
+### Sanity Check (Unmutated Input)
+
+- Result: PASS (`CHECK_OK file=/Users/sushikim/rigor-data/exports/Init.ndjson decls=58546 env_decls=59978 lines=6495289 mib=331.66 time_ms=29058.52 decls_per_sec=2015 mib_per_sec=11.4 arena_exprs=6311599`)
+- Total elapsed time: 820.46 s
+- Truncation mode: ON (avg 3,542,856 / 6,495,289 lines = 54.5% per mutant; 2 Stage-1 accept(s) re-verified against the full un-truncated file)
+
+### Summary by Mutation Operator
+
+| Operator | Total | Rejected | Accepted | Rejection Rate |
+|---|---:|---:|---:|---:|
+| `thm_value_swap` | 20 | 20 | 0 | 100.0% |
+| `const_swap` | 20 | 20 | 0 | 100.0% |
+| `arg_swap` | 20 | 20 | 0 | 100.0% |
+| `level_change` | 20 | 20 | 0 | 100.0% |
+| `def_body_rfl_break` | 20 | 19 | 1 | 95.0% |
+| `inductive_mutation` | 20 | 20 | 0 | 100.0% |
+| `level_arity_mismatch` | 20 | 20 | 0 | 100.0% |
+| **Total** | **140** | **139** | **1** | **99.3%** |
+
+### Operator 5 (`def_body_rfl_break`) Rejection Breakdown
+
+- Rejected mutants: 19
+- Rejected at a later dependent declaration: 3
+- Rejected at the mutated declaration itself: 16
+
+### Operator 6 (`inductive_mutation`) Rejection Breakdown
+
+- Rejected mutants: 20
+- Rejected at a later dependent declaration: 6
+- Rejected at the mutated declaration itself: 14
+
+### Accepted Mutants
+
+- Mutant #89 (`def_body_rfl_break`): target `HSMul.hSMul` (line 554307) -- in def HSMul.hSMul (rfl deps: _private.Init.Grind.Ring.IntSolver.0.Lean.Grind.CommRing.eq_norm_unsat_expr._proof_1_6 (via Lean.Grind.CommRing.Poly.denote) (via Lean.Grind.CommRing.Poly.denote._f), Lean.Grind.CommRing.Poly.denote_insertC (via Lean.Grind.CommRing.Poly.denote) (via Lean.Grind.CommRing.Poly.denote._f)), same-type const swap outParam -> semiOutParam | output: `CHECK_OK file=/var/folders/4k/zxttxcf53d3616s6mvcsv_xc0000gn/T/rigor_mut_7pm4l_8v/mutant_0089.ndjson decls=58546 env_decls=59978 lines=6495294 mib=331.66 time_ms=25259.84 decls_per_sec=2318 mib_per_sec=13.1 arena_exprs=6311604`
+
+### Review of Accepted Mutants (Round 3)
+
+Note: `/tmp/rigor-bench-round3` in the command above was an unmodified snapshot of `/Users/sushikim/rigor/target/release/rigor-bench` used to isolate the run from concurrent rebuilds.
+
+The single accepted mutant is **harmless (definitionally equal term, not a soundness bug)**:
+
+- Mutant #89 (`HSMul.hSMul`, `~/.elan/toolchains/leanprover--lean4---v4.36.0-rc1/src/lean/Init/Prelude.lean:1560`): `HSMul` is declared as `class HSMul (α : Type u) (β : Type v) (γ : outParam (Type w)) where hSMul : α → β → γ`, so the binder type of `γ` inside the projection definition `HSMul.hSMul` mentions `outParam (Type w)`. The mutation swapped `outParam` for `semiOutParam`. In Lean 4 v4.36.0-rc1 (`Init/Prelude.lean`), both are identity functions on types used solely as elaborator/typeclass-synthesis metadata gadgets:
+  - `~/.elan/toolchains/leanprover--lean4---v4.36.0-rc1/src/lean/Init/Prelude.lean:749`: `@[reducible] def outParam (α : Sort u) : Sort u := α`
+  - `~/.elan/toolchains/leanprover--lean4---v4.36.0-rc1/src/lean/Init/Prelude.lean:772`: `@[reducible] def semiOutParam (α : Sort u) : Sort u := α`
+  In `Init.ndjson` (lines 635 and 162480), both declarations even share the exact same exported `type` (`ie=495`), `value` (`ie=496`), `levelParams` (`[2]`), and `hints` (`{"regular": 1}`). Thus `outParam (Type w)` and `semiOutParam (Type w)` are definitionally equal (both delta-beta reduce to `Type w`), so replacing `outParam` with `semiOutParam` yields a definitionally equal body for `HSMul.hSMul`. Accepting it is correct; Lean's kernel accepts it as well.
+- Stage-2 truncation check note: 2 of 140 mutants passed Stage 1 (truncated prefix) and were automatically re-verified against the full 6,495,289-line `Init.ndjson`; Mutant #108 (`inductive_mutation` on `Lean.Grind.CommRing.Poly.NonnegCoeffs.below`, `Prop -> Type 0`) was caught on the full file at `Lean.Grind.CommRing.Poly.NonnegCoeffs.below.casesOn` (`universe parameter count mismatch`), leaving only Mutant #89 accepted.
+- Conclusion: across 140 Round 3 mutants on full `Init.ndjson` (20 per operator, seed 3), 139 were rejected and the sole accepted mutant (#89) is a definitionally equal elaborator-marker swap (`outParam -> semiOutParam`); no soundness bug found.
