@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::arena::{Arena, ExprData, ExprId, NameId};
 use crate::check::TypeChecker;
 use crate::error::KernelError;
-use crate::hash::{FxHashMap, FxHashSet};
+use crate::expr::any_subexpr;
+use crate::hash::FxHashMap;
 use crate::inductive::{check_inductive_block, InductiveSpec};
 
 /// Delta-reduction hint, matching Lean 4's `ReducibilityHints`.
@@ -125,28 +126,14 @@ impl Environment {
 
     /// Compute Lean 4-style definition height: `1 + max(height of referenced definitions)`.
     pub fn compute_height(&self, expr: ExprId) -> u32 {
-        let mut visited = FxHashSet::default();
-        self.max_height_rec(expr, &mut visited).saturating_add(1)
-    }
-
-    fn max_height_rec(&self, e: ExprId, visited: &mut FxHashSet<ExprId>) -> u32 {
-        if !visited.insert(e) { return 0; }
-        match self.arena.get_expr(e) {
-            ExprData::Const(name, _) => match self.decls.get(name) {
-                Some(Declaration::Definition { hint: ReducibilityHint::Regular(h), .. }) => *h,
-                _ => 0,
-            },
-            ExprData::App(f, a) => self.max_height_rec(*f, visited).max(self.max_height_rec(*a, visited)),
-            ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => {
-                self.max_height_rec(*ty, visited).max(self.max_height_rec(*body, visited))
+        let mut h = 0;
+        any_subexpr(&self.arena, expr, |_, _| false, |d| {
+            if let ExprData::Const(n, _) = d {
+                if let Some(Declaration::Definition { hint: ReducibilityHint::Regular(x), .. }) = self.decls.get(n) { h = h.max(*x); }
             }
-            ExprData::Let { ty, val, body, .. } => self
-                .max_height_rec(*ty, visited)
-                .max(self.max_height_rec(*val, visited))
-                .max(self.max_height_rec(*body, visited)),
-            ExprData::Proj { expr, .. } => self.max_height_rec(*expr, visited),
-            ExprData::BVar(_) | ExprData::FVar(_) | ExprData::Sort(_) | ExprData::Lit(_) => 0,
-        }
+            false
+        });
+        h.saturating_add(1)
     }
 
     /// Type-check and insert a declaration into the global environment.
@@ -223,59 +210,36 @@ impl Environment {
         let q_u = self.arena.const_(q_n, [lu]);
         let qmk_u = self.arena.const_(qmk_n, [lu]);
         let eq_v = self.arena.const_(eq_n, [lv]);
-        let r_ty = {
-            let inner = self.arena.pi(Arena::ANONYMOUS, BD, b1, prop);
-            self.arena.pi(Arena::ANONYMOUS, BD, b0, inner)
+        // Right-nested anonymous Pi types: pis([(bi, A), (bi', B)], C) = (A) -> (B) -> C.
+        let pis = |a: &mut Arena, bs: &[(crate::arena::BinderInfo, ExprId)], body: ExprId| {
+            bs.iter().rev().fold(body, |acc, &(bi, ty)| a.pi(Arena::ANONYMOUS, bi, ty, acc))
         };
-
+        let r_ty = pis(&mut self.arena, &[(BD, b0), (BD, b1)], prop);
         // Quot.{u} : {α : Sort u} → (r : α → α → Prop) → Sort u
-        let q_ty = {
-            let p_r = self.arena.pi(Arena::ANONYMOUS, BD, r_ty, su);
-            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
-        };
+        let q_ty = pis(&mut self.arena, &[(BI, su), (BD, r_ty)], su);
         // Quot.mk.{u} : {α : Sort u} → (r : α → α → Prop) → α → Quot.{u} α r
-        let qmk_ty = {
-            let ret = self.arena.app_n(q_u, &[b2, b1]);
-            let p_a = self.arena.pi(Arena::ANONYMOUS, BD, b1, ret);
-            let p_r = self.arena.pi(Arena::ANONYMOUS, BD, r_ty, p_a);
-            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
-        };
+        let ret = self.arena.app_n(q_u, &[b2, b1]);
+        let qmk_ty = pis(&mut self.arena, &[(BI, su), (BD, r_ty), (BD, b1)], ret);
         // Quot.lift.{u,v} : {α : Sort u} → {r : α → α → Prop} → {β : Sort v} → (f : α → β)
         //   → (∀ a b, r a b → Eq.{v} β (f a) (f b)) → Quot.{u} α r → β
-        let qlift_ty = {
-            let q_ar = self.arena.app_n(q_u, &[b4, b3]);
-            let q_to_b = self.arena.pi(Arena::ANONYMOUS, BD, q_ar, b3);
-            // Under (α:#6, r:#5, β:#4, f:#3, a:#2, b:#1, _:#0): Eq.{v} β (f a) (f b)
-            let fa_s = self.arena.app(b3, b2);
-            let fb_s = self.arena.app(b3, b1);
-            let eq_fafb_s = self.arena.app_n(eq_v, &[b4, fa_s, fb_s]);
-            let rab = self.arena.app_n(b4, &[b1, b0]);
-            let h_pi = self.arena.pi(Arena::ANONYMOUS, BD, rab, eq_fafb_s);
-            let b_pi = self.arena.pi(Arena::ANONYMOUS, BD, b4, h_pi);
-            let a_pi = self.arena.pi(Arena::ANONYMOUS, BD, b3, b_pi);
-            let f_ty = self.arena.pi(Arena::ANONYMOUS, BD, b2, b1);
-            let p_h = self.arena.pi(Arena::ANONYMOUS, BD, a_pi, q_to_b);
-            let p_f = self.arena.pi(Arena::ANONYMOUS, BD, f_ty, p_h);
-            let p_b = self.arena.pi(Arena::ANONYMOUS, BI, sv, p_f);
-            let p_r = self.arena.pi(Arena::ANONYMOUS, BI, r_ty, p_b);
-            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
-        };
+        // Under (α:#6, r:#5, β:#4, f:#3, a:#2, b:#1, _:#0): Eq.{v} β (f a) (f b)
+        let (fa, fb) = (self.arena.app(b3, b2), self.arena.app(b3, b1));
+        let eq_fafb = self.arena.app_n(eq_v, &[b4, fa, fb]);
+        let rab = self.arena.app_n(b4, &[b1, b0]);
+        let resp = pis(&mut self.arena, &[(BD, b3), (BD, b4), (BD, rab)], eq_fafb);
+        let f_ty = pis(&mut self.arena, &[(BD, b2)], b1);
+        let q_ar = self.arena.app_n(q_u, &[b4, b3]);
+        let qlift_ty = pis(&mut self.arena, &[(BI, su), (BI, r_ty), (BI, sv), (BD, f_ty), (BD, resp), (BD, q_ar)], b3);
         // Quot.ind.{u} : {α : Sort u} → {r : α → α → Prop} → {β : Quot.{u} α r → Prop}
         //   → (∀ a, β (Quot.mk α r a)) → ∀ q, β q
-        let qind_ty = {
-            let q_ar_2 = self.arena.app_n(q_u, &[b1, b0]);
-            let beta_ty = self.arena.pi(Arena::ANONYMOUS, BD, q_ar_2, prop);
-            let q_ar_4 = self.arena.app_n(q_u, &[b3, b2]);
-            let bq = self.arena.app(b2, b0);
-            let all_q = self.arena.pi(Arena::ANONYMOUS, BD, q_ar_4, bq);
-            let mk_a = self.arena.app_n(qmk_u, &[b3, b2, b0]);
-            let b_mka = self.arena.app(b1, mk_a);
-            let all_a = self.arena.pi(Arena::ANONYMOUS, BD, b2, b_mka);
-            let p_h = self.arena.pi(Arena::ANONYMOUS, BD, all_a, all_q);
-            let p_b = self.arena.pi(Arena::ANONYMOUS, BI, beta_ty, p_h);
-            let p_r = self.arena.pi(Arena::ANONYMOUS, BI, r_ty, p_b);
-            self.arena.pi(Arena::ANONYMOUS, BI, su, p_r)
-        };
+        let q_ar_2 = self.arena.app_n(q_u, &[b1, b0]);
+        let beta_ty = pis(&mut self.arena, &[(BD, q_ar_2)], prop);
+        let mk_a = self.arena.app_n(qmk_u, &[b3, b2, b0]);
+        let b_mka = self.arena.app(b1, mk_a);
+        let all_a = pis(&mut self.arena, &[(BD, b2)], b_mka);
+        let q_ar_4 = self.arena.app_n(q_u, &[b3, b2]);
+        let bq = self.arena.app(b2, b0);
+        let qind_ty = pis(&mut self.arena, &[(BI, su), (BI, r_ty), (BI, beta_ty), (BD, all_a), (BD, q_ar_4)], bq);
 
         let decls = [
             Declaration::Quot { name: q_n, level_params: Box::new([u]), ty: q_ty, kind: QuotKind::Type },
@@ -309,23 +273,13 @@ impl Environment {
     pub fn set_deferred_checking(&mut self, on: bool) { self.defer = on; }
 
     fn require_known_consts(&self, e: ExprId) -> Result<(), KernelError> {
-        let mut stack = vec![e];
-        let mut seen = FxHashSet::default();
-        while let Some(x) = stack.pop() {
-            if !seen.insert(x) { continue; }
-            match self.arena.get_expr(x) {
-                ExprData::Const(n, _) => if !self.decls.contains_key(n) { return Err(KernelError::UnknownConstant(*n)); },
-                ExprData::App(f, a) => { stack.push(*f); stack.push(*a); }
-                ExprData::Lam { ty, body, .. } | ExprData::Pi { ty, body, .. } => { stack.push(*ty); stack.push(*body); }
-                ExprData::Let { ty, val, body, .. } => { stack.push(*ty); stack.push(*val); stack.push(*body); }
-                ExprData::Proj { struct_name, expr, .. } => {
-                    if !self.decls.contains_key(struct_name) { return Err(KernelError::UnknownConstant(*struct_name)); }
-                    stack.push(*expr);
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        let mut missing = None;
+        any_subexpr(&self.arena, e, |_, _| false, |d| {
+            let (ExprData::Const(n, _) | ExprData::Proj { struct_name: n, .. }) = d else { return false };
+            if !self.decls.contains_key(n) { missing = Some(*n); }
+            missing.is_some()
+        });
+        missing.map_or(Ok(()), |n| Err(KernelError::UnknownConstant(n)))
     }
 
     /// Type-check every deferred declaration on `threads` worker threads (each declaration in its
