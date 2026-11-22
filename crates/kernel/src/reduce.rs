@@ -211,8 +211,8 @@ impl<'a> TypeChecker<'a> {
                             if rec.rules.len() == 1 && rec.all.len() == 1 && rec.num_indices == 0
                                 && !matches!(self.arena.get_expr(mhead), ExprData::Const(cn, _) if *cn == rec.rules[0].ctor_name || *cn == name)
                             {
-                                if let Some(Declaration::Inductive(ind)) = self.decls.get(&rec.all[0]) {
-                                    if !ind.is_prop && !ind.is_rec && ind.ctors.len() == 1 && ind.num_indices == 0 && ind.all.len() == 1 {
+                                if let Some(ind) = self.structure(rec.all[0]) {
+                                    if !ind.is_prop {
                                         if let Ok(mty) = self.infer_type_only(major) {
                                             let mty_w = self.whnf(mty);
                                             let (th, ta) = self.app_spine(mty_w);
@@ -688,14 +688,8 @@ impl<'a> TypeChecker<'a> {
         let a_ty_w = self.whnf(a_ty);
         let (head, _) = self.app_spine(a_ty_w);
         let ExprData::Const(iname, _) = *self.arena.get_expr(head) else { return Ok(false) };
-        let Some(Declaration::Inductive(ind)) = self.decls.get(&iname) else { return Ok(false) };
-        if ind.is_rec || ind.ctors.len() != 1 || ind.num_indices != 0 || ind.all.len() != 1 {
-            return Ok(false);
-        }
-        let Some(Declaration::Constructor(c)) = self.decls.get(&ind.ctors[0]) else { return Ok(false) };
-        if c.num_fields != 0 {
-            return Ok(false);
-        }
+        let Some(ind) = self.structure(iname) else { return Ok(false) };
+        if !matches!(self.decls.get(&ind.ctors[0]), Some(Declaration::Constructor(c)) if c.num_fields == 0) { return Ok(false); }
         let b_ty = self.infer_type_only(b)?;
         self.is_def_eq(a_ty_w, b_ty)
     }
@@ -704,12 +698,8 @@ impl<'a> TypeChecker<'a> {
         let (head, args) = self.app_spine(ctor_side);
         let ExprData::Const(cname, _) = *self.arena.get_expr(head) else { return Ok(false) };
         let Some(Declaration::Constructor(c)) = self.decls.get(&cname) else { return Ok(false) };
-        let Some(Declaration::Inductive(ind)) = self.decls.get(&c.ind_name) else { return Ok(false) };
-        if ind.is_prop || ind.is_rec || ind.ctors.len() != 1 || ind.num_indices != 0 || ind.all.len() != 1
-            || args.len() != (c.num_params + c.num_fields) as usize
-        {
-            return Ok(false);
-        }
+        let Some(ind) = self.structure(c.ind_name) else { return Ok(false) };
+        if ind.is_prop || args.len() != (c.num_params + c.num_fields) as usize { return Ok(false); }
         let other_ty = self.infer_type_only(other)?;
         let other_ty_w = self.whnf(other_ty);
         let (ohead, oargs) = self.app_spine(other_ty_w);
@@ -721,6 +711,14 @@ impl<'a> TypeChecker<'a> {
             if !self.is_def_eq(args[c.num_params as usize + fi as usize], rhs)? { return Ok(false); }
         }
         Ok(true)
+    }
+
+    /// `name` as a structure: a non-recursive, non-mutual inductive with one constructor and no indices.
+    fn structure(&self, name: NameId) -> Option<&'a crate::env::InductiveInfo> {
+        match self.decls.get(&name)? {
+            Declaration::Inductive(i) if !i.is_rec && i.ctors.len() == 1 && i.num_indices == 0 && i.all.len() == 1 => Some(i),
+            _ => None,
+        }
     }
 
     fn heads_equal(&mut self, ha: ExprId, hb: ExprId) -> bool {

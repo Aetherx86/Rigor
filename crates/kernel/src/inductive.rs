@@ -84,6 +84,15 @@ fn open_pis(tc: &mut TypeChecker<'_>, mut e: ExprId, max: usize) -> (Vec<Binder>
     (bs, e)
 }
 
+/// Index locals of `ind` and the major premise type `I params indices`.
+fn major_type(tc: &mut TypeChecker<'_>, ind: &ParsedInd, param_lvls: &[LevelId], param_fve: &[ExprId]) -> (Vec<ExprId>, ExprId) {
+    let idx_e: Vec<ExprId> = ind.indices.iter().map(|ix| tc.arena.fvar(ix.fv)).collect();
+    let head = tc.arena.const_(ind.name, param_lvls);
+    let p = tc.arena.app_n(head, param_fve);
+    let ty = tc.arena.app_n(p, &idx_e);
+    (idx_e, ty)
+}
+
 fn ind_info(spec: &InductiveSpec, p: &ParsedInd, all: Box<[NameId]>, is_rec: bool, can_elim_large: bool) -> Declaration {
     Declaration::Inductive(InductiveInfo {
         name: p.name, level_params: spec.level_params.clone(), ty: p.ty,
@@ -449,9 +458,7 @@ pub fn check_inductive_block(
 
     let mut motive_fvs = Vec::with_capacity(parsed_inds.len());
     for (ti, ind) in parsed_inds.iter().enumerate() {
-        let ind_c = tc.arena.const_(ind.name, &param_lvls);
-        let idx_e: Vec<ExprId> = ind.indices.iter().map(|ix| tc.arena.fvar(ix.fv)).collect();
-        let major_ty = { let p = tc.arena.app_n(ind_c, &param_fve); tc.arena.app_n(p, &idx_e) };
+        let (_, major_ty) = major_type(&mut tc, ind, &param_lvls, &param_fve);
         let t_n = tc.arena.name_from_path("t");
         let mty = tc.arena.pi(t_n, BinderInfo::Default, major_ty, motive_sort);
         let mty = wrap(tc.arena, &ind.indices, mty, true);
@@ -485,9 +492,7 @@ pub fn check_inductive_block(
     let minor_fve: Vec<ExprId> = minor_fvs.iter().map(|m| tc.arena.fvar(m.fv)).collect();
 
     for (ti, ind) in parsed_inds.iter().enumerate() {
-        let ind_c = tc.arena.const_(ind.name, &param_lvls);
-        let idx_e: Vec<ExprId> = ind.indices.iter().map(|ix| tc.arena.fvar(ix.fv)).collect();
-        let major_ty = { let p = tc.arena.app_n(ind_c, &param_fve); tc.arena.app_n(p, &idx_e) };
+        let (idx_e, major_ty) = major_type(&mut tc, ind, &param_lvls, &param_fve);
         let major_fv = tc.fresh_fvar();
         let major_e = tc.arena.fvar(major_fv);
         let ret = tc.arena.app_n(motive_fve[ti], &idx_e);
