@@ -33,14 +33,14 @@ Rigor's times include parsing the NDJSON export (332 MiB for `Init`, 532 MiB for
 
 ## Design
 
-- `crates/kernel` is the trusted part: about 2,900 lines with `#![forbid(unsafe_code)]` and no
+- `crates/kernel` is the trusted part: about 2,600 lines with `#![forbid(unsafe_code)]` and no
   third-party crates. Expressions are hash-consed into 16-byte nodes in an arena; worker threads
   check independent declarations in parallel against a shared read-only arena.
 - `crates/parser` reads `lean4export` 3.x NDJSON (and the older text format) and admits
   declarations through the kernel.
 - `crates/bench` is the command-line checker (`rigor-bench --check <file>`).
 - `web/` builds the browser demo (`wasm-bindgen`, single-threaded).
-- `tools/mutation/` corrupts exports on purpose and re-checks them. Over four rounds and 1,482
+- `tools/mutation/` corrupts exports on purpose and re-checks them. Over eight rounds and 1,608
   mutants (swapped proofs, universe changes, broken definitions, altered inductive types), every
   mutant that changes meaning was rejected; the few accepted ones are provably harmless and are
   explained in `tools/mutation/REPORT.md`.

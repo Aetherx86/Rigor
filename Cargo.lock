@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "rigor-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rigor-kernel",
  "rigor-parser",
@@ -12,11 +12,11 @@ dependencies = [
 
 [[package]]
 name = "rigor-kernel"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rigor-parser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rigor-kernel",
 ]

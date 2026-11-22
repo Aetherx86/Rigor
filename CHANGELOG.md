@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1] - 2026-11-23
+
+### Changed
+- The kernel is about 2,600 lines (from about 3,150): shared helpers replace duplicated code
+  (one generic intern table, one subexpression walk, shared binder instantiation,
+  compact Nat arithmetic with a randomized test against u128, and others). What the kernel
+  accepts is unchanged: full Init and Std still verify, and mutation testing (now 1,608 mutants
+  over eight rounds) rejects every meaning-changing mutant.
+
 ## [0.1.0] - 2026-11-22
 
 First release.
