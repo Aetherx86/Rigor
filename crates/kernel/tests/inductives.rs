@@ -173,9 +173,9 @@ fn nat_recursor_iota_reduction_arithmetic_and_eq_k_reduction() {
     let k_expr = env.arena.app_n(eq_rec_11, &[nat, zero, eq_motive, n4, zero, h_c]);
     let _ = type0;
 
-    let frozen = env.freeze();
-    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
-    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    let (base_arena, decls) = env.into_parts();
+    let mut scratch = Arena::child(Arc::new(base_arena));
+    let mut tc = TypeChecker::new(&decls, &mut scratch);
     assert!(
         tc.is_def_eq(k_expr, n4).unwrap(),
         "K-like reduction must reduce Eq.rec on opaque `h : 0 = 0` to minor premise"
@@ -249,9 +249,9 @@ fn structure_projections_and_structure_eta_on_prod() {
     let p1 = env.arena.proj(prod_n, 1, p_c);
     let eta_p = env.arena.app_n(mk_11, &[nat, nat, p0, p1]);
 
-    let frozen = env.freeze();
-    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
-    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    let (base_arena, decls) = env.into_parts();
+    let mut scratch = Arena::child(Arc::new(base_arena));
+    let mut tc = TypeChecker::new(&decls, &mut scratch);
 
     // Projection typing & reduction
     assert_eq!(tc.infer_type(proj0_pair).unwrap(), nat);
@@ -460,9 +460,9 @@ fn spine_machine_regression_overapplied_recursor_quot_and_lam_proof_irrelevance(
     let lam_proof_1 = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, p_c, b0);
     let lam_proof_2 = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, p_c, q_c);
 
-    let frozen = env.freeze();
-    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
-    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    let (base_arena, decls) = env.into_parts();
+    let mut scratch = Arena::child(Arc::new(base_arena));
+    let mut tc = TypeChecker::new(&decls, &mut scratch);
     assert!(tc.is_def_eq(over_rec, n10).unwrap(), "over-applied Nat.rec must reduce to 10");
     assert_eq!(tc.infer_type(over_quot).unwrap(), nat);
     assert!(tc.is_def_eq(over_quot, n3).unwrap(), "over-applied Quot.lift must reduce to 3");
@@ -763,9 +763,9 @@ fn lazy_delta_abbrev_reflection_and_eager_reduce_regressions() {
     })
     .expect("whnf must reduce Nat.sub on vanishing fvar without unfolding Nat.sub");
 
-    let frozen = env.freeze();
-    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
-    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    let (base_arena, decls) = env.into_parts();
+    let mut scratch = Arena::child(Arc::new(base_arena));
+    let mut tc = TypeChecker::new(&decls, &mut scratch);
     assert!(tc.is_def_eq(case_a, case_b).unwrap(), "Abbrev casesOn must unfold without comparing lambda arms");
     assert!(!tc.is_def_eq(case_a, case_c).unwrap(), "Abbrev casesOn with distinct zero arms must not be equal");
     assert!(tc.is_def_eq(beq_same, btrue).unwrap(), "Bool.true reflection fast path (rhs)");

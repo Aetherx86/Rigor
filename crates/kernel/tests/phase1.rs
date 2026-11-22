@@ -15,7 +15,7 @@ fn arena_hash_consing_and_two_tier_child_sharing() {
     let x2 = base.name_str(Arena::ANONYMOUS, "x");
     assert_eq!(x, x2, "identical names must hash-cons to the same NameId");
 
-    let l0 = base.lvl_zero();
+    let l0 = Arena::LEVEL_ZERO;
     let l1 = base.lvl_succ(l0);
     let prop = base.sort(l0);
     let type0 = base.sort(l1);
@@ -42,7 +42,7 @@ fn universe_level_normalization_and_inequality() {
     let u_name = a.name_from_path("u");
     let v_name = a.name_from_path("v");
     let w_name = a.name_from_path("w");
-    let z = a.lvl_zero();
+    let z = Arena::LEVEL_ZERO;
     let one = a.lvl_nat(1);
     let two = a.lvl_nat(2);
     let u = a.lvl_param(u_name);
@@ -401,9 +401,9 @@ fn eta_conversion_proof_irrelevance_let_and_opaque() {
     let cp2 = env.arena.const_(n_p2, []);
     let let_expr = env.arena.let_(Arena::ANONYMOUS, ca, ca1, b0);
 
-    let frozen = env.freeze();
-    let mut scratch = Arena::child(Arc::clone(&frozen.arena));
-    let mut tc = TypeChecker::new(&frozen.decls, &mut scratch);
+    let (base_arena, decls) = env.into_parts();
+    let mut scratch = Arena::child(Arc::new(base_arena));
+    let mut tc = TypeChecker::new(&decls, &mut scratch);
 
     // Proof irrelevance in Prop: p1 ≡ p2, while in Type 0: a1 ≠ a2
     assert!(tc.is_def_eq(cp1, cp2).unwrap(), "proofs in Prop must be def-eq");
@@ -491,18 +491,18 @@ fn parallel_batch_checking_with_thread_local_scratch_arenas() {
     let lam_h = env.arena.lam(Arena::ANONYMOUS, BinderInfo::Default, b0, b0);
     let id_prop_val = env.arena.lam(n_p, BinderInfo::Default, prop, lam_h);
 
-    let mut batch = Vec::new();
+    env.set_deferred_checking(true);
     for i in 0..64u64 {
         let name = env.arena.name_num(Arena::ANONYMOUS, i + 1);
-        batch.push(Declaration::Theorem {
+        env.add_decl(Declaration::Theorem {
             name,
             level_params: Box::new([]),
             ty: id_prop_ty,
             val: id_prop_val,
-        });
+        })
+        .unwrap();
     }
-    let frozen = env.freeze();
-    let res = frozen.check_batch_parallel(&batch, 4);
-    assert_eq!(res.len(), 64);
-    assert!(res.iter().all(|r| r.is_ok()));
+    env.set_deferred_checking(false);
+    env.check_deferred(4).expect("deferred parallel checking must succeed");
+    assert_eq!(env.len(), 64);
 }

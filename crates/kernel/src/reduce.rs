@@ -2,7 +2,7 @@
 //! Supports beta, zeta, iota, K-like, quotient, `Nat` literals, structure projections,
 //! height-ordered delta, proof irrelevance in `Prop`, and function + structure eta-conversion.
 
-use crate::arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelId, LevelListId, Literal, NameId};
+use crate::arena::{Arena, ExprData, ExprId, FVarId, LevelId, LevelListId, Literal, NameId};
 use crate::check::TypeChecker;
 use crate::env::{Declaration, QuotKind};
 use crate::error::KernelError;
@@ -587,20 +587,20 @@ impl<'a> TypeChecker<'a> {
                     return Ok(level_eq(self.arena, u, v));
                 }
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
-                (ExprData::Pi { name, binder_info, ty: t1, body: b1 }, ExprData::Pi { ty: t2, body: b2, .. }) => {
-                    let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
+                (ExprData::Pi { ty: t1, body: b1, .. }, ExprData::Pi { ty: t2, body: b2, .. }) => {
+                    let (t1, b1, t2, b2) = (*t1, *b1, *t2, *b2);
                     if !self.is_def_eq(t1, t2)? { return Ok(false); }
-                    let fv = self.push_local(name, bi, t1, None);
+                    let fv = self.push_local(t1, None);
                     let fve = self.arena.fvar(fv);
                     let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
                     let res = self.is_def_eq(ib1, ib2);
                     self.pop_local();
                     return res;
                 }
-                (ExprData::Lam { name, binder_info, ty: t1, body: b1 }, ExprData::Lam { ty: t2, body: b2, .. }) => {
-                    let (name, bi, t1, b1, t2, b2) = (*name, *binder_info, *t1, *b1, *t2, *b2);
+                (ExprData::Lam { ty: t1, body: b1, .. }, ExprData::Lam { ty: t2, body: b2, .. }) => {
+                    let (t1, b1, t2, b2) = (*t1, *b1, *t2, *b2);
                     if self.is_def_eq(t1, t2)? {
-                        let fv = self.push_local(name, bi, t1, None);
+                        let fv = self.push_local(t1, None);
                         let fve = self.arena.fvar(fv);
                         let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
                         let res = self.is_def_eq(ib1, ib2)?;
@@ -614,13 +614,13 @@ impl<'a> TypeChecker<'a> {
                     }
                     return Ok(false);
                 }
-                (ExprData::Lam { name, binder_info, ty, body }, _) => {
-                    let (name, bi, ty, body) = (*name, *binder_info, *ty, *body);
-                    if self.try_fun_eta(name, bi, ty, body, b)? { return Ok(true); }
+                (ExprData::Lam { ty, body, .. }, _) => {
+                    let (ty, body) = (*ty, *body);
+                    if self.try_fun_eta(ty, body, b)? { return Ok(true); }
                 }
-                (_, ExprData::Lam { name, binder_info, ty, body }) => {
-                    let (name, bi, ty, body) = (*name, *binder_info, *ty, *body);
-                    if self.try_fun_eta(name, bi, ty, body, a)? { return Ok(true); }
+                (_, ExprData::Lam { ty, body, .. }) => {
+                    let (ty, body) = (*ty, *body);
+                    if self.try_fun_eta(ty, body, a)? { return Ok(true); }
                 }
                 _ => {}
             }
@@ -728,7 +728,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn try_fun_eta(&mut self, name: NameId, bi: BinderInfo, ty: ExprId, body: ExprId, other: ExprId) -> Result<bool, KernelError> {
+    fn try_fun_eta(&mut self, ty: ExprId, body: ExprId, other: ExprId) -> Result<bool, KernelError> {
         if matches!(self.arena.get_expr(other), ExprData::Sort(_) | ExprData::Pi { .. } | ExprData::Lit(_) | ExprData::Lam { .. }) {
             return Ok(false);
         }
@@ -736,7 +736,7 @@ impl<'a> TypeChecker<'a> {
         let other_ty_w = self.whnf(other_ty);
         let ExprData::Pi { ty: dom, .. } = *self.arena.get_expr(other_ty_w) else { return Ok(false) };
         if !self.is_def_eq(ty, dom)? { return Ok(false); }
-        let fv: FVarId = self.push_local(name, bi, ty, None);
+        let fv: FVarId = self.push_local(ty, None);
         let fve = self.arena.fvar(fv);
         let (lhs, rhs) = (instantiate1(self.arena, body, fve), self.arena.app(other, fve));
         let res = self.is_def_eq(lhs, rhs);

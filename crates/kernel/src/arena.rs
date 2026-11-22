@@ -219,15 +219,6 @@ impl Arena {
         if id.0 < self.name_base { self.parent.as_deref().unwrap().get_name(id) }
         else { &self.names[(id.0 - self.name_base) as usize] }
     }
-    pub fn format_name(&self, id: NameId) -> String {
-        match self.get_name(id) {
-            NameData::Anonymous => "[anonymous]".into(),
-            NameData::Str(p, s) if *p == Self::ANONYMOUS => s.to_string(),
-            NameData::Str(p, s) => format!("{}.{s}", self.format_name(*p)),
-            NameData::Num(p, n) if *p == Self::ANONYMOUS => n.to_string(),
-            NameData::Num(p, n) => format!("{}.{n}", self.format_name(*p)),
-        }
-    }
 
     // ---------------------------------------------------------------- Levels
     fn lookup_level(&self, data: &LevelData) -> Option<LevelId> {
@@ -574,7 +565,7 @@ mod tests {
     #[test]
     fn level_lists_and_lits_child_and_truncate() {
         let mut a = Arena::new();
-        let l0 = a.lvl_zero();
+        let l0 = Arena::LEVEL_ZERO;
         let l1 = a.lvl_nat(1);
         let l2 = a.lvl_nat(2);
 

@@ -147,7 +147,7 @@ pub fn check_inductive_block(
                     return Err(KernelError::InvalidInductive("fewer binders than num_params".into()));
                 };
                 if ti == 0 {
-                    let fv = tc.push_local(name, binder_info, dom, None);
+                    let fv = tc.push_local(dom, None);
                     hdr_params.push(Binder { name, bi: binder_info, ty: dom, fv });
                     let fve = tc.arena.fvar(fv);
                     cur = instantiate1(tc.arena, body, fve);
@@ -164,7 +164,7 @@ pub fn check_inductive_block(
                 cur = tc.whnf(cur);
                 match *tc.arena.get_expr(cur) {
                     ExprData::Pi { name, binder_info, ty, body } => {
-                        let fv = tc.push_local(name, binder_info, ty, None);
+                        let fv = tc.push_local(ty, None);
                         let fve = tc.arena.fvar(fv);
                         indices.push(Binder { name, bi: binder_info, ty, fv });
                         cur = instantiate1(tc.arena, body, fve);
@@ -190,7 +190,7 @@ pub fn check_inductive_block(
             name: p.name, level_params: spec.level_params.clone(), ty: p.ty,
             num_params: spec.num_params, num_indices: p.indices.len() as u32,
             all: orig_names.clone().into(), ctors: p.ctor_names.clone().into(),
-            is_rec: false, is_reflexive: false, is_prop: p.is_prop, can_elim_large: !p.is_prop,
+            is_rec: false, is_prop: p.is_prop, can_elim_large: !p.is_prop,
         }));
     }
 
@@ -209,7 +209,7 @@ pub fn check_inductive_block(
                 for _ in 0..spec.num_params {
                     c = tc.whnf(c);
                     if let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(c) {
-                        let fv = tc.push_local(name, binder_info, ty, None);
+                        let fv = tc.push_local(ty, None);
                         let fve = tc.arena.fvar(fv);
                         p_fvs.push(Binder { name, bi: binder_info, ty, fv });
                         c = instantiate1(tc.arena, body, fve);
@@ -234,9 +234,9 @@ pub fn check_inductive_block(
                         let mut bad_dom = false;
                         loop {
                             fty = tc.whnf(fty);
-                            let ExprData::Pi { name: en, binder_info: ebi, ty: dom, body: eb } = *tc.arena.get_expr(fty) else { break };
+                            let ExprData::Pi { ty: dom, body: eb, .. } = *tc.arena.get_expr(fty) else { break };
                             if expr_mentions_any_const(tc.arena, dom, &orig_names) { bad_dom = true; break; }
-                            let efv = tc.push_local(en, ebi, dom, None);
+                            let efv = tc.push_local(dom, None);
                             let efve = tc.arena.fvar(efv);
                             extra_pushed += 1;
                             fty = instantiate1(tc.arena, eb, efve);
@@ -326,7 +326,7 @@ pub fn check_inductive_block(
                         }
                         for _ in 0..extra_pushed { tc.pop_local(); }
                     }
-                    let fv = tc.push_local(name, binder_info, ty, None);
+                    let fv = tc.push_local(ty, None);
                     let fve = tc.arena.fvar(fv);
                     fields.push(Binder { name, bi: binder_info, ty, fv });
                     cur = instantiate1(tc.arena, body, fve);
@@ -343,7 +343,7 @@ pub fn check_inductive_block(
                         name: pi.name, level_params: spec.level_params.clone(), ty: pi.ty,
                         num_params: spec.num_params, num_indices: pi.indices.len() as u32,
                         all: Box::new([pi.name]), ctors: pi.ctor_names.clone().into(),
-                        is_rec: true, is_reflexive: false, is_prop: pi.is_prop, can_elim_large: !pi.is_prop,
+                        is_rec: true, is_prop: pi.is_prop, can_elim_large: !pi.is_prop,
                     }));
                     parsed_inds.push(pi);
                     all_types.push(its);
@@ -372,7 +372,7 @@ pub fn check_inductive_block(
     for _ in 0..spec.num_params {
         cur = tc.whnf(cur);
         if let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(cur) {
-            let fv = tc.push_local(name, binder_info, ty, None);
+            let fv = tc.push_local(ty, None);
             let fve = tc.arena.fvar(fv);
             param_fvs.push(Binder { name, bi: binder_info, ty, fv });
             cur = instantiate1(tc.arena, body, fve);
@@ -391,7 +391,7 @@ pub fn check_inductive_block(
         loop {
             c = tc.whnf(c);
             if let ExprData::Pi { name, binder_info, ty, body } = *tc.arena.get_expr(c) {
-                let fv = tc.push_local(name, binder_info, ty, None);
+                let fv = tc.push_local(ty, None);
                 let fve = tc.arena.fvar(fv);
                 p.indices.push(Binder { name, bi: binder_info, ty, fv });
                 c = instantiate1(tc.arena, body, fve);
@@ -402,7 +402,6 @@ pub fn check_inductive_block(
 
     let mut parsed_ctors = Vec::new();
     let mut is_rec = false;
-    let mut is_reflexive = false;
     for (ti, t) in all_types.iter().enumerate() {
         let ind = &parsed_inds[ti];
         for &(cname, cty) in &t.ctors {
@@ -436,10 +435,9 @@ pub fn check_inductive_block(
                     let rf = check_strict_positivity(
                         &mut tc, ind.name, cname, ty, &all_names, &param_lvls, &param_fve, fields.len(),
                     )?;
-                    is_reflexive |= !rf.extra.is_empty();
                     rec_fields.push(rf);
                 }
-                let fv = tc.push_local(name, binder_info, ty, None);
+                let fv = tc.push_local(ty, None);
                 let fve = tc.arena.fvar(fv);
                 fields.push(Binder { name, bi: binder_info, ty, fv });
                 cur = instantiate1(tc.arena, body, fve);
@@ -481,7 +479,7 @@ pub fn check_inductive_block(
                     let fv_e = tc.arena.fvar(f.fv);
                     let in_idx = c0.result_indices.contains(&fv_e);
                     if !in_prop && !in_idx { ok = false; break; }
-                    tc.push_existing_local(f.fv, f.name, f.bi, f.ty);
+                    tc.push_existing_local(f.fv, f.ty);
                     pushed += 1;
                 }
                 for _ in 0..pushed { tc.pop_local(); }
@@ -522,17 +520,17 @@ pub fn check_inductive_block(
             name: ind.name, level_params: spec.level_params.clone(), ty: ind.ty,
             num_params: spec.num_params, num_indices: ind.indices.len() as u32,
             all: orig_all_box.clone(), ctors: ind.ctor_names.clone().into(),
-            is_rec, is_reflexive, is_prop: ind.is_prop, can_elim_large: can_elim[ti],
+            is_rec, is_prop: ind.is_prop, can_elim_large: can_elim[ti],
         }));
     }
-    let mut ctor_idx = vec![0u32; orig_n];
+    let mut ctor_idx = vec![0usize; orig_n];
     for c in parsed_ctors.iter().filter(|c| c.ind_idx < orig_n) {
         let ci = ctor_idx[c.ind_idx];
         ctor_idx[c.ind_idx] += 1;
-        let orig_ty = spec.types[c.ind_idx].ctors[ci as usize].1;
+        let orig_ty = spec.types[c.ind_idx].ctors[ci].1;
         out.push(Declaration::Constructor(ConstructorInfo {
             name: c.name, ind_name: parsed_inds[c.ind_idx].name, level_params: spec.level_params.clone(),
-            ty: orig_ty, ctor_idx: ci, num_params: spec.num_params, num_fields: c.fields.len() as u32,
+            ty: orig_ty, num_params: spec.num_params, num_fields: c.fields.len() as u32,
         }));
     }
 
@@ -657,7 +655,7 @@ fn check_strict_positivity(
             for _ in &extra { tc.pop_local(); }
             return Err(KernelError::NonPositiveInductive { ind, ctor });
         }
-        let fv = tc.push_local(name, binder_info, dom, None);
+        let fv = tc.push_local(dom, None);
         let fve = tc.arena.fvar(fv);
         extra.push(Binder { name, bi: binder_info, ty: dom, fv });
         ty = instantiate1(tc.arena, body, fve);

@@ -178,3 +178,13 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
   * Updated `BENCHMARKS.md` and `Worklog.md`; committing & pushing now.
   * NEXT: Task E (`tools/tcb/PLAN.md`: reduce `crates/kernel/src/*.rs` from 3,300 SLOC to < 2,500 SLOC, Wave 1 -> Wave 2 -> Wave 3), then `tools/tcb/MEMORY.md` per-thread memory optimizations. Starting Wave 1 now.
 - 2026-11-22 16:35 KST (agy-mut): Silica portal page upgrade done in ~/Documents/aetherx86.github.io/silica/{index.html,sim.js,test.mjs} (no edits to ~/rigor/crates, no commit/push). Ported Kotlin Rule (B/S + legacy S/B notation, rejects counts > 8 and reversed S/B letters), Rle (read/parse/write with MAX_COORDINATE=2^30, MAX_RUN_LENGTH=1,000,000, DEFAULT_MAX_CELLS=10,000,000, 70-char wrapping, header/comments/topology-suffix support), Patterns (GLIDER, GOSPER_GUN, ACORN, DIEHARD, PULSAR, R_PENTOMINO, BLINKER, BLOCK), and active-span Life engine supporting arbitrary B/S rules (including B0 fallback). Updated index.html with strict CSP (`script-src 'self'`, zero inline handlers/scripts), responsive mobile layout, rule input + presets, pattern presets, and RLE import/export panel. Verified: `node ~/Documents/aetherx86.github.io/silica/test.mjs` passed (`all silica checks passed`, 0.40s wall, including Diehard dies at gen 130 and Acorn reaches 633 cells at gen 5206 on 2600x2600) + static HTML/JS/CSP check (`HTML_JS_CSP_OK`, 21/21 IDs matched, 0 inline handlers/scripts).
+- 2026-11-22 17:05 KST (A, hourly check): independently re-verified gem's 1e4332d from a clean worktree (no
+  uncommitted Task E edits): Std CHECK_OK 96,626 decls, 11.86 s wall / 695.6 MB peak (leanchecker --fresh
+  44.18 s / 927.5 MB); Init CHECK_OK 7.76 s / 478.5 MB (leanchecker 28.67 s / 547 MB). Milestone confirmed:
+  Rigor checks both Init and Std. gem continues Task E (Wave 1) in the working tree.
+- 2026-11-22 17:25 KST (A, took over: Gemini account quota exhausted for both gem and agy-mut, resets in
+  ~146 h, around 2026-11-28 19:00 KST). Reviewed and committed gem's partial Task E Wave 1 (dead fields
+  name/binder_info/is_reflexive/ctor_idx, unused FrozenEnv/check_batch_parallel, Display match, lvl_zero,
+  Nat decimal parsing moved to the parser): no change to what the kernel accepts. Tests green; Init CHECK_OK
+  7.59 s / 482 MB, Std CHECK_OK 10.99 s / 690 MB. Kernel non-blank non-comment lines 3,418 -> 3,322.
+  A continues Task E alone; CYCLE hand-backs to gem are paused until the quota resets.

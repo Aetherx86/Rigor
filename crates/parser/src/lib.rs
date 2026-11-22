@@ -399,7 +399,7 @@ impl StreamParser {
             "#ELN" => {
                 let mut it = after_tag.split_ascii_whitespace();
                 let tok = next_tok(line, &mut it, "#ELN nat")?;
-                let n = rigor_kernel::Nat::from_dec(tok).ok_or_else(|| syntax(line, &format!("invalid natural number '{tok}' for #ELN nat")))?;
+                let n = parse_nat_dec(tok).ok_or_else(|| syntax(line, &format!("invalid natural number '{tok}' for #ELN nat")))?;
                 expect_end(line, &mut it, "#ELN")?;
                 let eid = env.arena.lit_nat_big(n);
                 set_slot(&mut self.exprs, id, eid);
@@ -758,7 +758,7 @@ pub fn parse_file_parallel(
     let parsed = parse_and_check(reader, env);
     env.set_deferred_checking(false);
     let stats = parsed?;
-    env.check_deferred(threads).map_err(|(name, err)| ParseError::DeferredKernel { name: env.arena.format_name(name), err })?;
+    env.check_deferred(threads).map_err(|(name, err)| ParseError::DeferredKernel { name: format_name(&env.arena, name), err })?;
     Ok(stats)
 }
 
@@ -915,4 +915,38 @@ fn parse_hint(
 fn trace_limit_ms() -> Option<f64> {
     static LIMIT: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| std::env::var("RIGOR_TRACE").ok().and_then(|v| v.parse().ok()))
+}
+
+pub(crate) fn parse_nat_dec(s: &str) -> Option<rigor_kernel::Nat> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut v: Vec<u64> = Vec::new();
+    for chunk in s.as_bytes().chunks(18) {
+        let (mut part, mut mul) = (0u64, 1u64);
+        for &c in chunk {
+            part = part * 10 + (c - b'0') as u64;
+            mul *= 10;
+        }
+        let mut carry = part as u128;
+        for limb in v.iter_mut() {
+            let t = *limb as u128 * mul as u128 + carry;
+            *limb = t as u64;
+            carry = t >> 64;
+        }
+        if carry != 0 {
+            v.push(carry as u64);
+        }
+    }
+    Some(rigor_kernel::Nat::from_limbs(v))
+}
+
+fn format_name(arena: &Arena, id: NameId) -> String {
+    match arena.get_name(id) {
+        rigor_kernel::arena::NameData::Anonymous => "[anonymous]".into(),
+        rigor_kernel::arena::NameData::Str(p, s) if *p == Arena::ANONYMOUS => s.to_string(),
+        rigor_kernel::arena::NameData::Str(p, s) => format!("{}.{s}", format_name(arena, *p)),
+        rigor_kernel::arena::NameData::Num(p, n) if *p == Arena::ANONYMOUS => n.to_string(),
+        rigor_kernel::arena::NameData::Num(p, n) => format!("{}.{n}", format_name(arena, *p)),
+    }
 }

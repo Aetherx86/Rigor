@@ -6,9 +6,6 @@ use crate::arena::{Arena, LevelData, LevelId, NameId};
 use crate::error::KernelError;
 
 impl Arena {
-    #[inline]
-    pub fn lvl_zero(&self) -> LevelId { Self::LEVEL_ZERO }
-
     pub fn lvl_nat(&mut self, n: u32) -> LevelId {
         let mut l = Self::LEVEL_ZERO;
         for _ in 0..n { l = self.lvl_succ(l); }

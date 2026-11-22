@@ -20,13 +20,13 @@ pub enum ReducibilityHint {
 pub struct InductiveInfo {
     pub name: NameId, pub level_params: Box<[NameId]>, pub ty: ExprId,
     pub num_params: u32, pub num_indices: u32, pub all: Box<[NameId]>, pub ctors: Box<[NameId]>,
-    pub is_rec: bool, pub is_reflexive: bool, pub is_prop: bool, pub can_elim_large: bool,
+    pub is_rec: bool, pub is_prop: bool, pub can_elim_large: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConstructorInfo {
     pub name: NameId, pub ind_name: NameId, pub level_params: Box<[NameId]>,
-    pub ty: ExprId, pub ctor_idx: u32, pub num_params: u32, pub num_fields: u32,
+    pub ty: ExprId, pub num_params: u32, pub num_fields: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -122,8 +122,6 @@ impl Environment {
     pub fn get(&self, name: NameId) -> Option<&Declaration> { self.decls.get(&name) }
     #[inline]
     pub fn len(&self) -> usize { self.decls.len() }
-    #[inline]
-    pub fn is_empty(&self) -> bool { self.decls.is_empty() }
 
     /// Compute Lean 4-style definition height: `1 + max(height of referenced definitions)`.
     pub fn compute_height(&self, expr: ExprId) -> u32 {
@@ -310,9 +308,6 @@ impl Environment {
     /// `check_deferred` has returned `Ok`.
     pub fn set_deferred_checking(&mut self, on: bool) { self.defer = on; }
 
-    /// Number of admitted declarations still waiting for `check_deferred`.
-    pub fn deferred_len(&self) -> usize { self.deferred.len() }
-
     fn require_known_consts(&self, e: ExprId) -> Result<(), KernelError> {
         let mut stack = vec![e];
         let mut seen = FxHashSet::default();
@@ -373,73 +368,8 @@ impl Environment {
         }
     }
 
-    /// Freeze this environment into an immutable, lock-free shareable snapshot for parallel checking.
-    pub fn freeze(self) -> FrozenEnv {
-        FrozenEnv {
-            arena: Arc::new(self.arena),
-            decls: Arc::new(self.decls),
-        }
-    }
-}
-
-/// Immutable environment snapshot shareable across worker threads with zero locking.
-#[derive(Debug, Clone)]
-pub struct FrozenEnv {
-    pub arena: Arc<Arena>,
-    pub decls: Arc<FxHashMap<NameId, Declaration>>,
-}
-
-impl FrozenEnv {
-    /// Verify a batch of independent declarations in parallel across `threads` OS threads,
-    /// using an isolated thread-local scratch arena (`Arena::child`) per worker.
-    pub fn check_batch_parallel(
-        &self,
-        decls: &[Declaration],
-        threads: usize,
-    ) -> Vec<Result<(), KernelError>> {
-        if decls.is_empty() {
-            return Vec::new();
-        }
-        let n_threads = threads.max(1).min(decls.len());
-        if n_threads == 1 {
-            let mut scratch = Arena::child(Arc::clone(&self.arena));
-            return decls
-                .iter()
-                .map(|d| {
-                    if self.decls.contains_key(&d.name()) {
-                        return Err(KernelError::DuplicateDeclaration(d.name()));
-                    }
-                    let mut tc = TypeChecker::new(&self.decls, &mut scratch);
-                    tc.check_decl(d)
-                })
-                .collect();
-        }
-
-        let chunk_size = decls.len().div_ceil(n_threads);
-        let mut results: Vec<Result<(), KernelError>> = Vec::with_capacity(decls.len());
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_threads);
-            for chunk in decls.chunks(chunk_size) {
-                let arena_ref = Arc::clone(&self.arena);
-                let decls_ref = Arc::clone(&self.decls);
-                handles.push(s.spawn(move || {
-                    let mut scratch = Arena::child(arena_ref);
-                    let mut out = Vec::with_capacity(chunk.len());
-                    for d in chunk {
-                        if decls_ref.contains_key(&d.name()) {
-                            out.push(Err(KernelError::DuplicateDeclaration(d.name())));
-                        } else {
-                            let mut tc = TypeChecker::new(&decls_ref, &mut scratch);
-                            out.push(tc.check_decl(d));
-                        }
-                    }
-                    out
-                }));
-            }
-            for h in handles {
-                results.extend(h.join().expect("worker thread panicked"));
-            }
-        });
-        results
+    /// Consume this environment and return its underlying arena and verified declarations.
+    pub fn into_parts(self) -> (Arena, FxHashMap<NameId, Declaration>) {
+        (self.arena, self.decls)
     }
 }

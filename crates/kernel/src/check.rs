@@ -1,6 +1,6 @@
 //! Bidirectional CIC type inference and declaration verification.
 
-use crate::arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelId, NameId};
+use crate::arena::{Arena, ExprData, ExprId, FVarId, LevelId, NameId};
 use crate::env::Declaration;
 use crate::error::KernelError;
 use crate::expr::{abstract_fvars, expr_check_level_params, instantiate1, instantiate_level_params};
@@ -10,10 +10,6 @@ use crate::level::level_is_zero;
 #[derive(Debug, Clone)]
 pub(crate) struct LocalDecl {
     pub id: FVarId,
-    #[allow(dead_code)]
-    pub name: NameId,
-    #[allow(dead_code)]
-    pub binder_info: BinderInfo,
     pub ty: ExprId,
     pub val: Option<ExprId>,
 }
@@ -71,14 +67,14 @@ impl<'a> TypeChecker<'a> {
         id
     }
 
-    pub(crate) fn push_local(&mut self, name: NameId, binder_info: BinderInfo, ty: ExprId, val: Option<ExprId>) -> FVarId {
+    pub(crate) fn push_local(&mut self, ty: ExprId, val: Option<ExprId>) -> FVarId {
         let id = self.fresh_fvar();
-        self.locals.push(LocalDecl { id, name, binder_info, ty, val });
+        self.locals.push(LocalDecl { id, ty, val });
         id
     }
 
-    pub(crate) fn push_existing_local(&mut self, id: FVarId, name: NameId, binder_info: BinderInfo, ty: ExprId) {
-        self.locals.push(LocalDecl { id, name, binder_info, ty, val: None });
+    pub(crate) fn push_existing_local(&mut self, id: FVarId, ty: ExprId) {
+        self.locals.push(LocalDecl { id, ty, val: None });
     }
 
     pub(crate) fn pop_local(&mut self) { self.locals.pop(); }
@@ -189,10 +185,10 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ok(instantiate1(self.arena, body, a))
             }
-            ExprData::Pi { name, binder_info, ty, body } => {
-                let (name, binder_info, ty, body) = (*name, *binder_info, *ty, *body);
+            ExprData::Pi { ty, body, .. } => {
+                let (ty, body) = (*ty, *body);
                 let u = self.infer_sort(ty)?;
-                let fv = self.push_local(name, binder_info, ty, None);
+                let fv = self.push_local(ty, None);
                 let fv_expr = self.arena.fvar(fv);
                 let body_inst = instantiate1(self.arena, body, fv_expr);
                 let v = self.infer_sort(body_inst);
@@ -204,7 +200,7 @@ impl<'a> TypeChecker<'a> {
             ExprData::Lam { name, binder_info, ty, body } => {
                 let (name, binder_info, ty, body) = (*name, *binder_info, *ty, *body);
                 let _u = self.infer_sort(ty)?;
-                let fv = self.push_local(name, binder_info, ty, None);
+                let fv = self.push_local(ty, None);
                 let fv_expr = self.arena.fvar(fv);
                 let body_inst = instantiate1(self.arena, body, fv_expr);
                 let body_ty = self.infer_type(body_inst);
@@ -223,7 +219,7 @@ impl<'a> TypeChecker<'a> {
                         got: val_ty,
                     });
                 }
-                let fv = self.push_local(Arena::ANONYMOUS, BinderInfo::Default, ty, Some(val));
+                let fv = self.push_local(ty, Some(val));
                 let fv_expr = self.arena.fvar(fv);
                 let body_inst = instantiate1(self.arena, body, fv_expr);
                 let body_ty = self.infer_type(body_inst);

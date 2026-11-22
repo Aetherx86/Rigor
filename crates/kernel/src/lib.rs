@@ -19,7 +19,7 @@ pub use arena::{
 };
 pub use check::TypeChecker;
 pub use env::{
-    ConstructorInfo, Declaration, Environment, FrozenEnv, InductiveInfo, QuotKind, RecursorInfo,
+    ConstructorInfo, Declaration, Environment, InductiveInfo, QuotKind, RecursorInfo,
     RecursorRule, ReducibilityHint,
 };
 pub use error::KernelError;

@@ -933,9 +933,26 @@ fn bench_parallel_theorems() {
         });
     }
 
-    let frozen = env.freeze();
+    let (base_arena, base_decls) = env.into_parts();
+    let base_arena = std::sync::Arc::new(base_arena);
+    let check_batch = |threads: usize| -> Vec<Result<(), rigor_kernel::KernelError>> {
+        let n_threads = threads.max(1).min(decls.len());
+        let chunk_size = decls.len().div_ceil(n_threads);
+        let mut results = Vec::with_capacity(decls.len());
+        std::thread::scope(|s| {
+            let handles: Vec<_> = decls.chunks(chunk_size).map(|chunk| {
+                let (a, d) = (std::sync::Arc::clone(&base_arena), &base_decls);
+                s.spawn(move || {
+                    let mut scratch = Arena::child(a);
+                    chunk.iter().map(|decl| rigor_kernel::TypeChecker::new(d, &mut scratch).check_decl(decl)).collect::<Vec<_>>()
+                })
+            }).collect();
+            for h in handles { results.extend(h.join().unwrap()); }
+        });
+        results
+    };
     let t1 = Instant::now();
-    let r1 = frozen.check_batch_parallel(&decls, 1);
+    let r1 = check_batch(1);
     let d1 = t1.elapsed();
     assert!(r1.iter().all(|r| r.is_ok()));
 
@@ -943,7 +960,7 @@ fn bench_parallel_theorems() {
         .map(|n| n.get())
         .unwrap_or(4);
     let tp = Instant::now();
-    let rp = frozen.check_batch_parallel(&decls, threads);
+    let rp = check_batch(threads);
     let dp = tp.elapsed();
     assert!(rp.iter().all(|r| r.is_ok()));
 

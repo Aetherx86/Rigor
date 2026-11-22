@@ -53,58 +53,9 @@ impl Nat {
         w < self.0.len() && (self.0[w] >> b) & 1 == 1
     }
 
-    /// Parse a decimal string of ASCII digits.
-    pub fn from_dec(s: &str) -> Option<Nat> {
-        if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let mut v: Vec<u64> = Vec::new();
-        for chunk in s.as_bytes().chunks(18) {
-            let (mut part, mut mul) = (0u64, 1u64);
-            for &c in chunk {
-                part = part * 10 + (c - b'0') as u64;
-                mul *= 10;
-            }
-            // v = v * mul + part
-            let mut carry = part as u128;
-            for limb in v.iter_mut() {
-                let t = *limb as u128 * mul as u128 + carry;
-                *limb = t as u64;
-                carry = t >> 64;
-            }
-            if carry != 0 {
-                v.push(carry as u64);
-            }
-        }
-        Some(norm(v))
+    pub fn from_limbs(v: Vec<u64>) -> Nat {
+        norm(v)
     }
-
-    pub fn to_dec(&self) -> String {
-        if self.is_zero() {
-            return "0".into();
-        }
-        let mut digits = Vec::new();
-        let mut cur: Vec<u64> = self.0.to_vec();
-        const BASE: u64 = 1_000_000_000_000_000_000;
-        while !cur.is_empty() {
-            let mut rem = 0u128;
-            for limb in cur.iter_mut().rev() {
-                let t = rem << 64 | *limb as u128;
-                *limb = (t / BASE as u128) as u64;
-                rem = t % BASE as u128;
-            }
-            while cur.last() == Some(&0) {
-                cur.pop();
-            }
-            digits.push(rem as u64);
-        }
-        let mut s = digits.pop().unwrap().to_string();
-        for d in digits.iter().rev() {
-            s.push_str(&format!("{d:018}"));
-        }
-        s
-    }
-
     pub fn add(&self, o: &Nat) -> Nat {
         let (a, b) = if self.0.len() >= o.0.len() { (&self.0, &o.0) } else { (&o.0, &self.0) };
         let mut v = Vec::with_capacity(a.len() + 1);
@@ -285,16 +236,66 @@ impl Ord for Nat {
 mod tests {
     use super::*;
 
+    fn from_dec(s: &str) -> Option<Nat> {
+        if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut v: Vec<u64> = Vec::new();
+        for chunk in s.as_bytes().chunks(18) {
+            let (mut part, mut mul) = (0u64, 1u64);
+            for &c in chunk {
+                part = part * 10 + (c - b'0') as u64;
+                mul *= 10;
+            }
+            let mut carry = part as u128;
+            for limb in v.iter_mut() {
+                let t = *limb as u128 * mul as u128 + carry;
+                *limb = t as u64;
+                carry = t >> 64;
+            }
+            if carry != 0 {
+                v.push(carry as u64);
+            }
+        }
+        Some(Nat::from_limbs(v))
+    }
+
+    fn to_dec(x: &Nat) -> String {
+        if x.is_zero() {
+            return "0".into();
+        }
+        let mut digits = Vec::new();
+        let mut cur: Vec<u64> = x.0.to_vec();
+        const BASE: u64 = 1_000_000_000_000_000_000;
+        while !cur.is_empty() {
+            let mut rem = 0u128;
+            for limb in cur.iter_mut().rev() {
+                let t = rem << 64 | *limb as u128;
+                *limb = (t / BASE as u128) as u64;
+                rem = t % BASE as u128;
+            }
+            while cur.last() == Some(&0) {
+                cur.pop();
+            }
+            digits.push(rem as u64);
+        }
+        let mut s = digits.pop().unwrap().to_string();
+        for d in digits.iter().rev() {
+            s.push_str(&format!("{d:018}"));
+        }
+        s
+    }
+
     fn n(s: &str) -> Nat {
-        Nat::from_dec(s).unwrap()
+        from_dec(s).unwrap()
     }
 
     #[test]
     fn decimal_round_trip_and_u128_agreement() {
         for s in ["0", "1", "18446744073709551615", "18446744073709551616", "340282366920938463463374607431768211456", "123456789012345678901234567890123456789012345678901234567890"] {
-            assert_eq!(n(s).to_dec(), s);
+            assert_eq!(to_dec(&n(s)), s);
         }
-        assert!(Nat::from_dec("12a").is_none() && Nat::from_dec("").is_none());
+        assert!(from_dec("12a").is_none() && from_dec("").is_none());
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         for _ in 0..2000 {
             x ^= x << 13;
@@ -302,7 +303,7 @@ mod tests {
             x ^= x << 17;
             let (a, b) = ((x as u128) << 37 | (x >> 3) as u128, (x as u128 >> 9) + 1);
             let (na, nb) = (Nat::from_u128(a), Nat::from_u128(b));
-            assert_eq!(na.add(&nb).to_dec(), (a + b).to_string());
+            assert_eq!(to_dec(&na.add(&nb)), (a + b).to_string());
             assert_eq!(na.sub(&nb).to_u128(), Some(a.saturating_sub(b)));
             assert_eq!(nb.sub(&na).to_u128(), Some(b.saturating_sub(a)));
             assert_eq!(na.div(&nb).to_u128(), Some(a / b));
@@ -322,7 +323,7 @@ mod tests {
     fn big_values() {
         let two = Nat::from_u128(2);
         let p = two.pow(&Nat::from_u128(200)).unwrap();
-        assert_eq!(p.to_dec(), "1606938044258990275541962092341162602522202993782792835301376");
+        assert_eq!(to_dec(&p), "1606938044258990275541962092341162602522202993782792835301376");
         assert_eq!(p.log2().to_u128(), Some(200));
         assert_eq!(Nat::from_u128(1).shl(200), p);
         assert_eq!(p.shr(199).to_u128(), Some(2));
@@ -333,7 +334,7 @@ mod tests {
         assert!(r < Nat::from_u128(1_000_000_007));
         assert_eq!(p.gcd(&Nat::from_u128(48)).to_u128(), Some(16));
         assert_eq!(p.land(&m), Nat::zero());
-        assert_eq!(p.lor(&m).to_dec(), p.add(&m).to_dec());
+        assert_eq!(to_dec(&p.lor(&m)), to_dec(&p.add(&m)));
         assert_eq!(p.div(&Nat::zero()), Nat::zero());
         assert_eq!(p.rem(&Nat::zero()), p);
         assert!(two.pow(&Nat::from_u128(MAX_BITS as u128 * 2)).is_none());

@@ -410,7 +410,7 @@ impl StreamParser {
                 env.arena.proj(tn, idx, st)
             } else if let Some(v) = root.field("natVal") {
                 let s = v.as_str(line, "natVal")?;
-                let n = rigor_kernel::Nat::from_dec(s).ok_or_else(|| syntax(line, &format!("invalid natVal '{s}'")))?;
+                let n = crate::parse_nat_dec(s).ok_or_else(|| syntax(line, &format!("invalid natVal '{s}'")))?;
                 env.arena.lit_nat_big(n)
             } else if let Some(v) = root.field("strVal") {
                 env.arena.lit_str(v.as_str(line, "strVal")?)
