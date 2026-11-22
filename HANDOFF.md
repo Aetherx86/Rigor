@@ -188,3 +188,16 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
   Nat decimal parsing moved to the parser): no change to what the kernel accepts. Tests green; Init CHECK_OK
   7.59 s / 482 MB, Std CHECK_OK 10.99 s / 690 MB. Kernel non-blank non-comment lines 3,418 -> 3,322.
   A continues Task E alone; CYCLE hand-backs to gem are paused until the quota resets.
+- 2026-11-22 18:10 KST (A): Task E progress, all verified (tests, full Init + Std CHECK_OK, 42-mutant
+  round on inductive changes): f4f57b0 arena Table<T> (3,157 -> 3,077), 887a5e1 any_subexpr /
+  replace_expr / inductive helpers (-> 2,962), 40e8bf2 reduce.rs helpers (-> 2,892). Count method:
+  tools/tcb/PLAN.md baseline command. Remaining to < 2,500: ~393 (check.rs arms, env.rs add_quot,
+  has_opaque_fvar/require_known_consts via any_subexpr, hash.rs, nat.rs compaction).
+  Released v0.1.0 (55f0c43: README, LICENSE, CHANGELOG, web/ crate, CI). Portal: rigor/ live checker
+  page + card (8e295d1). GitLab still on hold per user.
+- 2026-11-22 18:40 KST (A): more Task E, all verified (tests, Init + Std CHECK_OK): 34ea9e5 env.rs
+  (-> 2,847), 512f934 check.rs (-> 2,783). Mutation round 5 (seed 5, 42 mutants) after the check.rs change:
+  42/42 rejected (total now 1,524 mutants over five rounds, none meaning-changing accepted). CI green on
+  main and v0.1.0. NEXT (A, or gem after its quota resets ~2026-11-28): ~284 more lines to < 2,500:
+  hash.rs (56), nat.rs (208), level.rs (137), inductive.rs recursor builders (major_ty built twice,
+  motive/minor loops), reduce.rs K-rule block; then MEMORY.md plan. Keep each step verified.
