@@ -102,11 +102,7 @@ pub fn check_inductive_block(
     if spec.types.is_empty() {
         return Err(KernelError::InvalidInductive("empty inductive block".into()));
     }
-    for (i, &p) in spec.level_params.iter().enumerate() {
-        if spec.level_params[..i].contains(&p) {
-            return Err(KernelError::DuplicateLevelParam(p));
-        }
-    }
+    crate::check::check_unique_params(&spec.level_params)?;
 
     let orig_n = spec.types.len();
     let orig_names: Vec<NameId> = spec.types.iter().map(|t| t.name).collect();

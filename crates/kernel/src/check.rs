@@ -132,29 +132,13 @@ impl<'a> TypeChecker<'a> {
             }
             ExprData::Const(name, lvls_id) => {
                 let (name, lvls_id) = (*name, *lvls_id);
-                let decl = self
-                    .decls
-                    .get(&name)
-                    .ok_or(KernelError::UnknownConstant(name))?;
+                let decl = self.decls.get(&name).ok_or(KernelError::UnknownConstant(name))?;
                 let params = decl.level_params();
-                let lvls = self.arena.get_level_list(lvls_id);
+                let lvls: Box<[LevelId]> = self.arena.get_level_list(lvls_id).into();
                 if lvls.len() != params.len() {
-                    return Err(KernelError::LevelParamCountMismatch {
-                        constant: name,
-                        expected: params.len(),
-                        got: lvls.len(),
-                    });
+                    return Err(KernelError::LevelParamCountMismatch { constant: name, expected: params.len(), got: lvls.len() });
                 }
-                let ty = decl.ty();
-                if params.is_empty() || !self.arena.get_expr_meta(ty).has_level_param() {
-                    return Ok(ty);
-                }
-                if lvls.len() == 1 {
-                    let l0 = lvls[0];
-                    return Ok(self.inst_levels_cached(ty, params, &[l0]));
-                }
-                let lvls: Box<[LevelId]> = lvls.into();
-                Ok(instantiate_level_params(self.arena, ty, params, &lvls))
+                Ok(self.inst_levels_cached(decl.ty(), params, &lvls))
             }
             ExprData::App(f, a) => {
                 let (f, a) = (*f, *a);
@@ -168,45 +152,25 @@ impl<'a> TypeChecker<'a> {
                     return Ok(instantiate1(self.arena, body, a));
                 }
                 let a_ty = self.infer_type(a)?;
-                let eq = if self.is_eager_reduce(a) {
-                    let prev = self.eager_reduce;
-                    self.eager_reduce = true;
-                    let r = self.is_def_eq(a_ty, dom);
-                    self.eager_reduce = prev;
-                    r?
-                } else {
-                    self.is_def_eq(a_ty, dom)?
-                };
-                if !eq {
-                    return Err(KernelError::TypeMismatch {
-                        expected: dom,
-                        got: a_ty,
-                    });
-                }
+                let prev = self.eager_reduce;
+                self.eager_reduce |= self.is_eager_reduce(a);
+                let eq = self.is_def_eq(a_ty, dom);
+                self.eager_reduce = prev;
+                if !eq? { return Err(KernelError::TypeMismatch { expected: dom, got: a_ty }); }
                 Ok(instantiate1(self.arena, body, a))
             }
             ExprData::Pi { ty, body, .. } => {
                 let (ty, body) = (*ty, *body);
                 let u = self.infer_sort(ty)?;
-                let fv = self.push_local(ty, None);
-                let fv_expr = self.arena.fvar(fv);
-                let body_inst = instantiate1(self.arena, body, fv_expr);
-                let v = self.infer_sort(body_inst);
-                self.pop_local();
-                let v = v?;
-                let res_lvl = self.arena.lvl_imax(u, v);
+                let (_, v) = self.under_binder(ty, None, body, |tc, b| tc.infer_sort(b));
+                let res_lvl = self.arena.lvl_imax(u, v?);
                 Ok(self.arena.sort(res_lvl))
             }
             ExprData::Lam { name, binder_info, ty, body } => {
                 let (name, binder_info, ty, body) = (*name, *binder_info, *ty, *body);
                 let _u = self.infer_sort(ty)?;
-                let fv = self.push_local(ty, None);
-                let fv_expr = self.arena.fvar(fv);
-                let body_inst = instantiate1(self.arena, body, fv_expr);
-                let body_ty = self.infer_type(body_inst);
-                self.pop_local();
-                let body_ty = body_ty?;
-                let abs_body_ty = abstract_fvars(self.arena, body_ty, &[fv]);
+                let (fv, body_ty) = self.under_binder(ty, None, body, |tc, b| tc.infer_type(b));
+                let abs_body_ty = abstract_fvars(self.arena, body_ty?, &[fv]);
                 Ok(self.arena.pi(name, binder_info, ty, abs_body_ty))
             }
             ExprData::Let { ty, val, body } => {
@@ -214,38 +178,18 @@ impl<'a> TypeChecker<'a> {
                 let _u = self.infer_sort(ty)?;
                 let val_ty = if self.infer_only { ty } else { self.infer_type(val)? };
                 if !self.infer_only && !self.is_def_eq(val_ty, ty)? {
-                    return Err(KernelError::TypeMismatch {
-                        expected: ty,
-                        got: val_ty,
-                    });
+                    return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
                 }
-                let fv = self.push_local(ty, Some(val));
-                let fv_expr = self.arena.fvar(fv);
-                let body_inst = instantiate1(self.arena, body, fv_expr);
-                let body_ty = self.infer_type(body_inst);
-                self.pop_local();
-                let body_ty = body_ty?;
-                let abs = abstract_fvars(self.arena, body_ty, &[fv]);
+                let (fv, body_ty) = self.under_binder(ty, Some(val), body, |tc, b| tc.infer_type(b));
+                let abs = abstract_fvars(self.arena, body_ty?, &[fv]);
                 Ok(instantiate1(self.arena, abs, val))
             }
-            ExprData::Lit(lid) => match self.arena.get_lit(*lid) {
-                crate::arena::Literal::Nat(_) => {
-                    let nat_name = self.arena.name_from_path("Nat");
-                    if self.decls.contains_key(&nat_name) {
-                        Ok(self.arena.const_(nat_name, []))
-                    } else {
-                        Err(KernelError::UnknownConstant(nat_name))
-                    }
-                }
-                crate::arena::Literal::Str(_) => {
-                    let str_name = self.arena.name_from_path("String");
-                    if self.decls.contains_key(&str_name) {
-                        Ok(self.arena.const_(str_name, []))
-                    } else {
-                        Err(KernelError::UnknownConstant(str_name))
-                    }
-                }
-            },
+            ExprData::Lit(lid) => {
+                let is_nat = matches!(self.arena.get_lit(*lid), crate::arena::Literal::Nat(_));
+                let n = self.arena.name_from_path(if is_nat { "Nat" } else { "String" });
+                if !self.decls.contains_key(&n) { return Err(KernelError::UnknownConstant(n)); }
+                Ok(self.arena.const_(n, []))
+            }
             ExprData::Proj { struct_name, idx, expr } => {
                 let (s, i, x) = (*struct_name, *idx, *expr);
                 self.infer_proj(s, i, x)
@@ -319,37 +263,35 @@ impl<'a> TypeChecker<'a> {
         expr_check_level_params(self.arena, ty, params)?;
         let ty_sort = self.infer_sort(ty)?;
 
-        match decl {
-            Declaration::Axiom { .. }
-            | Declaration::Inductive(_)
-            | Declaration::Constructor(_)
-            | Declaration::Recursor(_)
-            | Declaration::Quot { .. } => Ok(()),
-            Declaration::Definition { val, .. } | Declaration::Opaque { val, .. } => {
-                expr_check_level_params(self.arena, *val, params)?;
-                let val_ty = self.infer_type(*val)?;
-                if !self.is_def_eq(val_ty, ty)? {
-                    return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
-                }
-                Ok(())
-            }
-            Declaration::Theorem { name, val, .. } => {
-                if !level_is_zero(self.arena, ty_sort) {
-                    let sort = self.arena.sort(ty_sort);
-                    return Err(KernelError::TheoremNotInProp { name: *name, sort });
-                }
-                expr_check_level_params(self.arena, *val, params)?;
-                let val_ty = self.infer_type(*val)?;
-                if !self.is_def_eq(val_ty, ty)? {
-                    return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
-                }
-                Ok(())
+        if let Declaration::Theorem { name, .. } = decl {
+            if !level_is_zero(self.arena, ty_sort) {
+                let sort = self.arena.sort(ty_sort);
+                return Err(KernelError::TheoremNotInProp { name: *name, sort });
             }
         }
+        let (Declaration::Definition { val, .. } | Declaration::Opaque { val, .. } | Declaration::Theorem { val, .. }) = decl else {
+            return Ok(()); // axioms, quotients, and inductive types (checked when they were built)
+        };
+        expr_check_level_params(self.arena, *val, params)?;
+        let val_ty = self.infer_type(*val)?;
+        if !self.is_def_eq(val_ty, ty)? {
+            return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
+        }
+        Ok(())
+    }
+
+    /// Run `f` on `body` opened with a new local of type `ty` (and value `val`), then drop the local.
+    fn under_binder<T>(&mut self, ty: ExprId, val: Option<ExprId>, body: ExprId, f: impl FnOnce(&mut Self, ExprId) -> T) -> (FVarId, T) {
+        let fv = self.push_local(ty, val);
+        let fve = self.arena.fvar(fv);
+        let b = instantiate1(self.arena, body, fve);
+        let r = f(self, b);
+        self.pop_local();
+        (fv, r)
     }
 }
 
-fn check_unique_params(params: &[NameId]) -> Result<(), KernelError> {
+pub(crate) fn check_unique_params(params: &[NameId]) -> Result<(), KernelError> {
     for (i, &p) in params.iter().enumerate() {
         if params[..i].contains(&p) {
             return Err(KernelError::DuplicateLevelParam(p));
