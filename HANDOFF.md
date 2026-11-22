@@ -207,3 +207,4 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
   Remaining duplication is small; what is left is mostly long match arms in reduce.rs (whnf_spine_with
   K/iota block) and inductive.rs nested-inductive discovery. Next: extract the K-rule and iota steps of
   whnf_spine_with into methods, flatten the nested-aux discovery in inductive.rs; mutation round after.
+- 2026-11-22 18:56 KST (A, hourly check): Gemini quota still out (gem, agy-mut idle until ~2026-11-28). Rigor Task E paused at 2,670 lines while A works on the user's Osmium compressor request; resume from the 19:20 entry's NEXT.
