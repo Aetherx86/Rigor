@@ -228,7 +228,7 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
   * Rigor verifies all of Lean v4.36.0-rc1 Init (58,546 decls) and Std (96,626 decls): parallel 7.8 s /
     478 MB and 11.9 s / 696 MB vs leanchecker --fresh 28.7 s / 547 MB and 44.2 s / 928 MB.
   * Kernel 3,155 -> 2,594 lines (forbid(unsafe_code), no dependencies), behaviour unchanged.
-  * Mutation testing: 1,664 mutants over ten rounds; every meaning-changing mutant rejected (accepted ones
+  * Mutation testing: 1,608 mutants over eight rounds; every meaning-changing mutant rejected (accepted ones
     analysed as harmless, e.g. outParam vs semiOutParam, Prop -> Type 0 hypothesis-only structures).
   * CI checks real Lean data (Init.Prelude verify + borrowed-proof rejection). Released v0.1.0, v0.1.1;
     portal /rigor/ live checker.
