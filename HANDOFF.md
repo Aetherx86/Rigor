@@ -224,3 +224,13 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
 - 2026-11-23 (A, hourly check): tried moving nested-inductive detection into flat helpers (nested_occurrence / nested_target): all tests incl. Init.Prelude, Init + Std CHECK_OK, Std 11.3 s (same speed), but +8 lines (2,602), so reverted. A slow 16.6 s Std run was macOS mediaanalysisd using a core, not the code. Kernel stays 2,594. Gemini quota still out.
 - 2026-11-23 (A, hourly check): Task E closed at 2,594 lines (from 3,155, -18%): what remains is either formatting compaction or restructuring soundness-critical inductive code (tried; it grew), and dropping binder names/info from Lam/Pi would save ~10 lines for a hash-consing change. README/page say "about 2,600". NEXT: tools/tcb/MEMORY.md item 2 (reuse one child arena + TypeChecker per worker with a high-water reset; low risk, -10 to -20 MB RSS expected on 10-thread Init), measured with tests + Init/Std + RSS; then item 1 (batched binder telescopes). Gemini quota still out.
 - 2026-11-23 (A, hourly check): MEMORY.md item 2 (one reset child arena per worker) measured and reverted: Init peak RSS 483-487 MB vs 479 MB baseline (no gain), Std 679 MB vs ~690 MB (-1.5%). Peak RSS is dominated by the shared arena and declarations, not per-thread scratch, so the plan's -10 to -20 MB estimate did not hold. Machine is being suspended/throttled (wall times 500-970 s), so no timing claims this cycle. NEXT (optional): item 1 (batched binder telescopes) for speed; adds kernel lines. Gemini quota still out.
+- 2026-11-23 (A): ALL DONE. Summary of the campaign:
+  * Rigor verifies all of Lean v4.36.0-rc1 Init (58,546 decls) and Std (96,626 decls): parallel 7.8 s /
+    478 MB and 11.9 s / 696 MB vs leanchecker --fresh 28.7 s / 547 MB and 44.2 s / 928 MB.
+  * Kernel 3,155 -> 2,594 lines (forbid(unsafe_code), no dependencies), behaviour unchanged.
+  * Mutation testing: 1,664 mutants over ten rounds; every meaning-changing mutant rejected (accepted ones
+    analysed as harmless, e.g. outParam vs semiOutParam, Prop -> Type 0 hypothesis-only structures).
+  * CI checks real Lean data (Init.Prelude verify + borrowed-proof rejection). Released v0.1.0, v0.1.1;
+    portal /rigor/ live checker.
+  Optional future work (not started): tools/tcb/MEMORY.md item 1 (batched binder telescopes, speed),
+  items 3-5; measure on an idle, awake machine.
