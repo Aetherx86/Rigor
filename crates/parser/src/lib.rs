@@ -13,8 +13,19 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+pub mod audit;
 mod ndjson;
+pub mod pretty;
 
+pub use audit::{
+    audit_environment, check_axiom_policy, check_decl_policy, inspect_decl, is_sorry_axiom,
+    is_standard_axiom, is_trust_extending_axiom, lookup_name, AuditReport, AxiomPolicy, AxiomUsage,
+    DeclInspection, DeclKind, PolicyViolation, STANDARD_AXIOMS, TRUST_EXTENDING_AXIOMS,
+};
+pub use pretty::{
+    format_expr, format_expr_bounded, format_kernel_error, format_level, format_name, format_nat,
+    format_parse_error,
+};
 pub use rigor_kernel as kernel;
 
 use rigor_kernel::{
@@ -22,10 +33,36 @@ use rigor_kernel::{
     KernelError, LevelId, NameId, ReducibilityHint,
 };
 
+/// Resource caps enforced by [`StreamParser`] to defend against hostile or malformed exports
+/// (sparse-ID OOM bombs, deeply nested JSON stack overflows, and oversized decimal literals).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ParseLimits {
+    /// Maximum numeric ID accepted in name/level/expr tables (default: 64,000,000).
+    pub max_table_id: usize,
+    /// Maximum single-step jump above the current table length (default: 1,000,000).
+    pub max_id_gap: usize,
+    /// Maximum JSON array/object nesting depth in NDJSON mode (default: 128).
+    pub max_json_depth: usize,
+    /// Maximum decimal digit length of a `Nat` literal (default: 1,000,000).
+    pub max_nat_digits: usize,
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self {
+            max_table_id: 64_000_000,
+            max_id_gap: 1_000_000,
+            max_json_depth: 128,
+            max_nat_digits: 1_000_000,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ParseError {
     Io(std::io::Error),
     Syntax { line: usize, message: String },
+    LimitExceeded { line: usize, message: String },
     UnknownNameId { line: usize, id: usize },
     UnknownLevelId { line: usize, id: usize },
     UnknownExprId { line: usize, id: usize },
@@ -40,6 +77,7 @@ impl fmt::Display for ParseError {
         match self {
             ParseError::Io(e) => write!(f, "I/O error: {e}"),
             ParseError::Syntax { line, message } => write!(f, "line {line}: syntax error: {message}"),
+            ParseError::LimitExceeded { line, message } => write!(f, "line {line}: parser limit exceeded: {message}"),
             ParseError::UnknownNameId { line, id } => write!(f, "line {line}: undefined name id {id}"),
             ParseError::UnknownLevelId { line, id } => write!(f, "line {line}: undefined level id {id}"),
             ParseError::UnknownExprId { line, id } => write!(f, "line {line}: undefined expr id {id}"),
@@ -150,6 +188,7 @@ pub struct StreamParser {
     pub(crate) levels: Vec<Option<LevelId>>,
     pub(crate) exprs: Vec<Option<ExprId>>,
     pub(crate) stats: ParseStats,
+    pub(crate) limits: ParseLimits,
     v3_mode: bool,
     ndjson_mode: bool,
     pending_ind: Option<PendingV3Ind>,
@@ -163,6 +202,10 @@ impl Default for StreamParser {
 
 impl StreamParser {
     pub fn new() -> Self {
+        Self::with_limits(ParseLimits::default())
+    }
+
+    pub fn with_limits(limits: ParseLimits) -> Self {
         let mut names = Vec::with_capacity(1024);
         names.push(Some(Arena::ANONYMOUS));
         let mut levels = Vec::with_capacity(256);
@@ -172,6 +215,7 @@ impl StreamParser {
             levels,
             exprs: Vec::with_capacity(4096),
             stats: ParseStats::default(),
+            limits,
             v3_mode: false,
             ndjson_mode: false,
             pending_ind: None,
@@ -228,7 +272,7 @@ impl StreamParser {
                     if is_decl && ms >= limit {
                         eprintln!("RIGOR_SLOW line={line_no} ms={ms:.1}");
                     }
-                    if line_no % 100_000 == 0 {
+                    if line_no.is_multiple_of(100_000) {
                         eprintln!("RIGOR_PROGRESS line={line_no}");
                     }
                 } else {
@@ -271,7 +315,7 @@ impl StreamParser {
                     .ok_or_else(|| syntax(line, "#NS expects <parent> <str>"))?;
                 let pid = self.get_name(line, parse_usize(line, p_tok, "parent name id")?)?;
                 let nid = env.arena.name_str(pid, seg);
-                set_slot(&mut self.names, id, nid);
+                set_slot(&mut self.names, id, nid, line, &self.limits)?;
                 self.stats.names += 1;
             }
             "#NI" => {
@@ -280,7 +324,7 @@ impl StreamParser {
                 let num = parse_u64(line, next_tok(line, &mut it, "#NI number")?, "#NI number")?;
                 expect_end(line, &mut it, "#NI")?;
                 let nid = env.arena.name_num(pid, num);
-                set_slot(&mut self.names, id, nid);
+                set_slot(&mut self.names, id, nid, line, &self.limits)?;
                 self.stats.names += 1;
             }
             "#US" => {
@@ -288,7 +332,7 @@ impl StreamParser {
                 let l = self.next_level(line, &mut it, "#US level")?;
                 expect_end(line, &mut it, "#US")?;
                 let lid = env.arena.lvl_succ(l);
-                set_slot(&mut self.levels, id, lid);
+                set_slot(&mut self.levels, id, lid, line, &self.limits)?;
                 self.stats.levels += 1;
             }
             "#UM" => {
@@ -297,7 +341,7 @@ impl StreamParser {
                 let l2 = self.next_level(line, &mut it, "#UM rhs")?;
                 expect_end(line, &mut it, "#UM")?;
                 let lid = env.arena.lvl_max(l1, l2);
-                set_slot(&mut self.levels, id, lid);
+                set_slot(&mut self.levels, id, lid, line, &self.limits)?;
                 self.stats.levels += 1;
             }
             "#UIM" => {
@@ -306,7 +350,7 @@ impl StreamParser {
                 let l2 = self.next_level(line, &mut it, "#UIM rhs")?;
                 expect_end(line, &mut it, "#UIM")?;
                 let lid = env.arena.lvl_imax(l1, l2);
-                set_slot(&mut self.levels, id, lid);
+                set_slot(&mut self.levels, id, lid, line, &self.limits)?;
                 self.stats.levels += 1;
             }
             "#UP" => {
@@ -314,7 +358,7 @@ impl StreamParser {
                 let nm = self.next_name(line, &mut it, "#UP name")?;
                 expect_end(line, &mut it, "#UP")?;
                 let lid = env.arena.lvl_param(nm);
-                set_slot(&mut self.levels, id, lid);
+                set_slot(&mut self.levels, id, lid, line, &self.limits)?;
                 self.stats.levels += 1;
             }
             "#EV" => {
@@ -322,7 +366,7 @@ impl StreamParser {
                 let idx = parse_u32(line, next_tok(line, &mut it, "#EV index")?, "#EV index")?;
                 expect_end(line, &mut it, "#EV")?;
                 let eid = env.arena.bvar(idx);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#ES" => {
@@ -330,7 +374,7 @@ impl StreamParser {
                 let l = self.next_level(line, &mut it, "#ES level")?;
                 expect_end(line, &mut it, "#ES")?;
                 let eid = env.arena.sort(l);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#EC" => {
@@ -341,7 +385,7 @@ impl StreamParser {
                     lvls.push(self.get_level(line, parse_usize(line, tok, "#EC level")?)?);
                 }
                 let eid = env.arena.const_(nm, lvls);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#EA" => {
@@ -350,7 +394,7 @@ impl StreamParser {
                 let a = self.next_expr(line, &mut it, "#EA arg")?;
                 expect_end(line, &mut it, "#EA")?;
                 let eid = env.arena.app(f, a);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#EL" => {
@@ -361,7 +405,7 @@ impl StreamParser {
                 let body = self.next_expr(line, &mut it, "#EL body")?;
                 expect_end(line, &mut it, "#EL")?;
                 let eid = env.arena.lam(nm, bi, ty, body);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#EP" => {
@@ -372,7 +416,7 @@ impl StreamParser {
                 let body = self.next_expr(line, &mut it, "#EP body")?;
                 expect_end(line, &mut it, "#EP")?;
                 let eid = env.arena.pi(nm, bi, ty, body);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#EZ" => {
@@ -383,7 +427,7 @@ impl StreamParser {
                 let body = self.next_expr(line, &mut it, "#EZ body")?;
                 expect_end(line, &mut it, "#EZ")?;
                 let eid = env.arena.let_(nm, ty, val, body);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#EJ" => {
@@ -393,16 +437,16 @@ impl StreamParser {
                 let expr = self.next_expr(line, &mut it, "#EJ expr")?;
                 expect_end(line, &mut it, "#EJ")?;
                 let eid = env.arena.proj(sname, idx, expr);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#ELN" => {
                 let mut it = after_tag.split_ascii_whitespace();
                 let tok = next_tok(line, &mut it, "#ELN nat")?;
-                let n = parse_nat_dec(tok).ok_or_else(|| syntax(line, &format!("invalid natural number '{tok}' for #ELN nat")))?;
+                let n = parse_nat_dec(line, tok, &self.limits)?;
                 expect_end(line, &mut it, "#ELN")?;
                 let eid = env.arena.lit_nat_big(n);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             "#ELS" => {
@@ -414,7 +458,7 @@ impl StreamParser {
                 }
                 let s = std::str::from_utf8(&bytes).map_err(|_| ParseError::InvalidUtf8 { line })?;
                 let eid = env.arena.lit_str(s);
-                set_slot(&mut self.exprs, id, eid);
+                set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
                 self.stats.exprs += 1;
             }
             other => {
@@ -534,7 +578,7 @@ impl StreamParser {
         let name = self.next_name(line, it, "#IND name")?;
         let ty = self.next_expr(line, it, "#IND type")?;
         let num_ctors = parse_usize(line, next_tok(line, it, "#IND num_ctors")?, "#IND num_ctors")?;
-        let mut ctors = Vec::with_capacity(num_ctors);
+        let mut ctors = Vec::with_capacity(num_ctors.min(1024));
         for _ in 0..num_ctors {
             let cn = self.next_name(line, it, "#IND ctor name")?;
             let cty = self.next_expr(line, it, "#IND ctor type")?;
@@ -559,12 +603,12 @@ impl StreamParser {
     ) -> Result<(), ParseError> {
         let num_params = parse_u32(line, next_tok(line, it, "#INDM num_params")?, "#INDM num_params")?;
         let num_types = parse_usize(line, next_tok(line, it, "#INDM num_types")?, "#INDM num_types")?;
-        let mut types = Vec::with_capacity(num_types);
+        let mut types = Vec::with_capacity(num_types.min(1024));
         for _ in 0..num_types {
             let name = self.next_name(line, it, "#INDM type name")?;
             let ty = self.next_expr(line, it, "#INDM type")?;
             let num_ctors = parse_usize(line, next_tok(line, it, "#INDM num_ctors")?, "#INDM num_ctors")?;
-            let mut ctors = Vec::with_capacity(num_ctors);
+            let mut ctors = Vec::with_capacity(num_ctors.min(1024));
             for _ in 0..num_ctors {
                 let cn = self.next_name(line, it, "#INDM ctor name")?;
                 let cty = self.next_expr(line, it, "#INDM ctor type")?;
@@ -597,12 +641,12 @@ impl StreamParser {
         let num_params = parse_u32(line, next_tok(line, it, "v3 #IND num_params")?, "num_params")?;
         let _num_indices = parse_u32(line, next_tok(line, it, "v3 #IND num_indices")?, "num_indices")?;
         let num_all = parse_usize(line, next_tok(line, it, "v3 #IND num_all")?, "num_all")?;
-        let mut all = Vec::with_capacity(num_all);
+        let mut all = Vec::with_capacity(num_all.min(1024));
         for _ in 0..num_all {
             all.push(self.next_name(line, it, "v3 #IND all member")?);
         }
         let num_ctors = parse_usize(line, next_tok(line, it, "v3 #IND num_ctors")?, "num_ctors")?;
-        let mut ctor_names = Vec::with_capacity(num_ctors);
+        let mut ctor_names = Vec::with_capacity(num_ctors.min(1024));
         for _ in 0..num_ctors {
             ctor_names.push(self.next_name(line, it, "v3 #IND ctor name")?);
         }
@@ -780,11 +824,31 @@ pub fn parse_file(
 }
 
 #[inline]
-pub(crate) fn set_slot<T: Copy>(table: &mut Vec<Option<T>>, id: usize, val: T) {
+pub(crate) fn set_slot<T: Copy>(
+    table: &mut Vec<Option<T>>,
+    id: usize,
+    val: T,
+    line: usize,
+    limits: &ParseLimits,
+) -> Result<(), ParseError> {
+    if id > limits.max_table_id {
+        return Err(ParseError::LimitExceeded {
+            line,
+            message: format!("table id {id} exceeds max_table_id ({})", limits.max_table_id),
+        });
+    }
     if id >= table.len() {
+        let gap = id - table.len();
+        if gap > limits.max_id_gap {
+            return Err(ParseError::LimitExceeded {
+                line,
+                message: format!("sparse table id jump of {gap} exceeds max_id_gap ({})", limits.max_id_gap),
+            });
+        }
         table.resize(id + 1, None);
     }
     table[id] = Some(val);
+    Ok(())
 }
 
 pub(crate) fn syntax(line: usize, msg: &str) -> ParseError {
@@ -917,9 +981,23 @@ fn trace_limit_ms() -> Option<f64> {
     *LIMIT.get_or_init(|| std::env::var("RIGOR_TRACE").ok().and_then(|v| v.parse().ok()))
 }
 
-pub(crate) fn parse_nat_dec(s: &str) -> Option<rigor_kernel::Nat> {
+pub(crate) fn parse_nat_dec(
+    line: usize,
+    s: &str,
+    limits: &ParseLimits,
+) -> Result<rigor_kernel::Nat, ParseError> {
+    if s.len() > limits.max_nat_digits {
+        return Err(ParseError::LimitExceeded {
+            line,
+            message: format!(
+                "natural literal length {} exceeds max_nat_digits ({})",
+                s.len(),
+                limits.max_nat_digits
+            ),
+        });
+    }
     if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
+        return Err(syntax(line, &format!("invalid natural number '{s}'")));
     }
     let mut v: Vec<u64> = Vec::new();
     for chunk in s.as_bytes().chunks(18) {
@@ -938,15 +1016,5 @@ pub(crate) fn parse_nat_dec(s: &str) -> Option<rigor_kernel::Nat> {
             v.push(carry as u64);
         }
     }
-    Some(rigor_kernel::Nat::from_limbs(v))
-}
-
-fn format_name(arena: &Arena, id: NameId) -> String {
-    match arena.get_name(id) {
-        rigor_kernel::arena::NameData::Anonymous => "[anonymous]".into(),
-        rigor_kernel::arena::NameData::Str(p, s) if *p == Arena::ANONYMOUS => s.to_string(),
-        rigor_kernel::arena::NameData::Str(p, s) => format!("{}.{s}", format_name(arena, *p)),
-        rigor_kernel::arena::NameData::Num(p, n) if *p == Arena::ANONYMOUS => n.to_string(),
-        rigor_kernel::arena::NameData::Num(p, n) => format!("{}.{n}", format_name(arena, *p)),
-    }
+    Ok(rigor_kernel::Nat::from_limbs(v))
 }

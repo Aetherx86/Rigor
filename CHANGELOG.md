@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.2.0] - 2026-11-24
+
+### Added
+- Transitive axiom footprint auditing and declaration inspection (`crates/parser/src/audit.rs`):
+  computes exact transitive axiom dependencies for any declaration (analogous to Lean's
+  `#print axioms`) or across an entire verified environment via reverse-BFS, classifies standard
+  axioms (`propext`, `Quot.sound`, `Classical.choice`) vs non-standard/trust-extending axioms
+  (`sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`, custom axioms), and enforces
+  `--forbid-sorry` and `--allow-axioms` verification policies.
+- Bounded, cycle-safe pretty-printer (`crates/parser/src/pretty.rs`) for Lean names, universe
+  levels, expressions (with binder-name resolution), and human-readable kernel error diagnostics.
+- Extended `rigor-bench` CLI with `--audit <file> [--decl <name>]`, `--inspect <file> <decl>`,
+  `--json`, `--sequential`, `--threads <N>`, `--forbid-sorry`, `--allow-axioms <list>`,
+  `--version`, and clean non-panicking exit codes.
+- New WebAssembly exports in `web/`: `audit(input, decl_name)` and `version()`, while preserving
+  the existing `check(input)` signature and schema (now with human-readable error diagnostics).
+- Configurable parser resource limits (`ParseLimits`) and `ParseError::LimitExceeded`.
+
+### Changed
+- Kernel memory and telescope optimization (`crates/kernel`): batched `Lam`/`Pi`/`Let` telescope
+  opening and `infer_only` `App` spines via `instantiate_rev`, batched `Pi`/`Lam` definitional
+  equality (`bindings_def_eq`), fast-return guards skipping trivial WHNF and leaf `infer_type`
+  cache entries, parent arena intern-map shrinking in `Arena::shrink_for_sharing`, and
+  coprime-stride parallel work dispatch in `Environment::check_deferred` with lock-free earliest
+  error tracking. Peak RSS drops from 478 MB to 355 MB on parallel `Init` (-25.7%) and from
+  696 MB to 547 MB on parallel `Std` (-21.4%).
+- Added read-only `Environment::decls()` and `Environment::is_empty()` accessors without
+  expanding the Trusted Computing Base beyond ~2,700 lines.
+
+### Security & Hardening
+- Hardened `crates/parser` against hostile and malformed `lean4export` inputs: strict JSON
+  nesting depth limit, sparse-ID allocation bomb protection, `u32`/`usize` overflow checks,
+  rejection of negative/floating-point values outside `mdata`, trailing-token rejection after JSON
+  objects, UTF-8-safe JSON escape scanning, bounded `Vec::with_capacity` in text inductive
+  directives, `Nat` literal digit limits, and mutual inductive consistency checks (`levelParams`,
+  `numParams`, duplicate `cidx`, and orphan constructors).
+
+### Verified
+- Full workspace unit, soundness, telescope, parallel differential, audit, hostile-input, and CLI
+  tests (37/37 tests), `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `wasm32-unknown-unknown` release build.
+- Full Lean v4.36.0-rc1 `Init` (58,546 decls, parallel 355 MB / sequential 347 MB) and `Std`
+  (96,626 decls, parallel 547 MB), plus full `Std` axiom audit (`--forbid-sorry --allow-axioms
+  propext,Quot.sound,Classical.choice`: 68,728 theorems, 0 `sorryAx` dependents).
+- Additional mutation round on `Init.Prelude` (28/28 mutants rejected across all 7 operators).
+
 ## [0.1.1] - 2026-11-23
 
 ### Changed

@@ -15,9 +15,9 @@ impl FxHasher {
 impl Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks { self.add(u64::from_ne_bytes(c.try_into().unwrap())); }
-        for &b in chunks.remainder() { self.add(b as u64); }
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for &c in chunks { self.add(u64::from_ne_bytes(c)); }
+        for &b in rem { self.add(b as u64); }
     }
     #[inline]
     fn write_u8(&mut self, i: u8) { self.add(i as u64); }

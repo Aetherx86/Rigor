@@ -40,18 +40,18 @@ dependencies = [
 
 [[package]]
 name = "rigor-kernel"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "rigor-parser"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rigor-kernel",
 ]
 
 [[package]]
 name = "rigor-web"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rigor-parser",
  "wasm-bindgen",

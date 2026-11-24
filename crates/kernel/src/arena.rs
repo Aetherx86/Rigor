@@ -418,10 +418,14 @@ impl Arena {
     /// is frozen and shared read-only with checker threads.
     pub fn shrink_for_sharing(&mut self) {
         self.names.items.shrink_to_fit();
+        self.names.map.shrink_to_fit();
         self.levels.items.shrink_to_fit();
+        self.levels.map.shrink_to_fit();
         self.level_meta.shrink_to_fit();
         self.level_lists.items.shrink_to_fit();
+        self.level_lists.map.shrink_to_fit();
         self.lits.items.shrink_to_fit();
+        self.lits.map.shrink_to_fit();
         self.exprs.shrink_to_fit();
         self.expr_meta.shrink_to_fit();
         let mut cap = 1024usize;

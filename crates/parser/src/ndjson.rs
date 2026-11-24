@@ -14,6 +14,8 @@ enum JVal<'a> {
     Null,
     Bool(bool),
     Int(u64),
+    /// Negative integer or floating-point number (permitted inside ignored `mdata`, rejected for IDs).
+    OtherNum,
     Str(Cow<'a, str>),
     Arr(Vec<JVal<'a>>),
     Obj(Vec<(Cow<'a, str>, JVal<'a>)>),
@@ -35,14 +37,16 @@ impl<'a> JVal<'a> {
     fn as_u64(&self, line: usize, what: &str) -> Result<u64, ParseError> {
         match self {
             JVal::Int(n) => Ok(*n),
-            _ => Err(syntax(line, &format!("expected integer for {what}"))),
+            _ => Err(syntax(line, &format!("expected non-negative integer for {what}"))),
         }
     }
     fn as_usize(&self, line: usize, what: &str) -> Result<usize, ParseError> {
-        self.as_u64(line, what).map(|n| n as usize)
+        let n = self.as_u64(line, what)?;
+        usize::try_from(n).map_err(|_| syntax(line, &format!("integer overflow for {what}")))
     }
     fn as_u32(&self, line: usize, what: &str) -> Result<u32, ParseError> {
-        self.as_u64(line, what).map(|n| n as u32)
+        let n = self.as_u64(line, what)?;
+        u32::try_from(n).map_err(|_| syntax(line, &format!("u32 overflow for {what}")))
     }
     fn as_str(&self, line: usize, what: &str) -> Result<&str, ParseError> {
         match self {
@@ -77,17 +81,29 @@ struct JsonCursor<'a> {
     b: &'a [u8],
     i: usize,
     line: usize,
+    depth: usize,
+    max_depth: usize,
 }
 
 impl<'a> JsonCursor<'a> {
-    fn new(s: &'a str, line: usize) -> Self {
-        Self { s, b: s.as_bytes(), i: 0, line }
+    fn new(s: &'a str, line: usize, max_depth: usize) -> Self {
+        Self { s, b: s.as_bytes(), i: 0, line, depth: 0, max_depth }
     }
     #[inline]
     fn skip_ws(&mut self) {
         while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
             self.i += 1;
         }
+    }
+    fn enter_container(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(ParseError::LimitExceeded {
+                line: self.line,
+                message: format!("JSON nesting depth exceeds max_json_depth ({})", self.max_depth),
+            });
+        }
+        Ok(())
     }
     fn parse_val(&mut self) -> Result<JVal<'a>, ParseError> {
         self.skip_ws();
@@ -122,10 +138,13 @@ impl<'a> JsonCursor<'a> {
             }
             b'0'..=b'9' => self.parse_uint(),
             b'-' => {
-                // Skip negative numbers (not used for IDs, may appear in mdata).
+                // Negative numbers may appear inside ignored mdata, never as valid IDs.
                 self.i += 1;
+                if self.b.get(self.i).is_none_or(|c| !c.is_ascii_digit()) {
+                    return Err(syntax(self.line, "expected digit after '-'"));
+                }
                 let _ = self.parse_uint()?;
-                Ok(JVal::Int(0))
+                Ok(JVal::OtherNum)
             }
             _ => Err(syntax(self.line, "unexpected character in JSON")),
         }
@@ -142,7 +161,7 @@ impl<'a> JsonCursor<'a> {
             {
                 self.i += 1;
             }
-            return Ok(JVal::Int(0));
+            return Ok(JVal::OtherNum);
         }
         let n = self.s[start..self.i]
             .parse::<u64>()
@@ -166,7 +185,16 @@ impl<'a> JsonCursor<'a> {
                 }
                 b'\\' => {
                     has_escape = true;
-                    self.i += 2;
+                    self.i += 1;
+                    if self.i >= self.b.len() {
+                        return Err(syntax(self.line, "unterminated escape in JSON string"));
+                    }
+                    if self.b[self.i] < 0x80 {
+                        self.i += 1;
+                    } else {
+                        let ch_len = self.s[self.i..].chars().next().map_or(1, char::len_utf8);
+                        self.i += ch_len;
+                    }
                 }
                 _ => self.i += 1,
             }
@@ -174,11 +202,13 @@ impl<'a> JsonCursor<'a> {
         Err(syntax(self.line, "unterminated JSON string"))
     }
     fn parse_arr(&mut self) -> Result<JVal<'a>, ParseError> {
+        self.enter_container()?;
         self.i += 1; // '['
         let mut out = Vec::new();
         self.skip_ws();
         if self.b.get(self.i) == Some(&b']') {
             self.i += 1;
+            self.depth -= 1;
             return Ok(JVal::Arr(out));
         }
         loop {
@@ -188,6 +218,7 @@ impl<'a> JsonCursor<'a> {
                 Some(&b',') => self.i += 1,
                 Some(&b']') => {
                     self.i += 1;
+                    self.depth -= 1;
                     return Ok(JVal::Arr(out));
                 }
                 _ => return Err(syntax(self.line, "expected ',' or ']' in JSON array")),
@@ -195,11 +226,13 @@ impl<'a> JsonCursor<'a> {
         }
     }
     fn parse_obj(&mut self) -> Result<JVal<'a>, ParseError> {
+        self.enter_container()?;
         self.i += 1; // '{'
         let mut out = Vec::new();
         self.skip_ws();
         if self.b.get(self.i) == Some(&b'}') {
             self.i += 1;
+            self.depth -= 1;
             return Ok(JVal::Obj(out));
         }
         loop {
@@ -220,6 +253,7 @@ impl<'a> JsonCursor<'a> {
                 Some(&b',') => self.i += 1,
                 Some(&b'}') => {
                     self.i += 1;
+                    self.depth -= 1;
                     return Ok(JVal::Obj(out));
                 }
                 _ => return Err(syntax(self.line, "expected ',' or '}' in JSON object")),
@@ -303,8 +337,12 @@ impl StreamParser {
         text: &str,
         env: &mut Environment,
     ) -> Result<(), ParseError> {
-        let mut cur = JsonCursor::new(text, line);
+        let mut cur = JsonCursor::new(text, line, self.limits.max_json_depth);
         let root = cur.parse_val()?;
+        cur.skip_ws();
+        if cur.i != cur.b.len() {
+            return Err(syntax(line, "unexpected trailing characters after JSON object"));
+        }
         let _ = root.as_obj(line, "root")?;
 
         if let Some(meta) = root.field("meta") {
@@ -323,12 +361,12 @@ impl StreamParser {
                 let pre = self.get_name(line, o.req(line, "pre")?.as_usize(line, "str.pre")?)?;
                 let seg = o.req(line, "str")?.as_str(line, "str.str")?;
                 let nid = env.arena.name_str(pre, seg);
-                set_slot(&mut self.names, id, nid);
+                set_slot(&mut self.names, id, nid, line, &self.limits)?;
             } else if let Some(o) = root.field("num") {
                 let pre = self.get_name(line, o.req(line, "pre")?.as_usize(line, "num.pre")?)?;
                 let num = o.req(line, "i")?.as_u64(line, "num.i")?;
                 let nid = env.arena.name_num(pre, num);
-                set_slot(&mut self.names, id, nid);
+                set_slot(&mut self.names, id, nid, line, &self.limits)?;
             } else {
                 return Err(syntax(line, "unknown name object in NDJSON"));
             }
@@ -360,7 +398,7 @@ impl StreamParser {
             } else {
                 return Err(syntax(line, "unknown level object in NDJSON"));
             };
-            set_slot(&mut self.levels, id, lid);
+            set_slot(&mut self.levels, id, lid, line, &self.limits)?;
             self.stats.levels += 1;
             return Ok(());
         }
@@ -410,7 +448,7 @@ impl StreamParser {
                 env.arena.proj(tn, idx, st)
             } else if let Some(v) = root.field("natVal") {
                 let s = v.as_str(line, "natVal")?;
-                let n = crate::parse_nat_dec(s).ok_or_else(|| syntax(line, &format!("invalid natVal '{s}'")))?;
+                let n = crate::parse_nat_dec(line, s, &self.limits)?;
                 env.arena.lit_nat_big(n)
             } else if let Some(v) = root.field("strVal") {
                 env.arena.lit_str(v.as_str(line, "strVal")?)
@@ -419,7 +457,7 @@ impl StreamParser {
             } else {
                 return Err(syntax(line, "unknown expr object in NDJSON"));
             };
-            set_slot(&mut self.exprs, id, eid);
+            set_slot(&mut self.exprs, id, eid, line, &self.limits)?;
             self.stats.exprs += 1;
             return Ok(());
         }
@@ -490,11 +528,21 @@ impl StreamParser {
                 parsed_ctors.push((cname, ind_name, cidx, cty));
             }
             let mut type_specs = Vec::with_capacity(types_arr.len());
+            let mut type_names = Vec::with_capacity(types_arr.len());
             for t in types_arr {
                 if t.field("isUnsafe").and_then(|v| v.as_bool(line, "isUnsafe").ok()).unwrap_or(false) {
                     return Err(syntax(line, "unsafe inductive rejected by Rigor kernel"));
                 }
+                let t_params = self.ndjson_names(line, t.req(line, "levelParams")?)?;
+                if t_params != level_params {
+                    return Err(syntax(line, "mutual inductive members must share identical levelParams"));
+                }
+                let t_num_params = t.req(line, "numParams")?.as_u32(line, "inductive.numParams")?;
+                if t_num_params != num_params {
+                    return Err(syntax(line, "mutual inductive members must share identical numParams"));
+                }
                 let name = self.get_name(line, t.req(line, "name")?.as_usize(line, "ind.name")?)?;
+                type_names.push(name);
                 let ty = self.get_expr(line, t.req(line, "type")?.as_usize(line, "ind.type")?)?;
                 let mut mine: Vec<(u32, NameId, rigor_kernel::ExprId)> = parsed_ctors
                     .iter()
@@ -502,8 +550,14 @@ impl StreamParser {
                     .map(|(cn, _, cidx, cty)| (*cidx, *cn, *cty))
                     .collect();
                 mine.sort_by_key(|(cidx, _, _)| *cidx);
+                if mine.windows(2).any(|w| w[0].0 == w[1].0) {
+                    return Err(syntax(line, "duplicate constructor index (cidx) in inductive block"));
+                }
                 let ctors = mine.into_iter().map(|(_, cn, cty)| (cn, cty)).collect();
                 type_specs.push(InductiveTypeSpec { name, ty, ctors });
+            }
+            if parsed_ctors.iter().any(|(_, ind, _, _)| !type_names.contains(ind)) {
+                return Err(syntax(line, "orphan constructor references inductive not in block"));
             }
             env.add_inductive(InductiveSpec {
                 level_params,

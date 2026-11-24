@@ -1,9 +1,9 @@
 //! Bidirectional CIC type inference and declaration verification.
 
-use crate::arena::{Arena, ExprData, ExprId, FVarId, LevelId, NameId};
+use crate::arena::{Arena, BinderInfo, ExprData, ExprId, FVarId, LevelId, NameId};
 use crate::env::Declaration;
 use crate::error::KernelError;
-use crate::expr::{abstract_fvars, expr_check_level_params, instantiate1, instantiate_level_params};
+use crate::expr::{abstract_fvars, expr_check_level_params, instantiate1, instantiate_level_params, instantiate_rev};
 use crate::hash::{FxHashMap, FxHashSet};
 use crate::level::level_is_zero;
 
@@ -89,6 +89,22 @@ impl<'a> TypeChecker<'a> {
 
     /// Infer the type of `e` in the current local context (DAG-memoized).
     pub fn infer_type(&mut self, e: ExprId) -> Result<ExprId, KernelError> {
+        // Fast path for O(1) leaves: skip cache probe/insert.
+        match *self.arena.get_expr(e) {
+            ExprData::BVar(idx) => return Err(KernelError::UnboundBVar(idx)),
+            ExprData::FVar(fv) => return self.local_type(fv).ok_or(KernelError::UnknownFVar(fv)),
+            ExprData::Sort(u) => {
+                let next = self.arena.lvl_succ(u);
+                return Ok(self.arena.sort(next));
+            }
+            ExprData::Lit(lid) => {
+                let is_nat = matches!(self.arena.get_lit(lid), crate::arena::Literal::Nat(_));
+                let n = self.arena.name_from_path(if is_nat { "Nat" } else { "String" });
+                if !self.decls.contains_key(&n) { return Err(KernelError::UnknownConstant(n)); }
+                return Ok(self.arena.const_(n, []));
+            }
+            _ => {}
+        }
         if let Some(&ty) = self.infer_cache.get(&e) {
             return Ok(ty);
         }
@@ -142,15 +158,15 @@ impl<'a> TypeChecker<'a> {
             }
             ExprData::App(f, a) => {
                 let (f, a) = (*f, *a);
+                if self.infer_only {
+                    return self.infer_app_only(e);
+                }
                 let f_ty = self.infer_type(f)?;
                 let f_ty_whnf = self.whnf(f_ty);
                 let (dom, body) = match self.arena.get_expr(f_ty_whnf) {
                     ExprData::Pi { ty, body, .. } => (*ty, *body),
                     _ => return Err(KernelError::ExpectedPi(f_ty_whnf)),
                 };
-                if self.infer_only {
-                    return Ok(instantiate1(self.arena, body, a));
-                }
                 let a_ty = self.infer_type(a)?;
                 let prev = self.eager_reduce;
                 self.eager_reduce |= self.is_eager_reduce(a);
@@ -159,31 +175,9 @@ impl<'a> TypeChecker<'a> {
                 if !eq? { return Err(KernelError::TypeMismatch { expected: dom, got: a_ty }); }
                 Ok(instantiate1(self.arena, body, a))
             }
-            ExprData::Pi { ty, body, .. } => {
-                let (ty, body) = (*ty, *body);
-                let u = self.infer_sort(ty)?;
-                let (_, v) = self.under_binder(ty, None, body, |tc, b| tc.infer_sort(b));
-                let res_lvl = self.arena.lvl_imax(u, v?);
-                Ok(self.arena.sort(res_lvl))
-            }
-            ExprData::Lam { name, binder_info, ty, body } => {
-                let (name, binder_info, ty, body) = (*name, *binder_info, *ty, *body);
-                let _u = self.infer_sort(ty)?;
-                let (fv, body_ty) = self.under_binder(ty, None, body, |tc, b| tc.infer_type(b));
-                let abs_body_ty = abstract_fvars(self.arena, body_ty?, &[fv]);
-                Ok(self.arena.pi(name, binder_info, ty, abs_body_ty))
-            }
-            ExprData::Let { ty, val, body } => {
-                let (ty, val, body) = (*ty, *val, *body);
-                let _u = self.infer_sort(ty)?;
-                let val_ty = if self.infer_only { ty } else { self.infer_type(val)? };
-                if !self.infer_only && !self.is_def_eq(val_ty, ty)? {
-                    return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
-                }
-                let (fv, body_ty) = self.under_binder(ty, Some(val), body, |tc, b| tc.infer_type(b));
-                let abs = abstract_fvars(self.arena, body_ty?, &[fv]);
-                Ok(instantiate1(self.arena, abs, val))
-            }
+            ExprData::Pi { .. } => self.infer_pi_telescope(e),
+            ExprData::Lam { .. } => self.infer_lam_telescope(e),
+            ExprData::Let { .. } => self.infer_let_telescope(e),
             ExprData::Lit(lid) => {
                 let is_nat = matches!(self.arena.get_lit(*lid), crate::arena::Literal::Nat(_));
                 let n = self.arena.name_from_path(if is_nat { "Nat" } else { "String" });
@@ -280,14 +274,119 @@ impl<'a> TypeChecker<'a> {
         (e, complete)
     }
 
-    /// Run `f` on `body` opened with a new local of type `ty` (and value `val`), then drop the local.
-    fn under_binder<T>(&mut self, ty: ExprId, val: Option<ExprId>, body: ExprId, f: impl FnOnce(&mut Self, ExprId) -> T) -> (FVarId, T) {
-        let fv = self.push_local(ty, val);
-        let fve = self.arena.fvar(fv);
-        let b = instantiate1(self.arena, body, fve);
-        let r = f(self, b);
-        self.pop_local();
-        (fv, r)
+    /// Batch `App` spine type inference in `infer_only` mode (matches Lean's `infer_app`).
+    fn infer_app_only(&mut self, e: ExprId) -> Result<ExprId, KernelError> {
+        let (head, args) = self.app_spine(e);
+        let mut f_ty = self.infer_type(head)?;
+        let mut i = 0;
+        while i < args.len() {
+            if !matches!(self.arena.get_expr(f_ty), ExprData::Pi { .. }) {
+                f_ty = self.whnf(f_ty);
+                if !matches!(self.arena.get_expr(f_ty), ExprData::Pi { .. }) {
+                    return Err(KernelError::ExpectedPi(f_ty));
+                }
+            }
+            let start = i;
+            let mut body = f_ty;
+            while i < args.len() {
+                if let ExprData::Pi { body: next, .. } = *self.arena.get_expr(body) {
+                    body = next;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            f_ty = instantiate_rev(self.arena, body, &args[start..i]);
+        }
+        Ok(f_ty)
+    }
+
+    /// Batched `Pi` telescope inference: peels all consecutive `Pi` binders and instantiates once.
+    fn infer_pi_telescope(&mut self, mut cur: ExprId) -> Result<ExprId, KernelError> {
+        let saved = self.locals.len();
+        let (mut fvars, mut us) = (Vec::new(), Vec::new());
+        let res = (|| -> Result<ExprId, KernelError> {
+            while let ExprData::Pi { ty, body, .. } = *self.arena.get_expr(cur) {
+                let dom = instantiate_rev(self.arena, ty, &fvars);
+                us.push(self.infer_sort(dom)?);
+                let fv = self.push_local(dom, None);
+                fvars.push(self.arena.fvar(fv));
+                cur = body;
+            }
+            let body_inst = instantiate_rev(self.arena, cur, &fvars);
+            let mut v = self.infer_sort(body_inst)?;
+            for u in us.into_iter().rev() {
+                v = self.arena.lvl_imax(u, v);
+            }
+            Ok(self.arena.sort(v))
+        })();
+        self.locals.truncate(saved);
+        res
+    }
+
+    /// Batched `Lam` telescope inference: peels consecutive `Lam` binders, instantiates and abstracts once.
+    fn infer_lam_telescope(&mut self, mut cur: ExprId) -> Result<ExprId, KernelError> {
+        let saved = self.locals.len();
+        let (mut fvars, mut fvar_exprs): (Vec<FVarId>, Vec<ExprId>) = (Vec::new(), Vec::new());
+        let mut binders: Vec<(NameId, BinderInfo, ExprId)> = Vec::new();
+        let body_ty = (|| -> Result<ExprId, KernelError> {
+            while let ExprData::Lam { name, binder_info, ty, body } = *self.arena.get_expr(cur) {
+                let dom = instantiate_rev(self.arena, ty, &fvar_exprs);
+                let _u = self.infer_sort(dom)?;
+                let fv = self.push_local(dom, None);
+                fvars.push(fv);
+                fvar_exprs.push(self.arena.fvar(fv));
+                binders.push((name, binder_info, ty));
+                cur = body;
+            }
+            let body_inst = instantiate_rev(self.arena, cur, &fvar_exprs);
+            self.infer_type(body_inst)
+        })();
+        self.locals.truncate(saved);
+        let mut res = abstract_fvars(self.arena, body_ty?, &fvars);
+        for (name, bi, orig_ty) in binders.into_iter().rev() {
+            res = self.arena.pi(name, bi, orig_ty, res);
+        }
+        Ok(res)
+    }
+
+    /// Batched `Let` telescope inference: peels consecutive `Let` binders and instantiates body once.
+    fn infer_let_telescope(&mut self, mut cur: ExprId) -> Result<ExprId, KernelError> {
+        let saved = self.locals.len();
+        let (mut fvars, mut fvar_exprs, mut vals): (Vec<FVarId>, Vec<ExprId>, Vec<ExprId>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let body_ty = (|| -> Result<ExprId, KernelError> {
+            while let ExprData::Let { ty, val, body } = *self.arena.get_expr(cur) {
+                let dom = instantiate_rev(self.arena, ty, &fvar_exprs);
+                let _u = self.infer_sort(dom)?;
+                let val_inst = instantiate_rev(self.arena, val, &fvar_exprs);
+                if !self.infer_only {
+                    let val_ty = self.infer_type(val_inst)?;
+                    if !self.is_def_eq(val_ty, dom)? {
+                        return Err(KernelError::TypeMismatch { expected: dom, got: val_ty });
+                    }
+                }
+                let fv = self.push_local(dom, Some(val_inst));
+                fvars.push(fv);
+                fvar_exprs.push(self.arena.fvar(fv));
+                vals.push(val_inst);
+                cur = body;
+            }
+            let body_inst = instantiate_rev(self.arena, cur, &fvar_exprs);
+            self.infer_type(body_inst)
+        })();
+        self.locals.truncate(saved);
+        let mut res = body_ty?;
+        for (&fv, &val) in fvars.iter().zip(&vals).rev() {
+            if !self.arena.get_expr_meta(res).has_fvar() {
+                break;
+            }
+            let abs = abstract_fvars(self.arena, res, &[fv]);
+            if abs != res {
+                res = instantiate1(self.arena, abs, val);
+            }
+        }
+        Ok(res)
     }
 }
 

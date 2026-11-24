@@ -43,6 +43,13 @@ impl<'a> TypeChecker<'a> {
 
     /// Reduce `e` to weak head normal form (beta + zeta + iota + proj + quot + delta).
     pub fn whnf(&mut self, e: ExprId) -> ExprId {
+        // Fast-return for terms already in WHNF without polluting `whnf_cache`.
+        match *self.arena.get_expr(e) {
+            ExprData::Sort(_) | ExprData::Pi { .. } | ExprData::Lam { .. } | ExprData::Lit(_) | ExprData::BVar(_) => return e,
+            ExprData::FVar(fv) if self.local_value(fv).is_none() => return e,
+            ExprData::Const(name, _) if self.decls.get(&name).and_then(Declaration::delta_value).is_none() => return e,
+            _ => {}
+        }
         if let Some(&cached) = self.whnf_cache.get(&e) {
             return cached;
         }
@@ -500,13 +507,11 @@ impl<'a> TypeChecker<'a> {
                     return Ok(level_eq(self.arena, u, v));
                 }
                 (ExprData::Lit(x), ExprData::Lit(y)) => return Ok(x == y),
-                (ExprData::Pi { ty: t1, body: b1, .. }, ExprData::Pi { ty: t2, body: b2, .. }) => {
-                    let (t1, b1, t2, b2) = (*t1, *b1, *t2, *b2);
-                    return Ok(self.is_def_eq(t1, t2)? && self.bodies_def_eq(t1, b1, b2)?);
+                (ExprData::Pi { .. }, ExprData::Pi { .. }) => {
+                    return self.bindings_def_eq(a, b, true);
                 }
-                (ExprData::Lam { ty: t1, body: b1, .. }, ExprData::Lam { ty: t2, body: b2, .. }) => {
-                    let (t1, b1, t2, b2) = (*t1, *b1, *t2, *b2);
-                    if self.is_def_eq(t1, t2)? && self.bodies_def_eq(t1, b1, b2)? { return Ok(true); }
+                (ExprData::Lam { .. }, ExprData::Lam { .. }) => {
+                    if self.bindings_def_eq(a, b, false)? { return Ok(true); }
                     if !checked_proof {
                         if let (Some(ta), Some(tb)) = (self.is_proof(a)?, self.is_proof(b)?) {
                             return self.is_def_eq(ta, tb);
@@ -564,8 +569,9 @@ impl<'a> TypeChecker<'a> {
                                         || matches!(self.arena.get_expr(xb), ExprData::Lam { .. }))
                             }))
                         && self.heads_equal(ha, hb)
+                        && self.args_def_eq(&args_a, &args_b)?
                     {
-                        if self.args_def_eq(&args_a, &args_b)? { return Ok(true); }
+                        return Ok(true);
                     }
                     if pa >= pb { a = self.unfold_delta_app(va, ppa, la, &args_a); }
                     if pb >= pa { b = self.unfold_delta_app(vb, ppb, lb, &args_b); }
@@ -600,19 +606,41 @@ impl<'a> TypeChecker<'a> {
                     }
                     if let Some(ex) = self.str_lit_ctor(a) { a = self.whnf_no_delta(ex); continue; }
                     if let Some(ex) = self.str_lit_ctor(b) { b = self.whnf_no_delta(ex); continue; }
-                    return Ok(self.try_unit_like(a, b)?);
+                    return self.try_unit_like(a, b);
                 }
             }
         }
     }
 
-    /// Bodies of two binders with the same domain `ty`, opened with one fresh local.
-    fn bodies_def_eq(&mut self, ty: ExprId, b1: ExprId, b2: ExprId) -> Result<bool, KernelError> {
-        let fv = self.push_local(ty, None);
-        let fve = self.arena.fvar(fv);
-        let (ib1, ib2) = (instantiate1(self.arena, b1, fve), instantiate1(self.arena, b2, fve));
-        let res = self.is_def_eq(ib1, ib2);
-        self.pop_local();
+    /// Compare consecutive `Pi` (`is_pi = true`) or `Lam` (`is_pi = false`) binder telescopes
+    /// with batched `instantiate_rev` (matches Lean's `is_def_eq_binding`).
+    fn bindings_def_eq(&mut self, mut a: ExprId, mut b: ExprId, is_pi: bool) -> Result<bool, KernelError> {
+        let saved = self.locals.len();
+        let mut fvars = Vec::new();
+        let res = (|| -> Result<bool, KernelError> {
+            loop {
+                let pair = match (*self.arena.get_expr(a), *self.arena.get_expr(b)) {
+                    (ExprData::Pi { ty: t1, body: b1, .. }, ExprData::Pi { ty: t2, body: b2, .. }) if is_pi => Some((t1, b1, t2, b2)),
+                    (ExprData::Lam { ty: t1, body: b1, .. }, ExprData::Lam { ty: t2, body: b2, .. }) if !is_pi => Some((t1, b1, t2, b2)),
+                    _ => None,
+                };
+                let Some((t1, b1, t2, b2)) = pair else { break };
+                let d1 = instantiate_rev(self.arena, t1, &fvars);
+                if t1 != t2 {
+                    let d2 = instantiate_rev(self.arena, t2, &fvars);
+                    if !self.is_def_eq(d1, d2)? {
+                        return Ok(false);
+                    }
+                }
+                let fv = self.push_local(d1, None);
+                fvars.push(self.arena.fvar(fv));
+                a = b1;
+                b = b2;
+            }
+            let (ib1, ib2) = (instantiate_rev(self.arena, a, &fvars), instantiate_rev(self.arena, b, &fvars));
+            self.is_def_eq(ib1, ib2)
+        })();
+        self.locals.truncate(saved);
         res
     }
 

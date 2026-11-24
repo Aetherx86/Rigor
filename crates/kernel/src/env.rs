@@ -107,6 +107,10 @@ impl Environment {
     pub fn get(&self, name: NameId) -> Option<&Declaration> { self.decls.get(&name) }
     #[inline]
     pub fn len(&self) -> usize { self.decls.len() }
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.decls.is_empty() }
+    #[inline]
+    pub fn decls(&self) -> &FxHashMap<NameId, Declaration> { &self.decls }
 
     /// Compute Lean 4-style definition height: `1 + max(height of referenced definitions)`.
     pub fn compute_height(&self, expr: ExprId) -> u32 {
@@ -272,26 +276,35 @@ impl Environment {
     pub fn check_deferred(&mut self, threads: usize) -> Result<(), (NameId, KernelError)> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let pending = std::mem::take(&mut self.deferred);
-        if pending.is_empty() { return Ok(()); }
+        let n = pending.len();
+        if n == 0 { return Ok(()); }
         self.arena.shrink_for_sharing();
-        let arena = Arc::new(std::mem::replace(&mut self.arena, Arena::new()));
+        let arena = Arc::new(std::mem::take(&mut self.arena));
         let decls = &self.decls;
+        // Coprime-stride permutation spreads module-clustered heavy proofs across time instead
+        // of handing adjacent 10k-node proofs to all workers at once. `min_err_idx` preserves
+        // exact earliest-admission-order error reporting without locking in the passing case.
+        let stride = coprime_stride(n);
         let next = AtomicUsize::new(0);
+        let min_err_idx = AtomicUsize::new(usize::MAX);
         let first_err: std::sync::Mutex<Option<(usize, NameId, KernelError)>> = std::sync::Mutex::new(None);
-        let n_threads = threads.max(1).min(pending.len());
+        let n_threads = threads.max(1).min(n);
         std::thread::scope(|sc| {
             for _ in 0..n_threads {
-                let (arena, pending, next, first_err) = (&arena, &pending, &next, &first_err);
+                let (arena, pending, next, min_err_idx, first_err) =
+                    (&arena, &pending, &next, &min_err_idx, &first_err);
                 std::thread::Builder::new()
                     .stack_size(1 << 30)
                     .spawn_scoped(sc, move || loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= pending.len() { break; }
-                        if let Some((j, _, _)) = *first_err.lock().unwrap() { if j < i { break; } }
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= n { break; }
+                        let i = ((k as u128 * stride as u128) % n as u128) as usize;
+                        if i >= min_err_idx.load(Ordering::Relaxed) { continue; }
                         let decl = &decls[&pending[i]];
                         let mut scratch = Arena::child(Arc::clone(arena));
                         let res = TypeChecker::new(decls, &mut scratch).check_decl(decl);
                         if let Err(e) = res {
+                            min_err_idx.fetch_min(i, Ordering::Relaxed);
                             let mut g = first_err.lock().unwrap();
                             if g.as_ref().is_none_or(|(j, _, _)| i < *j) { *g = Some((i, pending[i], e)); }
                         }
@@ -309,5 +322,16 @@ impl Environment {
     /// Consume this environment and return its underlying arena and verified declarations.
     pub fn into_parts(self) -> (Arena, FxHashMap<NameId, Declaration>) {
         (self.arena, self.decls)
+    }
+}
+
+fn coprime_stride(n: usize) -> usize {
+    if n <= 2 { return 1; }
+    let mut s = 1009usize;
+    loop {
+        let (mut a, mut b) = (s, n);
+        while b != 0 { (a, b) = (b, a % b); }
+        if a == 1 { return s % n; }
+        s += 2;
     }
 }

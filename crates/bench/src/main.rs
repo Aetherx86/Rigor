@@ -1,10 +1,14 @@
-//! Rigor Phase 4 Benchmark Harness & Computational Stress Suite.
+//! Rigor CLI Checker, Axiom Auditor & Benchmark Harness.
 //!
 //! Modes:
-//!   rigor-bench                                      Run full benchmark & stress suite
-//!   rigor-bench --check <file.export>                Stream-parse and verify a lean4export file
-//!   rigor-bench --generate-export <path> <n_decls>   Emit a valid lean4export benchmark artifact
-//!   rigor-bench --stress-only [iters]                Loop heavy kernel reduction for CPU profiling
+//!   rigor-bench                                                     Run benchmark & stress suite
+//!   rigor-bench --check <file> [--json] [--sequential] [--threads N]
+//!                              [--forbid-sorry] [--allow-axioms A,B]
+//!   rigor-bench --audit <file> [--decl <name>] [--json] [--sequential]
+//!                              [--threads N] [--forbid-sorry] [--allow-axioms A,B]
+//!   rigor-bench --inspect <file> <decl> [--json] [--sequential] [--threads N]
+//!   rigor-bench --generate-export <path> <n_decls>                  Emit a valid lean4export file
+//!   rigor-bench --stress-only [iters]                               Loop heavy kernel reduction
 
 use std::env;
 use std::fs::File;
@@ -15,22 +19,160 @@ use rigor_kernel::{
     Arena, BinderInfo, Declaration, Environment, ExprId, InductiveSpec, InductiveTypeSpec,
     ReducibilityHint,
 };
+use rigor_parser::{
+    audit_environment, check_axiom_policy, check_decl_policy, format_parse_error, inspect_decl,
+    lookup_name, AuditReport, AxiomPolicy, DeclInspection, ParseStats, PolicyViolation,
+};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Default)]
+struct CheckOpts {
+    json: bool,
+    sequential: bool,
+    threads: Option<usize>,
+    decl: Option<String>,
+    policy: AxiomPolicy,
+}
+
+fn print_usage() {
+    println!("rigor {VERSION} - Independent Lean 4 proof kernel, axiom auditor, and benchmark suite");
+    println!();
+    println!("USAGE:");
+    println!("  rigor-bench                                        Run benchmark & stress suite");
+    println!("  rigor-bench --check <file> [OPTIONS]               Verify a lean4export file");
+    println!("  rigor-bench --audit <file> [OPTIONS]               Verify and audit axiom footprint");
+    println!("  rigor-bench --inspect <file> <decl> [OPTIONS]      Verify and inspect one declaration");
+    println!("  rigor-bench --generate-export <path> <n_decls>     Generate a synthetic export file");
+    println!("  rigor-bench --stress-only [iters]                  Run kernel reduction stress loop");
+    println!("  rigor-bench --version                              Print version");
+    println!();
+    println!("OPTIONS:");
+    println!("  --json                  Emit structured JSON output");
+    println!("  --sequential            Check declarations sequentially while parsing");
+    println!("  --threads <N>           Number of parallel worker threads");
+    println!("  --decl <NAME>           Target declaration for --audit (like Lean's #print axioms)");
+    println!("  --forbid-sorry          Fail if sorryAx is present or depended upon");
+    println!("  --allow-axioms <LIST>   Comma-separated allowlist of permitted axiom names");
+}
+
+fn parse_opts(args: &[String]) -> Result<CheckOpts, String> {
+    let mut opts = CheckOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => opts.json = true,
+            "--sequential" => opts.sequential = true,
+            "--forbid-sorry" => opts.policy.forbid_sorry = true,
+            "--threads" => {
+                i += 1;
+                let v = args.get(i).ok_or("--threads requires an integer argument")?;
+                let n: usize = v.parse().map_err(|_| format!("invalid --threads value '{v}'"))?;
+                if n == 0 {
+                    return Err("--threads must be >= 1".into());
+                }
+                opts.threads = Some(n);
+            }
+            "--decl" => {
+                i += 1;
+                let v = args.get(i).ok_or("--decl requires a declaration name")?;
+                opts.decl = Some(v.clone());
+            }
+            "--allow-axioms" => {
+                i += 1;
+                let v = args.get(i).ok_or("--allow-axioms requires a comma-separated list")?;
+                let list: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                opts.policy.allow_axioms = Some(list);
+            }
+            other => return Err(format!("unknown option '{other}'")),
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
+fn run_on_large_stack<F>(f: F) -> i32
+where
+    F: FnOnce() -> i32 + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(4 << 30)
+        .spawn(f)
+        .expect("spawn checker thread")
+        .join()
+        .unwrap_or(101)
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() >= 2 {
         match args[1].as_str() {
-            "--check" => {
-                let path = args.get(2).expect("usage: rigor-bench --check <file.export>");
-                // Real libraries produce deeply nested terms; like Lean's own checker, run on a large
-                // stack (virtual reservation only; untouched pages are never committed).
-                let owned = path.to_owned();
-                std::thread::Builder::new()
-                    .stack_size(4 << 30)
-                    .spawn(move || run_check_file(&owned))
-                    .expect("spawn checker thread")
-                    .join()
-                    .unwrap_or_else(|_| std::process::exit(101));
+            "-h" | "--help" => {
+                print_usage();
+                return;
+            }
+            "-V" | "--version" => {
+                println!("rigor {VERSION}");
+                return;
+            }
+            "--check" | "check" => {
+                let Some(path) = args.get(2).cloned() else {
+                    eprintln!("error: usage: rigor-bench --check <file> [OPTIONS]");
+                    std::process::exit(2);
+                };
+                let opts = match parse_opts(&args[3..]) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+                let code = run_on_large_stack(move || run_check_file(&path, &opts));
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return;
+            }
+            "--audit" | "audit" => {
+                let Some(path) = args.get(2).cloned() else {
+                    eprintln!("error: usage: rigor-bench --audit <file> [OPTIONS]");
+                    std::process::exit(2);
+                };
+                let opts = match parse_opts(&args[3..]) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+                let code = run_on_large_stack(move || run_audit_file(&path, &opts));
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return;
+            }
+            "--inspect" | "inspect" => {
+                let (Some(path), Some(decl)) = (args.get(2).cloned(), args.get(3).cloned()) else {
+                    eprintln!("error: usage: rigor-bench --inspect <file> <decl> [OPTIONS]");
+                    std::process::exit(2);
+                };
+                let mut opts = match parse_opts(&args[4..]) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+                opts.decl = Some(decl);
+                let code = run_on_large_stack(move || run_inspect_file(&path, &opts));
+                if code != 0 {
+                    std::process::exit(code);
+                }
                 return;
             }
             "--generate-export" => {
@@ -50,7 +192,10 @@ fn main() {
                 }
                 return;
             }
-            _ => {}
+            other => {
+                eprintln!("error: unknown command '{other}' (try --help)");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -67,23 +212,90 @@ fn main() {
     bench_lean4export_tier("Mathlib-subset-scale", 100_000);
 }
 
-fn run_check_file(path: &str) {
-    let meta = std::fs::metadata(path).expect("failed to stat export file");
+fn verify_file(
+    path: &str,
+    opts: &CheckOpts,
+) -> Result<(Environment, ParseStats, f64, f64), (i32, String)> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| (2, format!("failed to stat '{path}': {e}")))?;
     let bytes = meta.len() as f64;
     let t0 = Instant::now();
     let mut env = Environment::new();
-    // RIGOR_THREADS=n (default: all cores); RIGOR_THREADS=1 with RIGOR_SEQUENTIAL=1 checks while parsing.
-    let threads = std::env::var("RIGOR_THREADS").ok().and_then(|v| v.parse().ok())
+    let threads = opts
+        .threads
+        .or_else(|| std::env::var("RIGOR_THREADS").ok().and_then(|v| v.parse().ok()))
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-    let stats = if std::env::var_os("RIGOR_SEQUENTIAL").is_some() {
+    let sequential = opts.sequential || std::env::var_os("RIGOR_SEQUENTIAL").is_some();
+    let res = if sequential {
         rigor_parser::parse_file(path, &mut env)
     } else {
         rigor_parser::parse_file_parallel(path, &mut env, threads)
-    }
-    .unwrap_or_else(|e| panic!("kernel rejected export file: {e}"));
-    let elapsed = t0.elapsed();
-    let secs = elapsed.as_secs_f64();
+    };
+    let stats = res.map_err(|e| (1, format_parse_error(&env.arena, &e)))?;
+    let secs = t0.elapsed().as_secs_f64();
     let mib = bytes / (1024.0 * 1024.0);
+    Ok((env, stats, mib, secs))
+}
+
+fn run_check_file(path: &str, opts: &CheckOpts) -> i32 {
+    let (env, stats, mib, secs) = match verify_file(path, opts) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("CHECK_FAIL file={path}: {msg}");
+            }
+            return code;
+        }
+    };
+    let need_policy = opts.policy.forbid_sorry || opts.policy.allow_axioms.is_some();
+    let report = if opts.json || need_policy {
+        Some(audit_environment(&env))
+    } else {
+        None
+    };
+    let violations = report
+        .as_ref()
+        .map(|r| check_axiom_policy(r, &opts.policy))
+        .unwrap_or_default();
+
+    if opts.json {
+        let ok = violations.is_empty();
+        let report_ref = report.as_ref().unwrap();
+        println!(
+            "{{\"ok\":{},\"version\":{},\"file\":{},\"format_version\":{},\"decls\":{},\"env_decls\":{},\"lines\":{},\"theorems\":{},\"defs\":{},\"inductives\":{},\"axioms\":{},\"opaques\":{},\"quots\":{},\"mib\":{:.4},\"time_ms\":{:.2},\"decls_per_sec\":{:.0},\"mib_per_sec\":{:.2},\"arena_exprs\":{},\"audit\":{},\"policy_violations\":{}}}",
+            ok,
+            json_str(VERSION),
+            json_str(path),
+            stats.version.as_deref().map(json_str).unwrap_or_else(|| "null".into()),
+            stats.total_decls(),
+            env.len(),
+            stats.lines,
+            stats.theorems,
+            stats.defs,
+            stats.inductives,
+            stats.axioms,
+            stats.opaques,
+            stats.quots,
+            mib,
+            secs * 1000.0,
+            if secs > 0.0 { stats.total_decls() as f64 / secs } else { 0.0 },
+            if secs > 0.0 { mib / secs } else { 0.0 },
+            env.arena.expr_len(),
+            audit_report_json(report_ref),
+            violations_json(&violations),
+        );
+        return if ok { 0 } else { 1 };
+    }
+
+    if !violations.is_empty() {
+        for v in &violations {
+            eprintln!("POLICY_FAIL: {}", v.reason);
+        }
+        return 1;
+    }
+
     println!(
         "CHECK_OK file={} decls={} env_decls={} lines={} mib={:.2} time_ms={:.2} decls_per_sec={:.0} mib_per_sec={:.1} arena_exprs={}",
         path,
@@ -92,10 +304,255 @@ fn run_check_file(path: &str) {
         stats.lines,
         mib,
         secs * 1000.0,
-        stats.total_decls() as f64 / secs,
-        mib / secs,
+        if secs > 0.0 { stats.total_decls() as f64 / secs } else { 0.0 },
+        if secs > 0.0 { mib / secs } else { 0.0 },
         env.arena.expr_len()
     );
+    0
+}
+
+fn run_audit_file(path: &str, opts: &CheckOpts) -> i32 {
+    let (env, stats, _mib, secs) = match verify_file(path, opts) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("AUDIT_FAIL file={path}: {msg}");
+            }
+            return code;
+        }
+    };
+
+    if let Some(target_name) = &opts.decl {
+        let Some(id) = lookup_name(&env, target_name) else {
+            let msg = format!("declaration '{target_name}' not found in environment");
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("AUDIT_FAIL: {msg}");
+            }
+            return 1;
+        };
+        let info = inspect_decl(&env, id).expect("looked up name must exist");
+        let violations = check_decl_policy(&info, &opts.policy);
+        let ok = violations.is_empty();
+        if opts.json {
+            println!(
+                "{{\"ok\":{},\"version\":{},\"file\":{},\"time_ms\":{:.2},\"decl\":{},\"policy_violations\":{}}}",
+                ok,
+                json_str(VERSION),
+                json_str(path),
+                secs * 1000.0,
+                decl_inspection_json(&info),
+                violations_json(&violations),
+            );
+        } else {
+            println!("AUDIT_DECL {} ({})", info.name, info.kind.as_str());
+            if info.axioms.is_empty() {
+                println!("  axioms: (none)");
+            } else {
+                println!("  axioms ({}): {}", info.axioms.len(), info.axioms.join(", "));
+            }
+            if !info.non_standard_axioms.is_empty() {
+                println!("  non-standard axioms: {}", info.non_standard_axioms.join(", "));
+            }
+            println!("  uses_sorry: {}  uses_quot: {}", info.uses_sorry, info.uses_quot);
+            for v in &violations {
+                eprintln!("POLICY_FAIL: {}", v.reason);
+            }
+        }
+        return if ok { 0 } else { 1 };
+    }
+
+    let report = audit_environment(&env);
+    let violations = check_axiom_policy(&report, &opts.policy);
+    let ok = violations.is_empty();
+    if opts.json {
+        println!(
+            "{{\"ok\":{},\"version\":{},\"file\":{},\"decls\":{},\"env_decls\":{},\"time_ms\":{:.2},\"audit\":{},\"policy_violations\":{}}}",
+            ok,
+            json_str(VERSION),
+            json_str(path),
+            stats.total_decls(),
+            env.len(),
+            secs * 1000.0,
+            audit_report_json(&report),
+            violations_json(&violations),
+        );
+    } else {
+        println!(
+            "AUDIT_OK file={} decls={} env_decls={} theorems={} axioms={} non_standard={} sorry_theorems={} uses_quot={} time_ms={:.2}",
+            path,
+            stats.total_decls(),
+            report.total_env_decls,
+            report.theorems,
+            report.axioms.len(),
+            report.non_standard_axioms.len(),
+            report.sorry_theorems.len(),
+            report.uses_quot,
+            secs * 1000.0
+        );
+        for ax in &report.axioms {
+            let tag = if ax.is_sorry {
+                "SORRY"
+            } else if ax.is_trust_extending {
+                "TRUST"
+            } else if ax.is_standard {
+                "standard"
+            } else {
+                "custom"
+            };
+            println!(
+                "  axiom {:<36} [{}]  decls={}  theorems={}",
+                ax.name, tag, ax.dependent_decls, ax.dependent_theorems
+            );
+        }
+        for v in &violations {
+            eprintln!("POLICY_FAIL: {}", v.reason);
+        }
+    }
+    if ok { 0 } else { 1 }
+}
+
+fn run_inspect_file(path: &str, opts: &CheckOpts) -> i32 {
+    let target_name = opts.decl.as_deref().unwrap_or("");
+    let (env, _stats, _mib, secs) = match verify_file(path, opts) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("INSPECT_FAIL file={path}: {msg}");
+            }
+            return code;
+        }
+    };
+    let Some(id) = lookup_name(&env, target_name) else {
+        let msg = format!("declaration '{target_name}' not found in environment");
+        if opts.json {
+            println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+        } else {
+            eprintln!("INSPECT_FAIL: {msg}");
+        }
+        return 1;
+    };
+    let info = inspect_decl(&env, id).expect("looked up name must exist");
+    if opts.json {
+        println!(
+            "{{\"ok\":true,\"version\":{},\"file\":{},\"time_ms\":{:.2},\"decl\":{}}}",
+            json_str(VERSION),
+            json_str(path),
+            secs * 1000.0,
+            decl_inspection_json(&info),
+        );
+    } else {
+        let lp = if info.level_params.is_empty() {
+            String::new()
+        } else {
+            format!(".{{{}}}", info.level_params.join(", "))
+        };
+        println!("{} {}{} : {}", info.kind.as_str(), info.name, lp, info.ty);
+        println!("  direct_deps ({}): {}", info.direct_deps.len(), info.direct_deps.join(", "));
+        if info.axioms.is_empty() {
+            println!("  axioms: (none)");
+        } else {
+            println!("  axioms ({}): {}", info.axioms.len(), info.axioms.join(", "));
+        }
+        println!("  uses_sorry: {}  uses_quot: {}", info.uses_sorry, info.uses_quot);
+    }
+    0
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_str_array(items: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_str(item));
+    }
+    out.push(']');
+    out
+}
+
+fn audit_report_json(r: &AuditReport) -> String {
+    let mut axs = String::from("[");
+    for (i, ax) in r.axioms.iter().enumerate() {
+        if i > 0 {
+            axs.push(',');
+        }
+        axs.push_str(&format!(
+            "{{\"name\":{},\"is_standard\":{},\"is_sorry\":{},\"is_trust_extending\":{},\"dependent_decls\":{},\"dependent_theorems\":{}}}",
+            json_str(&ax.name),
+            ax.is_standard,
+            ax.is_sorry,
+            ax.is_trust_extending,
+            ax.dependent_decls,
+            ax.dependent_theorems
+        ));
+    }
+    axs.push(']');
+    format!(
+        "{{\"total_env_decls\":{},\"theorems\":{},\"uses_quot\":{},\"non_standard_axioms\":{},\"sorry_theorems\":{},\"axioms\":{}}}",
+        r.total_env_decls,
+        r.theorems,
+        r.uses_quot,
+        json_str_array(&r.non_standard_axioms),
+        json_str_array(&r.sorry_theorems),
+        axs
+    )
+}
+
+fn decl_inspection_json(d: &DeclInspection) -> String {
+    format!(
+        "{{\"name\":{},\"kind\":{},\"level_params\":{},\"type\":{},\"direct_deps\":{},\"axioms\":{},\"non_standard_axioms\":{},\"uses_sorry\":{},\"uses_quot\":{}}}",
+        json_str(&d.name),
+        json_str(d.kind.as_str()),
+        json_str_array(&d.level_params),
+        json_str(&d.ty),
+        json_str_array(&d.direct_deps),
+        json_str_array(&d.axioms),
+        json_str_array(&d.non_standard_axioms),
+        d.uses_sorry,
+        d.uses_quot,
+    )
+}
+
+fn violations_json(vs: &[PolicyViolation]) -> String {
+    let mut out = String::from("[");
+    for (i, v) in vs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let decl = v.decl.as_deref().map(json_str).unwrap_or_else(|| "null".into());
+        out.push_str(&format!(
+            "{{\"decl\":{},\"axiom\":{},\"reason\":{}}}",
+            decl,
+            json_str(&v.axiom),
+            json_str(&v.reason)
+        ));
+    }
+    out.push(']');
+    out
 }
 
 fn generate_export_file(path: &str, n_decls: usize) {

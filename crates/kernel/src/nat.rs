@@ -166,7 +166,7 @@ mod tests {
             if let Some(s) = a.checked_add(b) { assert_eq!(na.add(&nb), n(s)); }
             assert_eq!(na.sub(&nb), n(a.saturating_sub(b)));
             if let Some(m) = (a >> 64 == 0 && b >> 64 == 0).then(|| a * b) { assert_eq!(na.mul(&nb), n(m)); }
-            assert_eq!(na.div(&nb), n(if b == 0 { 0 } else { a / b }));
+            assert_eq!(na.div(&nb), n(a.checked_div(b).unwrap_or(0)));
             assert_eq!(na.rem(&nb), n(if b == 0 { a } else { a % b }));
             assert_eq!(na.land(&nb), n(a & b));
             assert_eq!(na.lor(&nb), n(a | b));

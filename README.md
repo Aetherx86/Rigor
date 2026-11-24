@@ -14,8 +14,8 @@ Lean v4.36.0-rc1 exports on an Apple M4 MacBook Air (10 cores), peak memory from
 
 | Library | Declarations | `leanchecker --fresh` | Rigor, parallel | Rigor, one thread |
 | :--- | ---: | ---: | ---: | ---: |
-| `Init` | 58,546 | 28.7 s, 547 MB | 7.8 s, 478 MB | 25.1 s, 404 MB |
-| `Std` | 96,626 | 44.2 s, 928 MB | 11.9 s, 696 MB | 44.9 s, 567 MB |
+| `Init` | 58,546 | 28.7 s, 547 MB | 7.3–8.6 s, 355 MB | 25.1–29.1 s, 347 MB |
+| `Std` | 96,626 | 44.2 s, 928 MB | 11.1–12.6 s, 547 MB | 44.9 s, 567 MB |
 
 Rigor's times include parsing the NDJSON export (332 MiB for `Init`, 532 MiB for `Std`);
 `leanchecker` reads compiled `.olean` files. Details and history: [BENCHMARKS.md](BENCHMARKS.md).
@@ -33,14 +33,18 @@ Rigor's times include parsing the NDJSON export (332 MiB for `Init`, 532 MiB for
 
 ## Design
 
-- `crates/kernel` is the trusted part: about 2,600 lines with `#![forbid(unsafe_code)]` and no
-  third-party crates. Expressions are hash-consed into 16-byte nodes in an arena; worker threads
-  check independent declarations in parallel against a shared read-only arena.
-- `crates/parser` reads `lean4export` 3.x NDJSON (and the older text format) and admits
-  declarations through the kernel.
-- `crates/bench` is the command-line checker (`rigor-bench --check <file>`).
-- `web/` builds the browser demo (`wasm-bindgen`, single-threaded).
-- `tools/mutation/` corrupts exports on purpose and re-checks them. Over eight rounds and 1,608
+- `crates/kernel` is the trusted part: about 2,700 lines with `#![forbid(unsafe_code)]` and no
+  third-party crates. Expressions are hash-consed into 16-byte nodes in an arena; batched binder
+  telescopes and coprime-stride work dispatch let worker threads check independent declarations in
+  parallel against a shared read-only arena with low peak memory.
+- `crates/parser` reads `lean4export` 3.x NDJSON and the older text format with defensive parser
+  limits (`ParseLimits`), admits declarations through the kernel, and provides post-verification
+  transitive axiom auditing (`audit`) and bounded pretty-printing (`pretty`) outside the TCB.
+- `crates/bench` is the command-line checker, axiom auditor, inspector, and benchmark suite
+  (`rigor-bench`).
+- `web/` builds the browser module (`wasm-bindgen`, single-threaded) exporting `check(input)`,
+  `audit(input, decl_name)`, and `version()`.
+- `tools/mutation/` corrupts exports on purpose and re-checks them. Over nine rounds and 1,636
   mutants (swapped proofs, universe changes, broken definitions, altered inductive types), every
   mutant that changes meaning was rejected; the few accepted ones are provably harmless and are
   explained in `tools/mutation/REPORT.md`.
@@ -50,11 +54,32 @@ Rigor's times include parsing the NDJSON export (332 MiB for `Init`, 532 MiB for
 ```sh
 cargo test --workspace
 cargo build --release -p rigor-bench
-./target/release/rigor-bench --check Init.ndjson          # parallel, all cores
-RIGOR_SEQUENTIAL=1 ./target/release/rigor-bench --check Init.ndjson
-RIGOR_THREADS=4 ./target/release/rigor-bench --check Init.ndjson
+
+# Verify exports (parallel by default, or sequential / bounded thread count)
+./target/release/rigor-bench --check Init.ndjson
+./target/release/rigor-bench --check Init.ndjson --sequential
+./target/release/rigor-bench --check Init.ndjson --threads 4 --json
 RIGOR_TRACE=1000 ./target/release/rigor-bench --check Std.ndjson   # report declarations over 1 s
+
+# Verify and audit transitive axiom footprints (equivalent to #print axioms)
+./target/release/rigor-bench --audit Std.ndjson --forbid-sorry \
+  --allow-axioms propext,Quot.sound,Classical.choice
+./target/release/rigor-bench --audit Init.Prelude.ndjson --decl Eq.symm --json
+
+# Verify and inspect a single declaration (kind, type, direct dependencies, axioms)
+./target/release/rigor-bench --inspect Init.Prelude.ndjson Eq.symm
 ```
+
+### Browser / WebAssembly build
+
+```sh
+cargo build --release --target wasm32-unknown-unknown --manifest-path web/Cargo.toml
+```
+
+WASM exports:
+- `check(input: &str) -> String`: verifies an export and returns JSON with counts or a formatted error.
+- `audit(input: &str, decl_name: &str) -> String`: verifies and audits the full environment (empty `decl_name`) or one declaration's transitive axiom footprint.
+- `version() -> String`: returns the Rigor package version (`0.2.0`).
 
 Exports come from [lean4export](https://github.com/leanprover/lean4export):
 `lake env lean4export Init > Init.ndjson`.
