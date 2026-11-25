@@ -5,7 +5,7 @@ NDJSON export of a Lean library and re-checks every declaration with its own sma
 (the Calculus of Inductive Constructions as Lean implements it). A proof is trusted only when
 this second kernel agrees with Lean's.
 
-Live demo: <https://aetherx86.github.io/rigor/> runs the same kernel, compiled to WebAssembly, on
+Live demo: <https://omakasekim.github.io/rigor/> runs the same kernel, compiled to WebAssembly, on
 Lean's `Init.Prelude` in the browser, and shows it rejecting a tampered proof.
 
 ## Results

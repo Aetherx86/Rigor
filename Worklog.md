@@ -6,7 +6,7 @@ Read this file first before modifying code. Update after every milestone.
 Rigor is a high-performance, mathematically sound dependent type theory proof kernel (Calculus of Inductive Constructions, Lean 4 `lean4export`-compatible) written in safe Rust (`#![forbid(unsafe_code)]` in `crates/kernel`), engineered to outperform `lean4checker` on type-checking throughput, peak RSS memory, and kernel reduction.
 
 - Project root: `~/Rigor`
-- Owner: `Aetherx86 <omakasekim@naver.com>`
+- Owner: `omakasekim <omakasekim@naver.com>`
 - Repo conventions: no emoji, no AI mentions, no Co-Authored-By trailers in commits or docs.
 - TCB budget: `crates/kernel` strictly isolated, zero external dependencies, `#![forbid(unsafe_code)]`, target < 2,500 LOC.
 
@@ -115,7 +115,7 @@ Rigor is a high-performance, mathematically sound dependent type theory proof ke
 
 ## Progress log
 - 2026-11-22 01:30 KST: initialized `~/Rigor` workspace and started Phase 1 implementation.
-- 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `Aetherx86/Rigor` (commit `b41a1c2`).
+- 2026-11-22 01:39 KST: completed Phase 1 (7/7 tests green, 0 warnings, benchmarks recorded); created public GitHub repo `omakasekim/Rigor` (commit `b41a1c2`).
 - 2026-11-22 01:52 KST: completed Phase 2 (inductives, strict positivity, Subsingleton large-elim & `Proj` guard, iota/K-like/structure-eta reduction, soundness torture suite: 14/14 tests green, 0 warnings, `Nat.rec` benchmark 1.544 ms, commit `f879983`).
 - 2026-11-22 02:04 KST: completed Phase 3 (streaming `lean4export` parser for all 22 directives + v3 `#IND`/`#CTOR`/`#REC` + `#INDM`, kernel `#QUOT` + `#ELN` reduction, 18/18 tests green, 0 warnings, 778k decls/s streaming parse+verify, TCB < 2,500 SLOC, commit `2e473b1`).
 - 2026-11-22 02:19 KST: completed Phase 4 (head-to-head benchmark harness + Peak RSS script, Ackermann & primality reflection stress tests, `/usr/bin/sample` profile-guided spine-machine & arena optimizations up to 8.81x faster / -23.7% RSS, 19/19 tests green, TCB 2,484 SLOC, `BENCHMARKS.md`, commit `cb2ddff`).

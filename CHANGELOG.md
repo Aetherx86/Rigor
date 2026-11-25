@@ -68,7 +68,7 @@ First release.
 - `lean4export` 3.x NDJSON and text-format parser.
 - Parallel checking of independent declarations (`rigor-bench --check`), with `RIGOR_THREADS`,
   `RIGOR_SEQUENTIAL` and `RIGOR_TRACE`.
-- Browser build in `web/` (the live demo on aetherx86.github.io/rigor).
+- Browser build in `web/` (the live demo on omakasekim.github.io/rigor).
 - Mutation-testing harness in `tools/mutation/`.
 
 ### Verified

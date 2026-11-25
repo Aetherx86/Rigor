@@ -27,7 +27,7 @@ Never run two full Init checks at the same time (timings become meaningless).
 - Soundness first: never remove or weaken a check to make something pass. Every kernel change needs the
   full test suite green and a full Init CHECK_OK in both parallel and sequential mode.
 - crates/kernel must stay `#![forbid(unsafe_code)]` with zero external dependencies.
-- Commits: author Aetherx86 <omakasekim@naver.com> (already configured in this repo), plain technical
+- Commits: author omakasekim <omakasekim@naver.com> (already configured in this repo), plain technical
   messages, no emoji, no mention of AI or assistants, no Co-Authored-By lines. Only the coordinating
   session commits and pushes; workers do not run git commit or git push.
 - File ownership while a task is in progress is listed per task below. Do not edit files owned by
@@ -101,7 +101,7 @@ appending to this Log after each step:
 2. agy-mut's Task E plan (~/rigor/tools/tcb/PLAN.md): implement the low-risk items one at a time; after
    each: cargo test -q --workspace (all green, 0 warnings), full Init check parallel and sequential
    (CHECK_OK, record time/RSS), then commit.
-3. Commits: only verified work, author Aetherx86 <omakasekim@naver.com> (repo config already set), plain
+3. Commits: only verified work, author omakasekim <omakasekim@naver.com> (repo config already set), plain
    technical message, no emoji, no AI/assistant mentions, no Co-Authored-By line; then `git push origin HEAD`.
 4. ChronosVault (~/ChronosVault): commit your verified fixes there the same way if you made any; record the
    review outcome in ~/ChronosVault/Worklog.md.
@@ -177,7 +177,7 @@ Never weaken a kernel check to make something pass. Keep the continuity rule abo
       * sequential: **44.88 s** wall, **566,657,024 B (566.7 MB / 540.4 MiB)** peak RSS
   * Updated `BENCHMARKS.md` and `Worklog.md`; committing & pushing now.
   * NEXT: Task E (`tools/tcb/PLAN.md`: reduce `crates/kernel/src/*.rs` from 3,300 SLOC to < 2,500 SLOC, Wave 1 -> Wave 2 -> Wave 3), then `tools/tcb/MEMORY.md` per-thread memory optimizations. Starting Wave 1 now.
-- 2026-11-22 16:35 KST (agy-mut): Silica portal page upgrade done in ~/Documents/aetherx86.github.io/silica/{index.html,sim.js,test.mjs} (no edits to ~/rigor/crates, no commit/push). Ported Kotlin Rule (B/S + legacy S/B notation, rejects counts > 8 and reversed S/B letters), Rle (read/parse/write with MAX_COORDINATE=2^30, MAX_RUN_LENGTH=1,000,000, DEFAULT_MAX_CELLS=10,000,000, 70-char wrapping, header/comments/topology-suffix support), Patterns (GLIDER, GOSPER_GUN, ACORN, DIEHARD, PULSAR, R_PENTOMINO, BLINKER, BLOCK), and active-span Life engine supporting arbitrary B/S rules (including B0 fallback). Updated index.html with strict CSP (`script-src 'self'`, zero inline handlers/scripts), responsive mobile layout, rule input + presets, pattern presets, and RLE import/export panel. Verified: `node ~/Documents/aetherx86.github.io/silica/test.mjs` passed (`all silica checks passed`, 0.40s wall, including Diehard dies at gen 130 and Acorn reaches 633 cells at gen 5206 on 2600x2600) + static HTML/JS/CSP check (`HTML_JS_CSP_OK`, 21/21 IDs matched, 0 inline handlers/scripts).
+- 2026-11-22 16:35 KST (agy-mut): Silica portal page upgrade done in ~/Documents/omakasekim.github.io/silica/{index.html,sim.js,test.mjs} (no edits to ~/rigor/crates, no commit/push). Ported Kotlin Rule (B/S + legacy S/B notation, rejects counts > 8 and reversed S/B letters), Rle (read/parse/write with MAX_COORDINATE=2^30, MAX_RUN_LENGTH=1,000,000, DEFAULT_MAX_CELLS=10,000,000, 70-char wrapping, header/comments/topology-suffix support), Patterns (GLIDER, GOSPER_GUN, ACORN, DIEHARD, PULSAR, R_PENTOMINO, BLINKER, BLOCK), and active-span Life engine supporting arbitrary B/S rules (including B0 fallback). Updated index.html with strict CSP (`script-src 'self'`, zero inline handlers/scripts), responsive mobile layout, rule input + presets, pattern presets, and RLE import/export panel. Verified: `node ~/Documents/omakasekim.github.io/silica/test.mjs` passed (`all silica checks passed`, 0.40s wall, including Diehard dies at gen 130 and Acorn reaches 633 cells at gen 5206 on 2600x2600) + static HTML/JS/CSP check (`HTML_JS_CSP_OK`, 21/21 IDs matched, 0 inline handlers/scripts).
 - 2026-11-22 17:05 KST (A, hourly check): independently re-verified gem's 1e4332d from a clean worktree (no
   uncommitted Task E edits): Std CHECK_OK 96,626 decls, 11.86 s wall / 695.6 MB peak (leanchecker --fresh
   44.18 s / 927.5 MB); Init CHECK_OK 7.76 s / 478.5 MB (leanchecker 28.67 s / 547 MB). Milestone confirmed:
