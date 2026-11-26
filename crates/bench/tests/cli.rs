@@ -185,7 +185,76 @@ fn cli_version_check_audit_inspect_and_policies() {
     assert!(stdout.contains("\"kind\":\"theorem\""), "got: {stdout}");
     assert!(stdout.contains("Eq.{1} Nat 0 0"), "got: {stdout}");
 
-    // 7. Ill-typed export exits 1 cleanly (not panic 101) with human-readable error.
+    // 7. --why traces shortest dependency chain (found and independent).
+    let out = Command::new(BIN)
+        .args([
+            "--why",
+            valid_path.to_str().unwrap(),
+            "sorry_thm",
+            "sorryAx",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("\"found\":true")
+            && stdout.contains("\"path\":[\"sorry_thm\",\"sorryAx\"]"),
+        "got: {stdout}"
+    );
+
+    let out = Command::new(BIN)
+        .args([
+            "--why",
+            valid_path.to_str().unwrap(),
+            "pure_thm",
+            "sorryAx",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("\"found\":false"), "got: {stdout}");
+
+    // 8. --rdeps and --list filter declarations cleanly.
+    let out = Command::new(BIN)
+        .args([
+            "--rdeps",
+            valid_path.to_str().unwrap(),
+            "sorryAx",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("\"reverse_dependents\":[\"sorry_thm\"]"),
+        "got: {stdout}"
+    );
+
+    let out = Command::new(BIN)
+        .args([
+            "--list",
+            valid_path.to_str().unwrap(),
+            "--kind",
+            "theorem",
+            "--prefix",
+            "pure",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("\"count\":1") && stdout.contains("\"name\":\"pure_thm\""),
+        "got: {stdout}"
+    );
+
+    // 9. Ill-typed export exits 1 cleanly (not panic 101) with human-readable error.
     let out = Command::new(BIN)
         .args(["--check", bad_path.to_str().unwrap(), "--json"])
         .output()

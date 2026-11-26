@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0] - 2026-11-27
+
+### Added
+- Shortest dependency chain witness tracing (`shortest_dependency_path` in `crates/parser/src/audit.rs`): explains *why* a theorem transitively depends on an axiom or lemma (e.g., tracing the exact lemma chain introducing `sorryAx` or `Classical.choice`) in deterministic sorted order, strictly outside the TCB.
+- Direct reverse-dependents query (`reverse_dependents`) and filtered declaration enumeration (`list_decls` with `DeclKind::from_str_name` and dotted prefix filtering).
+- New `rigor-bench` CLI commands: `--why <file> <decl> <dep>`, `--rdeps <file> <decl>`, and `--list <file> [--kind K] [--prefix P]` (all supporting `--json`, `--sequential`, and `--threads`).
+- New WebAssembly export `why(input, from_name, to_name)` in `web/src/lib.rs`.
+- Strict `cargo clippy --workspace --all-targets -- -D warnings` step in `.github/workflows/ci.yml` and Korean documentation (`README.ko.md`).
+
 ## [0.2.0] - 2026-11-24
 
 ### Added

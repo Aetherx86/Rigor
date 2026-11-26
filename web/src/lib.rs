@@ -3,6 +3,7 @@
 use rigor_parser::kernel::Environment;
 use rigor_parser::{
     audit_environment, format_parse_error, inspect_decl, lookup_name, parse_and_check,
+    shortest_dependency_path,
 };
 use wasm_bindgen::prelude::*;
 
@@ -91,6 +92,43 @@ pub fn audit(input: &str, decl_name: &str) -> String {
         json_str_array(&report.sorry_theorems),
         axioms_json,
     )
+}
+
+/// Verify a `lean4export` input and compute the shortest dependency chain from `from_name` to `to_name`.
+#[wasm_bindgen]
+pub fn why(input: &str, from_name: &str, to_name: &str) -> String {
+    let mut env = Environment::new();
+    if let Err(e) = parse_and_check(input.as_bytes(), &mut env) {
+        let msg = format_parse_error(&env.arena, &e);
+        return format!("{{\"ok\":false,\"error\":{}}}", json_str(&msg));
+    }
+    let from = from_name.trim();
+    let to = to_name.trim();
+    let Some(from_id) = lookup_name(&env, from) else {
+        return format!(
+            "{{\"ok\":false,\"error\":{}}}",
+            json_str(&format!("declaration '{from}' not found"))
+        );
+    };
+    let Some(to_id) = lookup_name(&env, to) else {
+        return format!(
+            "{{\"ok\":false,\"error\":{}}}",
+            json_str(&format!("target dependency '{to}' not found"))
+        );
+    };
+    match shortest_dependency_path(&env, from_id, to_id) {
+        Some(path) => format!(
+            "{{\"ok\":true,\"from\":{},\"to\":{},\"found\":true,\"path\":{}}}",
+            json_str(from),
+            json_str(to),
+            json_str_array(&path)
+        ),
+        None => format!(
+            "{{\"ok\":true,\"from\":{},\"to\":{},\"found\":false,\"path\":[]}}",
+            json_str(from),
+            json_str(to)
+        ),
+    }
 }
 
 fn json_str(s: &str) -> String {

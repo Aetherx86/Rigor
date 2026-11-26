@@ -19,8 +19,9 @@ pub mod pretty;
 
 pub use audit::{
     audit_environment, check_axiom_policy, check_decl_policy, inspect_decl, is_sorry_axiom,
-    is_standard_axiom, is_trust_extending_axiom, lookup_name, AuditReport, AxiomPolicy, AxiomUsage,
-    DeclInspection, DeclKind, PolicyViolation, STANDARD_AXIOMS, TRUST_EXTENDING_AXIOMS,
+    is_standard_axiom, is_trust_extending_axiom, list_decls, lookup_name, reverse_dependents,
+    shortest_dependency_path, AuditReport, AxiomPolicy, AxiomUsage, DeclInspection, DeclKind,
+    PolicyViolation, STANDARD_AXIOMS, TRUST_EXTENDING_AXIOMS,
 };
 pub use pretty::{
     format_expr, format_expr_bounded, format_kernel_error, format_level, format_name, format_nat,

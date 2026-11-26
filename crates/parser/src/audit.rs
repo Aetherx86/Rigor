@@ -41,6 +41,20 @@ impl DeclKind {
             DeclKind::Quot => "quot",
         }
     }
+
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s {
+            "axiom" => Some(DeclKind::Axiom),
+            "def" | "definition" => Some(DeclKind::Definition),
+            "theorem" | "thm" => Some(DeclKind::Theorem),
+            "opaque" => Some(DeclKind::Opaque),
+            "inductive" | "ind" => Some(DeclKind::Inductive),
+            "constructor" | "ctor" => Some(DeclKind::Constructor),
+            "recursor" | "rec" => Some(DeclKind::Recursor),
+            "quot" => Some(DeclKind::Quot),
+            _ => None,
+        }
+    }
 }
 
 /// Detailed inspection of a single verified declaration and its transitive axiom footprint.
@@ -442,4 +456,102 @@ pub fn check_decl_policy(
         }
     }
     violations
+}
+
+/// Find the shortest dependency chain `[from, ..., to]` explaining why `from` transitively
+/// depends on `to` (for example, tracing which lemma chain pulls `sorryAx` or `Classical.choice`
+/// into a theorem). Neighbors are explored in deterministic sorted-name order.
+pub fn shortest_dependency_path(
+    env: &Environment,
+    from: NameId,
+    to: NameId,
+) -> Option<Vec<String>> {
+    env.get(from)?;
+    env.get(to)?;
+    if from == to {
+        return Some(vec![format_name(&env.arena, from)]);
+    }
+
+    let mut parent: HashMap<NameId, NameId> = HashMap::new();
+    let mut visited: HashSet<NameId> = HashSet::new();
+    let mut queue = VecDeque::new();
+    let mut seen_exprs = HashSet::new();
+
+    visited.insert(from);
+    queue.push_back(from);
+
+    while let Some(cur) = queue.pop_front() {
+        let Some(decl) = env.get(cur) else {
+            continue;
+        };
+        seen_exprs.clear();
+        let dep_ids = direct_decl_deps(&env.arena, decl, &mut seen_exprs);
+        let mut sorted: Vec<(String, NameId)> = dep_ids
+            .into_iter()
+            .map(|id| (format_name(&env.arena, id), id))
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, dep) in sorted {
+            if !visited.insert(dep) {
+                continue;
+            }
+            parent.insert(dep, cur);
+            if dep == to {
+                let mut chain = vec![format_name(&env.arena, to)];
+                let mut node = to;
+                while let Some(&prev) = parent.get(&node) {
+                    chain.push(format_name(&env.arena, prev));
+                    node = prev;
+                }
+                chain.reverse();
+                return Some(chain);
+            }
+            queue.push_back(dep);
+        }
+    }
+    None
+}
+
+/// Return the sorted list of declarations that directly reference `target`.
+pub fn reverse_dependents(env: &Environment, target: NameId) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen_exprs = HashSet::new();
+    for (&name, decl) in env.decls().iter() {
+        if name == target {
+            continue;
+        }
+        seen_exprs.clear();
+        if direct_decl_deps(&env.arena, decl, &mut seen_exprs).contains(&target) {
+            out.push(format_name(&env.arena, name));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// List verified declarations in sorted name order, optionally filtered by kind and/or name prefix.
+pub fn list_decls(
+    env: &Environment,
+    kind: Option<DeclKind>,
+    prefix: Option<&str>,
+) -> Vec<(String, DeclKind)> {
+    let mut out = Vec::new();
+    for (&name, decl) in env.decls().iter() {
+        let k = decl_kind(decl);
+        if let Some(expected) = kind {
+            if k != expected {
+                continue;
+            }
+        }
+        let formatted = format_name(&env.arena, name);
+        if let Some(p) = prefix {
+            if !formatted.starts_with(p) {
+                continue;
+            }
+        }
+        out.push((formatted, k));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }

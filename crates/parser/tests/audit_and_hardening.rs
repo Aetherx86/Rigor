@@ -214,6 +214,16 @@ fn real_init_prelude_audit_and_pretty_print() {
         "expected named binder resolution in Eq.symm type, got: {}",
         symm_info.ty
     );
+
+    // Verify shortest_dependency_path, reverse_dependents, and list_decls on real Init.Prelude!
+    let eq_id = lookup_name(&env, "Eq").expect("Eq must exist");
+    let chain = rigor_parser::shortest_dependency_path(&env, symm, eq_id)
+        .expect("Eq.symm must depend on Eq");
+    assert_eq!(chain.first().map(String::as_str), Some("Eq.symm"));
+    assert_eq!(chain.last().map(String::as_str), Some("Eq"));
+    assert!(rigor_parser::reverse_dependents(&env, eq_id).contains(&"Eq.symm".to_string()));
+    let eq_theorems = rigor_parser::list_decls(&env, Some(DeclKind::Theorem), Some("Eq."));
+    assert!(eq_theorems.iter().any(|(n, _)| n == "Eq.symm"));
 }
 
 #[test]

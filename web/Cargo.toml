@@ -1,6 +1,6 @@
 [package]
 name = "rigor-web"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 description = "Browser build of the Rigor kernel and lean4export parser (sequential checking)."

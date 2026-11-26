@@ -21,7 +21,8 @@ use rigor_kernel::{
 };
 use rigor_parser::{
     audit_environment, check_axiom_policy, check_decl_policy, format_parse_error, inspect_decl,
-    lookup_name, AuditReport, AxiomPolicy, DeclInspection, ParseStats, PolicyViolation,
+    list_decls, lookup_name, reverse_dependents, shortest_dependency_path, AuditReport,
+    AxiomPolicy, DeclInspection, DeclKind, ParseStats, PolicyViolation,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +33,9 @@ struct CheckOpts {
     sequential: bool,
     threads: Option<usize>,
     decl: Option<String>,
+    target: Option<String>,
+    kind: Option<DeclKind>,
+    prefix: Option<String>,
     policy: AxiomPolicy,
 }
 
@@ -43,6 +47,9 @@ fn print_usage() {
     println!("  rigor-bench --check <file> [OPTIONS]               Verify a lean4export file");
     println!("  rigor-bench --audit <file> [OPTIONS]               Verify and audit axiom footprint");
     println!("  rigor-bench --inspect <file> <decl> [OPTIONS]      Verify and inspect one declaration");
+    println!("  rigor-bench --why <file> <decl> <dep> [OPTIONS]    Shortest dependency chain witness");
+    println!("  rigor-bench --rdeps <file> <decl> [OPTIONS]        Direct reverse dependents of a decl");
+    println!("  rigor-bench --list <file> [OPTIONS]                List verified declarations");
     println!("  rigor-bench --generate-export <path> <n_decls>     Generate a synthetic export file");
     println!("  rigor-bench --stress-only [iters]                  Run kernel reduction stress loop");
     println!("  rigor-bench --version                              Print version");
@@ -52,6 +59,8 @@ fn print_usage() {
     println!("  --sequential            Check declarations sequentially while parsing");
     println!("  --threads <N>           Number of parallel worker threads");
     println!("  --decl <NAME>           Target declaration for --audit (like Lean's #print axioms)");
+    println!("  --kind <KIND>           Filter --list by kind (axiom|def|theorem|opaque|inductive|ctor|rec|quot)");
+    println!("  --prefix <PREFIX>       Filter --list by dotted name prefix");
     println!("  --forbid-sorry          Fail if sorryAx is present or depended upon");
     println!("  --allow-axioms <LIST>   Comma-separated allowlist of permitted axiom names");
 }
@@ -77,6 +86,18 @@ fn parse_opts(args: &[String]) -> Result<CheckOpts, String> {
                 i += 1;
                 let v = args.get(i).ok_or("--decl requires a declaration name")?;
                 opts.decl = Some(v.clone());
+            }
+            "--kind" => {
+                i += 1;
+                let v = args.get(i).ok_or("--kind requires a declaration kind")?;
+                let k = DeclKind::from_str_name(v)
+                    .ok_or_else(|| format!("unknown --kind '{v}' (expected axiom|def|theorem|opaque|inductive|ctor|rec|quot)"))?;
+                opts.kind = Some(k);
+            }
+            "--prefix" => {
+                i += 1;
+                let v = args.get(i).ok_or("--prefix requires a name prefix")?;
+                opts.prefix = Some(v.clone());
             }
             "--allow-axioms" => {
                 i += 1;
@@ -170,6 +191,65 @@ fn main() {
                 };
                 opts.decl = Some(decl);
                 let code = run_on_large_stack(move || run_inspect_file(&path, &opts));
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return;
+            }
+            "--why" | "why" => {
+                let (Some(path), Some(decl), Some(target)) =
+                    (args.get(2).cloned(), args.get(3).cloned(), args.get(4).cloned())
+                else {
+                    eprintln!("error: usage: rigor-bench --why <file> <decl> <dep> [OPTIONS]");
+                    std::process::exit(2);
+                };
+                let mut opts = match parse_opts(&args[5..]) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+                opts.decl = Some(decl);
+                opts.target = Some(target);
+                let code = run_on_large_stack(move || run_why_file(&path, &opts));
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return;
+            }
+            "--rdeps" | "rdeps" => {
+                let (Some(path), Some(decl)) = (args.get(2).cloned(), args.get(3).cloned()) else {
+                    eprintln!("error: usage: rigor-bench --rdeps <file> <decl> [OPTIONS]");
+                    std::process::exit(2);
+                };
+                let mut opts = match parse_opts(&args[4..]) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+                opts.decl = Some(decl);
+                let code = run_on_large_stack(move || run_rdeps_file(&path, &opts));
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return;
+            }
+            "--list" | "list" => {
+                let Some(path) = args.get(2).cloned() else {
+                    eprintln!("error: usage: rigor-bench --list <file> [OPTIONS]");
+                    std::process::exit(2);
+                };
+                let opts = match parse_opts(&args[3..]) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+                let code = run_on_large_stack(move || run_list_file(&path, &opts));
                 if code != 0 {
                     std::process::exit(code);
                 }
@@ -460,6 +540,148 @@ fn run_inspect_file(path: &str, opts: &CheckOpts) -> i32 {
             println!("  axioms ({}): {}", info.axioms.len(), info.axioms.join(", "));
         }
         println!("  uses_sorry: {}  uses_quot: {}", info.uses_sorry, info.uses_quot);
+    }
+    0
+}
+
+fn run_why_file(path: &str, opts: &CheckOpts) -> i32 {
+    let from_name = opts.decl.as_deref().unwrap_or("");
+    let to_name = opts.target.as_deref().unwrap_or("");
+    let (env, _stats, _mib, secs) = match verify_file(path, opts) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("WHY_FAIL file={path}: {msg}");
+            }
+            return code;
+        }
+    };
+    let Some(from_id) = lookup_name(&env, from_name) else {
+        let msg = format!("declaration '{from_name}' not found in environment");
+        if opts.json {
+            println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+        } else {
+            eprintln!("WHY_FAIL: {msg}");
+        }
+        return 1;
+    };
+    let Some(to_id) = lookup_name(&env, to_name) else {
+        let msg = format!("target dependency '{to_name}' not found in environment");
+        if opts.json {
+            println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+        } else {
+            eprintln!("WHY_FAIL: {msg}");
+        }
+        return 1;
+    };
+    let chain = shortest_dependency_path(&env, from_id, to_id);
+    if opts.json {
+        let found = chain.is_some();
+        let path_json = chain
+            .as_deref()
+            .map(json_str_array)
+            .unwrap_or_else(|| "[]".into());
+        println!(
+            "{{\"ok\":true,\"version\":{},\"file\":{},\"from\":{},\"to\":{},\"found\":{},\"path\":{},\"time_ms\":{:.2}}}",
+            json_str(VERSION),
+            json_str(path),
+            json_str(from_name),
+            json_str(to_name),
+            found,
+            path_json,
+            secs * 1000.0
+        );
+    } else if let Some(c) = chain {
+        println!("WHY_PATH ({} hops): {}", c.len().saturating_sub(1), c.join(" -> "));
+    } else {
+        println!("WHY_NONE: '{from_name}' does not depend on '{to_name}'");
+    }
+    0
+}
+
+fn run_rdeps_file(path: &str, opts: &CheckOpts) -> i32 {
+    let target_name = opts.decl.as_deref().unwrap_or("");
+    let (env, _stats, _mib, secs) = match verify_file(path, opts) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("RDEPS_FAIL file={path}: {msg}");
+            }
+            return code;
+        }
+    };
+    let Some(id) = lookup_name(&env, target_name) else {
+        let msg = format!("declaration '{target_name}' not found in environment");
+        if opts.json {
+            println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+        } else {
+            eprintln!("RDEPS_FAIL: {msg}");
+        }
+        return 1;
+    };
+    let deps = reverse_dependents(&env, id);
+    if opts.json {
+        println!(
+            "{{\"ok\":true,\"version\":{},\"file\":{},\"decl\":{},\"count\":{},\"reverse_dependents\":{},\"time_ms\":{:.2}}}",
+            json_str(VERSION),
+            json_str(path),
+            json_str(target_name),
+            deps.len(),
+            json_str_array(&deps),
+            secs * 1000.0
+        );
+    } else {
+        println!("RDEPS {target_name} ({} direct dependents):", deps.len());
+        for d in &deps {
+            println!("  {d}");
+        }
+    }
+    0
+}
+
+fn run_list_file(path: &str, opts: &CheckOpts) -> i32 {
+    let (env, _stats, _mib, secs) = match verify_file(path, opts) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            if opts.json {
+                println!("{{\"ok\":false,\"file\":{},\"error\":{}}}", json_str(path), json_str(&msg));
+            } else {
+                eprintln!("LIST_FAIL file={path}: {msg}");
+            }
+            return code;
+        }
+    };
+    let items = list_decls(&env, opts.kind, opts.prefix.as_deref());
+    if opts.json {
+        let mut arr = String::from("[");
+        for (i, (name, kind)) in items.iter().enumerate() {
+            if i > 0 {
+                arr.push(',');
+            }
+            arr.push_str(&format!(
+                "{{\"name\":{},\"kind\":{}}}",
+                json_str(name),
+                json_str(kind.as_str())
+            ));
+        }
+        arr.push(']');
+        println!(
+            "{{\"ok\":true,\"version\":{},\"file\":{},\"count\":{},\"decls\":{},\"time_ms\":{:.2}}}",
+            json_str(VERSION),
+            json_str(path),
+            items.len(),
+            arr,
+            secs * 1000.0
+        );
+    } else {
+        println!("LIST_OK file={} count={}", path, items.len());
+        for (name, kind) in &items {
+            println!("  {:<11} {}", kind.as_str(), name);
+        }
     }
     0
 }

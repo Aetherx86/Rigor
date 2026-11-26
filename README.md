@@ -68,6 +68,13 @@ RIGOR_TRACE=1000 ./target/release/rigor-bench --check Std.ndjson   # report decl
 
 # Verify and inspect a single declaration (kind, type, direct dependencies, axioms)
 ./target/release/rigor-bench --inspect Init.Prelude.ndjson Eq.symm
+
+# Trace the shortest dependency witness chain between any two declarations/axioms
+./target/release/rigor-bench --why Std.ndjson MyTheorem Classical.choice --json
+
+# List direct reverse dependents or filter verified declarations by kind & prefix
+./target/release/rigor-bench --rdeps Init.Prelude.ndjson Eq
+./target/release/rigor-bench --list Init.Prelude.ndjson --kind theorem --prefix Eq. --json
 ```
 
 ### Browser / WebAssembly build
@@ -79,7 +86,8 @@ cargo build --release --target wasm32-unknown-unknown --manifest-path web/Cargo.
 WASM exports:
 - `check(input: &str) -> String`: verifies an export and returns JSON with counts or a formatted error.
 - `audit(input: &str, decl_name: &str) -> String`: verifies and audits the full environment (empty `decl_name`) or one declaration's transitive axiom footprint.
-- `version() -> String`: returns the Rigor package version (`0.2.0`).
+- `why(input: &str, from_name: &str, to_name: &str) -> String`: verifies and returns the shortest dependency chain from `from_name` to `to_name`.
+- `version() -> String`: returns the Rigor package version (`0.3.0`).
 
 Exports come from [lean4export](https://github.com/leanprover/lean4export):
 `lake env lean4export Init > Init.ndjson`.
